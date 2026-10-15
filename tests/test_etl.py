@@ -19,7 +19,8 @@ REPORT = ROOT / "data" / "report.csv"
 #: Реальные выгрузки не лежат в репозитории (``data/`` в ``.gitignore``):
 #: тесты на них пропускаются на чистом клоне и работают локально.
 HAS_JOURNAL = JOURNAL_CSV.exists()
-HAS_REAL_DATA = HAS_JOURNAL and REPORT.exists()
+HAS_REPORT = REPORT.exists()
+HAS_REAL_DATA = HAS_JOURNAL and HAS_REPORT
 
 REPORT_SAMPLE = """Всего тренировок;2
 ;;Вес;;Пвт
@@ -72,6 +73,9 @@ class DefaultPathsTests(unittest.TestCase):
     def test_source_files_are_renamed(self):
         self.assertEqual(etl.DEFAULT_JOURNAL.name, "journal.csv")
         self.assertEqual(etl.DEFAULT_REPORT.name, "report.csv")
+
+    @unittest.skipUnless(HAS_REAL_DATA, "нет data/journal.csv и/или data/report.csv")
+    def test_source_files_exist_under_the_new_names(self):
         self.assertTrue(etl.DEFAULT_JOURNAL.exists())
         self.assertTrue(etl.DEFAULT_REPORT.exists())
 
@@ -135,6 +139,7 @@ class ReportDateTests(unittest.TestCase):
             with self.assertRaises(ValueError, msg=bad):
                 etl.parse_report_date(bad)
 
+    @unittest.skipUnless(HAS_REPORT, "нет data/report.csv")
     def test_all_report_dates_parse(self):
         """Все 502 даты отчёта обязаны разбираться."""
         dates = etl.report_dates(REPORT)
@@ -345,6 +350,7 @@ class LoadAllGuardTests(TempDbMixin):
                          report=etl.DEFAULT_REPORT)
         self.assertIn("нет-такого.csv", str(caught.exception))
 
+    @unittest.skipUnless(HAS_JOURNAL, "нет data/journal.csv")
     def test_missing_report_raises(self):
         with self.assertRaises(FileNotFoundError) as caught:
             etl.load_all(self.conn, journal=etl.DEFAULT_JOURNAL,
@@ -356,6 +362,7 @@ class LoadAllGuardTests(TempDbMixin):
             etl.load_all(self.conn, journal="нет.csv")
         self.assertIn("журнала", str(caught.exception))
 
+    @unittest.skipUnless(HAS_JOURNAL, "нет data/journal.csv")
     def test_none_still_means_no_source(self):
         """Явное None - это «выгрузки нет», а не опечатка."""
         report = etl.load_all(self.conn, journal=etl.DEFAULT_JOURNAL,
@@ -367,6 +374,7 @@ class LoadAllGuardTests(TempDbMixin):
         report = etl.load_all(self.conn, journal=None, report=None)
         self.assertEqual(report.total, 0)
 
+    @unittest.skipUnless(HAS_JOURNAL, "нет data/journal.csv")
     def test_nothing_is_written_when_a_file_is_missing(self):
         """Файл проверяется до загрузки, а не после."""
         with self.assertRaises(FileNotFoundError):

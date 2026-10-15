@@ -27,6 +27,12 @@ ROOT = Path(__file__).resolve().parent.parent
 JOURNAL_CSV = ROOT / "data" / "journal.csv"
 REPORT = ROOT / "data" / "report.csv"
 
+#: Реальные выгрузки не лежат в репозитории (``data/`` в ``.gitignore``):
+#: проверки покрытия имён пропускаются на чистом клоне и работают локально.
+HAS_JOURNAL = JOURNAL_CSV.exists()
+HAS_REPORT = REPORT.exists()
+HAS_REAL_DATA = HAS_JOURNAL and HAS_REPORT
+
 REPORT_HEADER = re.compile(r"^;\s*\d+\.\s*(.+?)\s*$")
 
 
@@ -219,14 +225,17 @@ class TimedTests(unittest.TestCase):
 class CoverageTests(unittest.TestCase):
     """Словарь обязан покрывать каждое имя из обеих выгрузок."""
 
+    @unittest.skipUnless(HAS_JOURNAL, "нет data/journal.csv")
     def test_no_journal_name_unmapped(self):
         missing = unmapped(journal_names())
         self.assertEqual(missing, [], f"не сопоставлены упражнения журнала: {missing}")
 
+    @unittest.skipUnless(HAS_REPORT, "нет data/report.csv")
     def test_no_report_name_unmapped(self):
         missing = unmapped(report_names())
         self.assertEqual(missing, [], f"не сопоставлены упражнения отчёта: {missing}")
 
+    @unittest.skipUnless(HAS_REAL_DATA, "нет data/journal.csv и/или data/report.csv")
     def test_no_unused_entries(self):
         real = journal_names() | report_names()
         keys = {normalize(n) for n in real}
