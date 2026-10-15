@@ -3,7 +3,7 @@
 Модуль читает готовую таблицу ``sets`` и отвечает на два вопроса:
 
 * что сделано по каждому упражнению - объём, лучший 1RM, динамика, КОИ
-  (``exercise_report``);
+  (коэффициент относительной интенсивности) (``exercise_report``);
 * что делать дальше - программа роста нагрузки, стартованная от последней
   реальной тренировки (``progression_from_db``).
 
@@ -53,6 +53,7 @@ from .core import (
     TRANSITIONS,
     Progression,
     TransitionPlan,
+    koi_band,
     progression,
     snap_to_ladder,
     transitions,
@@ -69,10 +70,13 @@ __all__ = [
     "available_weights",
     "exercise_report",
     "explain_sets",
+    "format_explain",
     "format_history",
     "format_periods",
     "format_plan",
     "format_report",
+    "format_transitions",
+    "format_weekly_koi",
     "history",
     "periods",
     "progression_from_available",
@@ -446,10 +450,6 @@ class WeeklyKoi:
     koi_week: float
     band: str
 
-    @property
-    def koi_per_set(self) -> float:
-        return self.koi_week / self.sets_done if self.sets_done else 0.0
-
 
 def weekly_koi(
     conn: sqlite3.Connection,
@@ -465,10 +465,6 @@ def weekly_koi(
     база 1RM, поэтому складывать жим и тягу в одну сумму нельзя. Пороги полос
     - из ``core.KOI_BANDS_WEEK``: < 2 лёгкая неделя, 2…3 тяжёлая, 3…4 очень
     тяжёлая, больше 4 «Вы сошли с ума??».
-
-    Учтите оговорку о формуле в docstring модуля: при интенсивности, близкой к
-    100 %, одно упражнение даёт сумму в десятки тысяч, поэтому ``koi_per_set``
-    информативнее, чем сама сумма.
 
     ``exercise`` фильтрует по названию упражнения, ``group`` - по группе.
     """
@@ -505,6 +501,41 @@ def weekly_koi(
         for row in conn.execute(sql, params)
     ]
     return out
+
+
+def format_weekly_koi(rows: Sequence[WeeklyKoi]) -> str:
+    """Таблица недельных сумм КОИ - с шапкой, общей для CLI и ноутбука.
+
+    Одна строка - пара «неделя, упражнение». Колонка «КОИ» - **сумма**
+    подходов недели по этому упражнению, «режим» - полоса по этой сумме
+    (``core.KOI_BANDS_WEEK``). Отдельной колонки «на подход» нет: она
+    усредняла сумму и теряла смысл полосы, которая задана именно для суммы.
+    """
+    if not rows:
+        return "недель с посчитанным КОИ нет\n"
+    header = (
+        f"{'неделя':<12}  {'упражнение':<28} {'группа':<16} "
+        f"{'подходов':>8} {'КОИ':>8}  режим"
+    )
+    lines = [header, "-" * len(header)]
+    for row in rows:
+        lines.append(
+            f"{row.week:<12}  {row.exercise[:28]:<28} "
+            f"{row.exercise_group[:16]:<16} {row.sets_done:>8} "
+            f"{row.koi_week:>8.2f}  {row.band}"
+        )
+    lines.append("")
+    lines.append(
+        "КОИ считается по каждому упражнению отдельно (у каждого своя база 1RM),"
+    )
+    lines.append(
+        "суммы разных упражнений складывать нельзя. Режим - по недельной сумме:"
+    )
+    lines.append(
+        "меньше 2 - лёгкая, 2…3 - тяжёлая, 3…4 - очень тяжёлая, больше 4 - "
+        "«Вы сошли с ума??»."
+    )
+    return "\n".join(lines) + "\n"
 
 
 # --------------------------------------------------------------------------
@@ -580,8 +611,6 @@ class HistoryRow:
 
     @property
     def band(self) -> str | None:
-        from .core import koi_band
-
         return koi_band(self.koi_sum)
 
 
@@ -592,6 +621,7 @@ def history(
     since: str | None = None,
     until: str | None = None,
     limit: int | None = None,
+    reverse: bool = False,
 ) -> list[HistoryRow]:
     """История одной тренировки упражнения за интервал ``since``…``until``.
 
@@ -600,8 +630,15 @@ def history(
     может быть ``None``, тогда ограничения с этой стороны нет. Пусто с обеих
     сторон - вся история упражнения.
 
-    ``limit`` обрезает вывод **после** сортировки по дате возрастанию, то есть
-    оставляет первые ``limit`` тренировок интервала; ``None`` - все.
+    ``limit`` обрезает вывод **после** сортировки по дате; какие именно
+    тренировки оставить, зависит от ``reverse``:
+
+    * ``reverse=False`` (по умолчанию) - порядок от первой даты к последней,
+      ``limit`` оставляет первые (самые старые) ``limit`` тренировок;
+    * ``reverse=True`` - порядок от последней даты к первой, ``limit``
+      оставляет последние (самые свежие) ``limit`` тренировок.
+
+    ``None`` вместо ``limit`` - все тренировки интервала.
     """
     sql = _HISTORY_SQL.format(
         since="AND date >= ?" if since else "",
@@ -612,10 +649,8 @@ def history(
         params.append(since)
     if until:
         params.append(until)
-    if limit:
-        sql = "SELECT * FROM (" + sql + f") LIMIT {int(limit)}"
 
-    return [
+    rows = [
         HistoryRow(
             date=row["date"],
             session_id=row["session_id"],
@@ -631,6 +666,11 @@ def history(
         )
         for row in conn.execute(sql, params)
     ]
+    if reverse:
+        rows.reverse()
+    if limit:
+        rows = rows[: int(limit)]
+    return rows
 
 
 def format_history(
@@ -640,8 +680,9 @@ def format_history(
     since: str | None = None,
     until: str | None = None,
     width: int = 26,
+    reverse: bool = False,
 ) -> str:
-    """Таблица истории упражнения с подписью интервала."""
+    """Таблица истории упражнения с подписью интервала и направления."""
     window = f"{since or 'начало'} … {until or 'конец'}"
     if not rows:
         return (
@@ -649,7 +690,8 @@ def format_history(
             f"(в этом интервале нет подходов; проверьте название упражнения "
             f"и даты)\n"
         )
-    lines = [f"=== {exercise}: история за {window} ==="]
+    order = "от новых к старым" if reverse else "от старых к новым"
+    lines = [f"=== {exercise}: история за {window} ({order}) ==="]
     header = (
         f"{'дата':>10} {'верхний подход':>16} {'подх':>5} {'повторов':>8} "
         f"{'объём':>9} {'1RM':>7} {'Δ 1RM':>7} {'КОИ':>7}  режим"
@@ -684,6 +726,9 @@ _EXPLAIN_SQL = """
 SELECT id, source, date, session_id, set_index,
        exercise, exercise_group, weight_mode,
        raw_weight, added_weight, weight, reps, time_seconds,
+       CASE WHEN weight_mode <> 'absolute'
+                 AND weight IS NOT NULL AND added_weight IS NOT NULL
+            THEN weight - added_weight END AS body_weight,
        is_warmup, skipped, note, is_timed, timed_reason,
        is_outlier, outlier_rule,
        rm, rm_session, rm_delta, rm_ma_30d, koi
@@ -703,8 +748,87 @@ def explain_sets(
     """Последние ``limit`` подходов упражнения со всеми промежуточными полями.
 
     Возвращает строки как есть: что именно печатать - дело ``koilog explain``.
+    Каждая строка несёт и ``body_weight`` (``weight - added_weight`` для
+    режимов с телом, ``NULL`` для ``absolute``) - из неё видно, как из
+    собственного веса и добавки получился суммарный ``weight``.
     """
     return list(conn.execute(_EXPLAIN_SQL, (exercise, max(1, int(limit)))))
+
+
+def _cell(value: float | None, digits: int = 1) -> str:
+    """Число для печати; ``None`` - пустая ячейка (вызывающий ставит «—»)."""
+    if value is None:
+        return ""
+    return f"{value:.{digits}f}"
+
+
+def format_explain(rows: Sequence[sqlite3.Row]) -> str:
+    """Таблица «последние подходы» для ``explain`` - общая для CLI и ноутбука.
+
+    Колонки: ``сырой`` - что записано в файле; ``режим`` - как трактуется
+    (taxonomy); ``разм`` - разминка (в 1RM/КОИ не входит); ``свой`` - вес
+    собственного тела, взятый для подхода; ``вес`` - суммарный рабочий;
+    ``+`` - добавка к телу (жилет); ``1RMтрен`` - лучший 1RM тренировки;
+    ``Δ`` - к прошлой тренировке; ``МА30`` - скользящее среднее (база КОИ);
+    ``полоса`` - по ``core.KOI_BANDS``. Флаги (пропуск, время, выброс)
+    дописываются в конец строки.
+    """
+    if not rows:
+        return "подходов нет\n"
+    header = (
+        f"{'дата':>10} {'п':>2} {'разм':>4} {'сырой':>7} {'режим':<16} "
+        f"{'свой':>6} {'вес':>7} {'+':>6} {'повт':>4} {'1RM':>7} "
+        f"{'1RMтрен':>8} {'Δ':>7} {'МА30':>7} {'КОИ':>7}  полоса"
+    )
+    lines = [header, "-" * len(header)]
+    for row in rows:
+        flags = []
+        if row["skipped"]:
+            flags.append("пропущен")
+        if row["is_timed"]:
+            flags.append("время")
+        if row["is_outlier"]:
+            flags.append(f"выброс:{row['outlier_rule']}")
+        suffix = ("  [" + ", ".join(flags) + "]") if flags else ""
+        warm = "разм" if row["is_warmup"] else "—"
+        lines.append(
+            f"{row['date']:>10} "
+            f"{'' if row['set_index'] is None else row['set_index']:>2} "
+            f"{warm:>4} "
+            f"{_cell(row['raw_weight']) or '—':>7} "
+            f"{(row['weight_mode'] or '—'):<16} "
+            f"{_cell(row['body_weight']) or '—':>6} "
+            f"{_cell(row['weight']) or '—':>7} "
+            f"{_cell(row['added_weight']) or '—':>6} "
+            f"{'' if row['reps'] is None else row['reps']:>4} "
+            f"{_cell(row['rm']) or '—':>7} "
+            f"{_cell(row['rm_session']) or '—':>8} "
+            f"{_cell(row['rm_delta'], 2) or '—':>7} "
+            f"{_cell(row['rm_ma_30d']) or '—':>7} "
+            f"{_cell(row['koi'], 3) or '—':>7}  "
+            f"{koi_band(row['koi']) or '—'}{suffix}"
+        )
+    lines.append("")
+    lines.append(
+        "разм - разминка, в 1RM/КОИ не входит; сырой - что записано в файле; "
+        "режим -"
+    )
+    lines.append(
+        "как трактуется (taxonomy); свой - вес тела для подхода, вес - "
+        "суммарный рабочий,"
+    )
+    lines.append(
+        "+ - добавка (жилет); 1RMтрен - лучший 1RM тренировки; Δ - к прошлой "
+        "тренировке;"
+    )
+    lines.append(
+        "МА30 - среднее 1RM за 30 дней по упражнению (база КОИ);"
+    )
+    lines.append(
+        "КОИ (коэффициент относительной интенсивности) = "
+        "повторы / (1 − вес/МА30) / 100; полоса - по core.KOI_BANDS."
+    )
+    return "\n".join(lines) + "\n"
 
 
 # --------------------------------------------------------------------------
@@ -1260,7 +1384,11 @@ def format_report(rows: Sequence[ExerciseStats], *, width: int = 30) -> str:
 
 
 def format_plan(plan: ProgramPlan) -> str:
-    """Программа и сводка переходов по весам для чтения глазами."""
+    """Программа роста нагрузки для чтения глазами.
+
+    Переходы на следующий вес печатает отдельная :func:`format_transitions`:
+    в ноутбуке под них отведена своя ячейка, и здесь они дублировались.
+    """
     stats = plan.stats
     out: list[str] = []
     out.append(f"=== {stats.exercise}  ({stats.exercise_group}) ===")
@@ -1335,21 +1463,30 @@ def format_plan(plan: ProgramPlan) -> str:
                 f"{load:>9} {step.koi:>8.2f}  {step.band}{warm}"
             )
 
-    if len(plan.wave):
-        out.append("")
-        out.append("переходы на следующий вес:")
-        out.append(
-            f"{'из':>14}  ->  {'новый вес':<16} {'1RM':>7} {'дельта':>8}"
-        )
-        out.append("-" * 52)
-        for step in plan.wave:
-            out.append(
-                f"{step.from_weight:g} кг x {step.from_reps:<2}   ->  "
-                f"{step.weight:g} кг x {step.reps:<2}      "
-                f"{step.rm:>7.2f} {step.delta:>+8.2f}"
-            )
-
     return "\n".join(out) + "\n"
+
+
+def format_transitions(wave: TransitionPlan | Sequence[Any]) -> str:
+    """Таблица переходов на следующий вес - отдельно от программы.
+
+    ``format_plan`` переходы больше не печатает: в ноутбуке для них есть
+    отдельная ячейка, и та же информация выходила дважды. Общий форматтер
+    держит CLI и ноутбук в одном виде.
+    """
+    if not wave:
+        return ""
+    lines = [
+        "переходы на следующий вес:",
+        f"{'из':>14}  ->  {'новый вес':<16} {'1RM':>7} {'дельта':>8}",
+        "-" * 52,
+    ]
+    for step in wave:
+        lines.append(
+            f"{step.from_weight:g} кг x {step.from_reps:<2}   ->  "
+            f"{step.weight:g} кг x {step.reps:<2}      "
+            f"{step.rm:>7.2f} {step.delta:>+8.2f}"
+        )
+    return "\n".join(lines) + "\n"
 
 
 def progression_from_available(

@@ -107,6 +107,17 @@ class HistoryTests(unittest.TestCase):
         rows = stats.history(self.conn, "Жим гантелей", limit=2)
         self.assertEqual([r.date for r in rows], ["2024-01-01", "2024-02-01"])
 
+    def test_reverse_orders_newest_first(self):
+        rows = stats.history(self.conn, "Жим гантелей", reverse=True)
+        self.assertEqual(
+            [r.date for r in rows],
+            ["2024-03-01", "2024-02-01", "2024-01-01"],
+        )
+
+    def test_reverse_limit_keeps_latest_sessions(self):
+        rows = stats.history(self.conn, "Жим гантелей", limit=2, reverse=True)
+        self.assertEqual([r.date for r in rows], ["2024-03-01", "2024-02-01"])
+
     def test_format_names_exercise_and_interval(self):
         text = stats.format_history(
             stats.history(self.conn, "Жим гантелей"),
@@ -114,6 +125,14 @@ class HistoryTests(unittest.TestCase):
         )
         self.assertIn("Жим гантелей", text)
         self.assertIn("2024-01-01 … 2024-03-01", text)
+        self.assertIn("от старых к новым", text)
+
+    def test_format_names_direction(self):
+        text = stats.format_history(
+            stats.history(self.conn, "Жим гантелей", reverse=True),
+            "Жим гантелей", reverse=True,
+        )
+        self.assertIn("от новых к старым", text)
 
     def test_format_empty_is_readable(self):
         text = stats.format_history(
@@ -149,10 +168,39 @@ class ExplainTests(unittest.TestCase):
         self.assertEqual([r["date"] for r in rows], ["2024-03-01", "2024-02-01"])
         self.assertIn("raw_weight", rows[0].keys())
 
+    def test_explain_body_weight_for_vest(self):
+        self.conn.execute(
+            "UPDATE sets SET weight_mode = 'vest_only', weight = 90.0, "
+            "added_weight = 20.0"
+        )
+        self.conn.commit()
+        row = stats.explain_sets(self.conn, "Жим гантелей", limit=1)[0]
+        self.assertAlmostEqual(row["body_weight"], 70.0)
+
+    def test_explain_body_weight_null_for_absolute(self):
+        row = stats.explain_sets(self.conn, "Жим гантелей", limit=1)[0]
+        self.assertIsNone(row["body_weight"])
+
+    def test_format_explain_has_columns_and_band(self):
+        text = stats.format_explain(
+            stats.explain_sets(self.conn, "Жим гантелей", limit=3)
+        )
+        self.assertIn("разм", text)
+        self.assertIn("свой", text)
+        self.assertIn("полоса", text)
+
+    def test_format_explain_empty(self):
+        self.assertIn("нет", stats.format_explain([]))
+
     def test_parse_notes_describe_reading(self):
         notes = etl.parse_notes()
         self.assertTrue(any("utf-8-sig" in n for n in notes))
         self.assertTrue(any("ПРОПУЩЕН" in n for n in notes))
+
+    def test_parse_notes_print_project_relative_paths(self):
+        notes = etl.parse_notes()
+        # Локальный путь вида C:\... в отчёт не попадает: только внутри проекта.
+        self.assertFalse(any(":\\" in n for n in notes))
 
 
 class RecordTests(unittest.TestCase):

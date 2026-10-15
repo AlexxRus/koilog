@@ -601,6 +601,42 @@ class WeeksCommandTests(CliFixture):
         self.assertIn("недель", out)
 
 
+class HistoryCommandTests(CliFixture):
+    def test_lists_a_session(self):
+        code, out, _ = self.run_cli("history", "Жим гантелей лежа")
+        self.assertEqual(code, 0)
+        self.assertIn("2024-01-10", out)
+        self.assertIn("от старых к новым", out)
+
+    def test_reverse_flips_the_order(self):
+        code, out, _ = self.run_cli(
+            "history", "Жим гантелей лежа", "--limit", "1", "--reverse"
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("от новых к старым", out)
+        # limit в обратном режиме оставляет самую свежую тренировку.
+        self.assertIn("2024-01-20", out)
+
+    def test_csv_has_band_column(self):
+        code, out, _ = self.run_cli("history", "Жим гантелей лежа", "--csv")
+        self.assertEqual(code, 0)
+        self.assertIn("koi_sum,band", out)
+
+
+class ExplainCommandTests(CliFixture):
+    def test_prints_raw_to_koi_columns(self):
+        code, out, _ = self.run_cli("explain", "Жим гантелей лежа")
+        self.assertEqual(code, 0)
+        for column in ("сырой", "режим", "разм", "свой", "вес", "1RM", "полоса"):
+            self.assertIn(column, out)
+        self.assertIn("относительн", out.replace("Относительн", "относительн"))
+
+    def test_unknown_exercise(self):
+        code, out, _ = self.run_cli("explain", "Нет такого")
+        self.assertEqual(code, 1)
+        self.assertIn("не найдено", out)
+
+
 class ExportCommandTests(CliFixture):
     def test_writes_all_rows(self):
         target = Path(self._dir.name) / "out.csv"

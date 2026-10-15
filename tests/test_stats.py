@@ -507,7 +507,18 @@ class ProgressionFromDbTests(unittest.TestCase):
         text = stats.format_plan(plan)
         self.assertIn("Жим гантелей лежа", text)
         self.assertIn("лучший 1RM", text)
+        # Переходы вынесены в format_transitions - в программе их быть не должно.
+        self.assertNotIn("переходы на следующий вес", text)
+
+    def test_format_transitions_are_separate(self):
+        plan = stats.progression_from_db(
+            self.conn, "Жим гантелей лежа", start_weight=30.0, start_reps=8
+        )
+        text = stats.format_transitions(plan.wave)
         self.assertIn("переходы на следующий вес", text)
+
+    def test_format_transitions_empty(self):
+        self.assertEqual(stats.format_transitions(()), "")
 
     def test_format_plan_shows_the_reason(self):
         plan = stats.progression_from_db(self.conn, "Такого нет")
@@ -572,14 +583,20 @@ class WeeklyKoiTests(unittest.TestCase):
         self.assertIn(row.band, {"Лёгкий", "Тяжёлый", "Очень тяжёлый",
                                  "Вы сошли с ума??"})
 
-    def test_koi_per_set(self):
+    def test_koi_per_set_is_gone(self):
+        """Колонку «на подход» убрали: полоса задана для недельной суммы."""
         row = stats.weekly_koi(self.conn)[0]
-        self.assertAlmostEqual(row.koi_per_set, row.koi_week / row.sets_done)
+        self.assertFalse(hasattr(row, "koi_per_set"))
 
-    def test_koi_per_set_without_sets(self):
-        row = stats.WeeklyKoi(week="2024-W01", exercise="Жим", exercise_group="X",
-                              sets_done=0, koi_week=0.0, band="Лёгкий")
-        self.assertEqual(row.koi_per_set, 0.0)
+    def test_format_weekly_koi_has_headers(self):
+        text = stats.format_weekly_koi(stats.weekly_koi(self.conn))
+        self.assertIn("неделя", text)
+        self.assertIn("упражнение", text)
+        self.assertIn("режим", text)
+        self.assertNotIn("на подход", text)
+
+    def test_format_weekly_koi_empty(self):
+        self.assertIn("нет", stats.format_weekly_koi([]))
 
 
 def _build_history() -> sqlite3.Connection:

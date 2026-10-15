@@ -11,7 +11,8 @@
 ``weeks``
     Недельные суммы КОИ по упражнениям.
 ``history``
-    История упражнения за интервал дат ``--from``…``--to``.
+    История упражнения за интервал дат ``--from``…``--to``; ``--reverse``
+    разворачивает порядок от последней даты к первой.
 ``explain``
     Разбор парсинга выгрузок и расчёта по упражнению, подход за подходом.
 ``check``
@@ -34,7 +35,7 @@ from pathlib import Path
 from typing import Sequence
 
 from . import equipment, etl, rules, stats
-from .core import BODY_WEIGHT, koi_band
+from .core import BODY_WEIGHT
 
 __all__ = ["build_parser", "main"]
 
@@ -345,7 +346,9 @@ def cmd_plan(args: argparse.Namespace) -> int:
         return 0
 
     print(stats.format_plan(plan))
-    print()
+    wave = stats.format_transitions(plan.wave)
+    if wave:
+        print(wave)
     print(stats.format_periods(period_rows))
     # Упёршись в край списка весов - не ошибка: программа построена,
     # просто расти больше некуда. Ошибка - когда построить нечего.
@@ -410,20 +413,7 @@ def cmd_weeks(args: argparse.Namespace) -> int:
     if not rows:
         print("недель с посчитанным КОИ нет")
         return 1
-    print("неделя        упражнение                   группа            "
-          "подходов    КОИ  на подход  полоса")
-    for row in rows:
-        print(f"{row.week:12}  {row.exercise[:28]:28} {row.exercise_group[:16]:16} "
-              f"{row.sets_done:>7} {row.koi_week:>7.2f} {row.koi_per_set:>10.2f}  "
-              f"{row.band}")
-    print()
-    print("КОИ считается для каждого упражнения отдельно: у каждого своя база 1RM, "
-          "поэтому")
-    print("суммы разных упражнений складывать нельзя. Полосы недельного КОИ: <2 "
-          "лёгкая,")
-    print("2…3 тяжёлая, 3…4 очень тяжёлая, больше 4 «Вы сошли с ума??». «на подход» "
-          "читается")
-    print("надёжнее итога: сумма складывается по подходам и растёт с их числом.")
+    print(stats.format_weekly_koi(rows), end="")
     return 0
 
 
@@ -432,7 +422,7 @@ def cmd_history(args: argparse.Namespace) -> int:
     try:
         rows = stats.history(
             conn, args.exercise, since=args.since, until=args.until,
-            limit=args.limit,
+            limit=args.limit, reverse=args.reverse,
         )
         total = len(
             stats.history(conn, args.exercise, since=args.since, until=args.until)
@@ -454,7 +444,8 @@ def cmd_history(args: argparse.Namespace) -> int:
         return 0
 
     print(stats.format_history(
-        rows, args.exercise, since=args.since, until=args.until
+        rows, args.exercise, since=args.since, until=args.until,
+        reverse=args.reverse,
     ))
     if args.limit and total > len(rows):
         print(f"показано {len(rows)} из {total} тренировок "
@@ -502,47 +493,7 @@ def cmd_explain(args: argparse.Namespace) -> int:
     if not sets:
         print("подходов нет")
         return 1
-    header = (
-        f"{'дата':>10} {'п':>2} {'сырой':>7} {'режим':<16} {'вес':>7} "
-        f"{'+':>6} {'повт':>4} {'1RM':>7} {'1RMтрен':>8} {'Δ':>7} "
-        f"{'МА30':>7} {'КОИ':>7}  полоса"
-    )
-    print(header)
-    print("-" * len(header))
-    for row in sets:
-        flags = []
-        if row["is_warmup"]:
-            flags.append("разминка")
-        if row["skipped"]:
-            flags.append("пропущен")
-        if row["is_timed"]:
-            flags.append("время")
-        if row["is_outlier"]:
-            flags.append(f"выброс:{row['outlier_rule']}")
-        suffix = ("  [" + ", ".join(flags) + "]") if flags else ""
-        print(
-            f"{row['date']:>10} "
-            f"{'' if row['set_index'] is None else row['set_index']:>2} "
-            f"{_csv_number(row['raw_weight'], digits=1) or '—':>7} "
-            f"{(row['weight_mode'] or '—'):<16} "
-            f"{_csv_number(row['weight'], digits=1) or '—':>7} "
-            f"{_csv_number(row['added_weight'], digits=1) or '—':>6} "
-            f"{'' if row['reps'] is None else row['reps']:>4} "
-            f"{_csv_number(row['rm'], digits=1) or '—':>7} "
-            f"{_csv_number(row['rm_session'], digits=1) or '—':>8} "
-            f"{_csv_number(row['rm_delta']) or '—':>7} "
-            f"{_csv_number(row['rm_ma_30d'], digits=1) or '—':>7} "
-            f"{_csv_number(row['koi'], digits=3) or '—':>7}  "
-            f"{koi_band(row['koi']) or '—'}{suffix}"
-        )
-    print()
-    print("сырой - что записано в файле; режим - как трактуется (taxonomy); "
-          "вес - суммарный")
-    print("рабочий вес; + - добавка к телу (жилет); 1RMтрен - лучший 1RM "
-          "тренировки; Δ -")
-    print("к прошлой тренировке; МА30 - среднее 1RM за 30 дней по упражнению "
-          "(база КОИ);")
-    print("КОИ = повторы / (1 − вес/МА30) / 100; полоса - по core.KOI_BANDS.")
+    print(stats.format_explain(sets), end="")
     return 0
 
 
@@ -865,6 +816,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_history.add_argument("--limit", type=int, default=200,
                            help="сколько тренировок показать (0 - все)")
+    p_history.add_argument(
+        "--reverse", action="store_true",
+        help="порядок от последней даты к первой; при --limit остаются "
+             "последние (самые свежие) тренировки (по умолчанию - от первой "
+             "к последней)",
+    )
     p_history.add_argument("--csv", action="store_true", help="вывод в CSV")
     p_history.set_defaults(func=cmd_history)
 
