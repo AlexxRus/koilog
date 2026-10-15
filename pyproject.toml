@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "koilog"
+version = "0.5.0"
+description = "Разбор журнала силовых тренировок: 1RM, КОИ и программа роста нагрузки"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "koilog contributors" }]
+keywords = ["strength-training", "1rm", "workout", "sqlite", "fitness"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Database",
+    "Topic :: Other/Nonlisted Topic",
+]
+# Пакет держится на стандартной библиотеке: внешних зависимостей нет.
+dependencies = []
+
+[project.optional-dependencies]
+# Только для ноутбука koilog.ipynb; ни одна команда `python -m koilog`
+# их не требует.
+notebook = ["matplotlib", "ipywidgets"]
+
+[project.scripts]
+koilog = "koilog.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["koilog*"]
+
+[tool.setuptools.package-data]
+koilog = ["py.typed"]

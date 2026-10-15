@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Личные данные. Журнал тренировок, вес тела и заметки не должны уезжать
+# в репозиторий: в data/ лежат выгрузки приложений, в sql/ - собранная
+# база, в export/ - развёрнутый CSV. Раскомментировать только осознанно,
+# и лучше не коммитить вовсе.
+data/
+export/
+sql/*.db
+sql/*.db-wal
+sql/*.db-shm
