@@ -22,9 +22,12 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-# Только для ноутбука koilog.ipynb; ни одна команда `python -m koilog`
-# их не требует.
+# Только для ноутбуков koilog.ipynb / koilog-health.ipynb; ни одна команда
+# `python -m koilog` их не требует.
 notebook = ["matplotlib", "ipywidgets"]
+# Только для koilog.health.ml (машинное обучение). Ядро пакета и
+# остальные модули health остаются на стандартной библиотеке.
+ml = ["numpy", "scikit-learn"]
 
 [project.scripts]
 koilog = "koilog.cli:main"

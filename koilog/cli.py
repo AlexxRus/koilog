@@ -36,6 +36,9 @@ from typing import Sequence
 
 from . import equipment, etl, rules, stats
 from .core import BODY_WEIGHT
+from .health import apple as health_apple
+from .health import illness as health_illness
+from .health import load as health_load
 
 __all__ = ["build_parser", "main"]
 
@@ -699,6 +702,69 @@ def cmd_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_apple_load(args: argparse.Namespace) -> int:
+    """Разобрать выгрузку Apple Health в таблицы ``aw_*``."""
+    report = health_apple.load(
+        xml=args.xml,
+        db=args.db,
+        window=args.window,
+        check=args.check,
+    )
+    for line in report.lines():
+        print(line)
+    return 0
+
+
+def cmd_health_load(args: argparse.Namespace) -> int:
+    """Пересобрать ``load_daily`` и ``health_days`` из ``sets`` и ``aw_*``."""
+    conn = _open(args)
+    try:
+        days = health_load.load_daily(conn, window=args.window)
+        if not days:
+            print("нет данных для окна (нужны разобранные sets и/или aw_*)")
+            return 1
+        text = health_load.format_summary(conn)
+    finally:
+        conn.close()
+    print(text)
+    return 0
+
+
+def cmd_illness(args: argparse.Namespace) -> int:
+    """Пересобрать и показать эпизоды болезни."""
+    conn = _open(args)
+    try:
+        health_illness.build(conn, window=args.window)
+        text = health_illness.format_episodes(conn)
+    finally:
+        conn.close()
+    print(text)
+    return 0
+
+
+def cmd_ml(args: argparse.Namespace) -> int:
+    """Отчёт ML: признаки, лаги, CV-протокол, красный флаг."""
+    from .health import ml as health_ml
+
+    conn = _open(args)
+    try:
+        data = health_ml.report(conn, window=args.window, as_json=args.json)
+    finally:
+        conn.close()
+
+    if args.json:
+        print(health_ml.dumps(data))
+        return 0
+
+    print(health_ml.format_report(data))
+    if args.lag:
+        print()
+        print(health_ml.format_lag(data["lag_tonnage"], "недельный тоннаж"))
+        print()
+        print(health_ml.format_lag(data["lag_hrv"], "z ВСР"))
+    return 0
+
+
 # --------------------------------------------------------------------------
 # Разбор аргументов
 # --------------------------------------------------------------------------
@@ -848,6 +914,42 @@ def build_parser() -> argparse.ArgumentParser:
     p_export = sub.add_parser("export", help="выгрузка в CSV")
     p_export.add_argument("--out", default=etl.DEFAULT_EXPORT)
     p_export.set_defaults(func=cmd_export)
+
+    p_apple = sub.add_parser(
+        "apple-load", help="разобрать выгрузку Apple Health (export.xml) в aw_*")
+    p_apple.add_argument("--xml", default=None,
+                         help="путь к export.xml (по умолчанию ищется сам)")
+    p_apple.add_argument("--window", default=health_apple.DEFAULT_WINDOW,
+                         help=f"первая дата включительно (по умолчанию "
+                              f"{health_apple.DEFAULT_WINDOW})")
+    p_apple.add_argument("--check", action="store_true",
+                         help="только прочитать и показать покрытие, без записи")
+    p_apple.set_defaults(func=cmd_apple_load)
+
+    p_health = sub.add_parser(
+        "health-load", help="внешняя нагрузка: load_daily + health_days")
+    p_health.add_argument("--window", default=health_load.DEFAULT_WINDOW,
+                          help=f"первая дата включительно (по умолчанию "
+                               f"{health_load.DEFAULT_WINDOW})")
+    p_health.set_defaults(func=cmd_health_load)
+
+    p_illness = sub.add_parser(
+        "illness", help="эпизоды болезни: confirmed / probable / gap_only")
+    p_illness.add_argument("--window", default=health_load.DEFAULT_WINDOW,
+                           help=f"первая дата включительно (по умолчанию "
+                                f"{health_load.DEFAULT_WINDOW})")
+    p_illness.set_defaults(func=cmd_illness)
+
+    p_ml = sub.add_parser(
+        "ml", help="признаки, лаги, CV-протокол, красный флаг")
+    p_ml.add_argument("--window", default=health_load.DEFAULT_WINDOW,
+                      help=f"первая дата включительно (по умолчанию "
+                           f"{health_load.DEFAULT_WINDOW})")
+    p_ml.add_argument("--json", action="store_true", help="машинный вывод")
+    p_ml.add_argument("--lag", action="store_true",
+                      help="показать лаг-анализ: на сколько дней до эпизода "
+                           "признаки отклоняются сильнее всего")
+    p_ml.set_defaults(func=cmd_ml)
 
     return parser
 
