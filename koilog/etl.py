@@ -193,16 +193,40 @@ ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
 #: тяжёлая, больше 4 - «Вы сошли с ума??». Пороги те же, что в
 #: ``core.KOI_BANDS_WEEK``.
 #:
-#: Неделя берётся по **ISO 8601** (``%G-W%V``: год и номер недели,
+#: Неделя берётся по **ISO 8601** (метка ``ГГГГ-Www``: год и номер недели,
 #: начинающейся с понедельника), а не по ``%Y-W%W``. Прежний ``%W`` давал
 #: метку на единицу меньше календарной и разрывал одну реальную неделю на
 #: стыке года: ``2025-12-29`` попадало в ``2025-W52``, а ``2026-01-01`` - в
 #: несуществующую ``2026-W00``, хотя это одна неделя ``2026-W01``. Теперь
 #: метка совпадает с календарями и приложениями, и недели не рвутся.
-WEEKLY_KOI_VIEW = """
+#:
+#: В SQL неделя считается выражением :func:`iso_week_sql`, а **не**
+#: ``strftime('%G-W%V')``: форматы ``%G``/``%V`` добавили только в SQLite
+#: 3.46 (май 2024), а в сборках Python на GitHub Actions SQLite старше -
+#: там такая метка была NULL и роняла четыре теста недельного КОИ.
+def iso_week_sql(column: str) -> str:
+    """SQL-выражение ISO-недели (``ГГГГ-Www``), работающее на любом SQLite.
+
+    По ISO 8601 неделю определяет её **четверг**: сдвигаем дату к четвергу
+    (``julianday`` минус смещение к понедельнику плюс три дня), год берём
+    у четверга, а номер недели - ``(день года четверга + 6) / 7`` с целым
+    делением. Поддержка ``strftime``-спецификаторов не требуется: нужны
+    только ``julianday``/``date``/``printf`` - они в SQLite с древних версий.
+    """
+    thursday = (
+        f"date(julianday({column}) "
+        f"- ((CAST(strftime('%w', {column}) AS INTEGER) + 6) % 7) + 3)"
+    )
+    return (
+        f"printf('%s-W%02d', strftime('%Y', {thursday}), "
+        f"(CAST(strftime('%j', {thursday}) AS INTEGER) + 6) / 7)"
+    )
+
+
+WEEKLY_KOI_VIEW = f"""
 DROP VIEW IF EXISTS v_weekly_koi;
 CREATE VIEW v_weekly_koi AS
-SELECT strftime('%G-W%V', date)              AS week,
+SELECT {iso_week_sql("date")}                 AS week,
        exercise,
        MIN(exercise_group)                    AS exercise_group,
        COUNT(*)                               AS sets_done,

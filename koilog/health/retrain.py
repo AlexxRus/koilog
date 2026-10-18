@@ -606,19 +606,41 @@ def _koi_on_day(conn: sqlite3.Connection, exercise: str, day: str) -> float | No
     return row[0] if row and row[0] is not None else None
 
 
+def _iso_week_label(day: str) -> str:
+    """Метка ISO-недели (``ГГГГ-Www``) - календарём Python, без SQLite.
+
+    ``strftime('%G-W%V', ...)`` умеют только SQLite 3.46+ (май 2024), а в
+    сборках Python на CI он старше: такая метка там возвращала NULL. У
+    ``datetime`` ISO-неделя есть всегда - через ``isocalendar()``.
+    """
+    year, week, _ = date_cls.fromisoformat(day).isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+def _iso_week_bounds(day: str) -> tuple[str, str]:
+    """Понедельник и воскресенье той ISO-недели, в которую попадает ``day``."""
+    current = date_cls.fromisoformat(day)
+    monday = current - timedelta(days=current.weekday())
+    return monday.isoformat(), (monday + timedelta(days=6)).isoformat()
+
+
 def _koi_week(conn: sqlite3.Connection, exercise: str, day: str):
-    """Метка ISO-недели и суммарный КОИ упражнения за неё."""
+    """Метка ISO-недели и суммарный КОИ упражнения за неё.
+
+    Неделя в SQL отбирается границами (Пн-Вс), а не сравнением метки:
+    так не нужны устаревающие ``strftime``-форматы. Метка же считается в
+    Python (:func:`_iso_week_label`) и на старом SQLite остаётся валидной.
+    """
     try:
-        label = conn.execute(
-            "SELECT strftime('%G-W%V', ?)", (day,)
-        ).fetchone()[0]
+        label = _iso_week_label(day)
+        monday, sunday = _iso_week_bounds(day)
         total = conn.execute(
             "SELECT SUM(koi) FROM sets "
             "WHERE exercise = ? AND koi IS NOT NULL "
-            "  AND strftime('%G-W%V', date) = ?",
-            (exercise, label),
+            "  AND date BETWEEN ? AND ?",
+            (exercise, monday, sunday),
         ).fetchone()[0]
-    except sqlite3.OperationalError:
+    except (sqlite3.OperationalError, ValueError):
         return None, None
     return label, total
 

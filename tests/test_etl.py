@@ -6,6 +6,7 @@ import io
 import sqlite3
 import tempfile
 import unittest
+from datetime import date as date_cls
 from pathlib import Path
 
 from koilog import etl
@@ -451,16 +452,23 @@ class SchemaTests(TempDbMixin):
         self.assertEqual(row["band"], "Вы сошли с ума??")
 
     def test_weekly_view_uses_iso_week(self):
-        """Регресс: неделя - ISO (``%G-W%V``), а не ``%Y-W%W``.
+        """Регресс: неделя - ISO (``ГГГГ-Www``), а не ``%Y-W%W``.
 
         Прежний ``%W`` давал метку на единицу меньше календарной и рвал одну
         реальную неделю на стыке года: 2025-12-29 -> 2025-W52, а 2026-01-01 ->
-        2026-W00. Теперь обе даты - одна ISO-неделя 2026-W01.
+        2026-W00. Теперь обе даты - одна ISO-неделя 2026-W01. Ещё проверяем
+        границу длинной недели (53) и короткого года, где ISO-номер может
+        разойтись с календарным даже у валидных реализаций.
         """
         etl.create_schema(self.conn)
-        label = self.conn.execute(
-            "SELECT strftime('%G-W%V', '2026-01-01')").fetchone()[0]
-        self.assertEqual(label, "2026-W01")
+        for day in ("2025-12-29", "2026-01-01", "2020-12-28", "2021-01-01",
+                    "2026-12-31", "2027-01-01"):
+            year, week, _ = date_cls.fromisoformat(day).isocalendar()
+            # выражение упоминает колонку четыре раза - столько же и параметров
+            label = self.conn.execute(
+                f"SELECT {etl.iso_week_sql('?')}", (day,) * 4
+            ).fetchone()[0]
+            self.assertEqual(label, f"{year}-W{week:02d}", day)
         for i, day in enumerate(("2025-12-29", "2026-01-01"), 1):
             self.conn.execute(
                 "INSERT INTO sets (source, source_row, session_id, date, "

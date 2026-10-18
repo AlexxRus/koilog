@@ -441,9 +441,7 @@ class ReturnPlanTests(unittest.TestCase):
         self.assertAlmostEqual(plan.base_koi, 0.4)
         # обе даты в одной ISO-неделе - КОИ за неделю складывается
         self.assertAlmostEqual(plan.base_week_koi, 1.3)
-        self.assertEqual(
-            plan.base_week,
-            date_cls.fromisoformat("2024-01-02").strftime("%G-W%V"))
+        self.assertEqual(plan.base_week, "2024-W01")
 
     def test_missing_koi_column_does_not_crash(self):
         conn = _db()
