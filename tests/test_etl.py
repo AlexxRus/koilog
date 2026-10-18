@@ -450,6 +450,29 @@ class SchemaTests(TempDbMixin):
         self.assertAlmostEqual(row["koi_week"], 10 / 0.5)
         self.assertEqual(row["band"], "Вы сошли с ума??")
 
+    def test_weekly_view_uses_iso_week(self):
+        """Регресс: неделя - ISO (``%G-W%V``), а не ``%Y-W%W``.
+
+        Прежний ``%W`` давал метку на единицу меньше календарной и рвал одну
+        реальную неделю на стыке года: 2025-12-29 -> 2025-W52, а 2026-01-01 ->
+        2026-W00. Теперь обе даты - одна ISO-неделя 2026-W01.
+        """
+        etl.create_schema(self.conn)
+        label = self.conn.execute(
+            "SELECT strftime('%G-W%V', '2026-01-01')").fetchone()[0]
+        self.assertEqual(label, "2026-W01")
+        for i, day in enumerate(("2025-12-29", "2026-01-01"), 1):
+            self.conn.execute(
+                "INSERT INTO sets (source, source_row, session_id, date, "
+                "exercise, exercise_group, reps, weight, rm_ma_30d, koi) "
+                "VALUES ('journal', ?, 's', ?, 'Жим штанги лежа', 'ЖИМ ЛЁЖА', "
+                "10, 50, 100, 1.0)", (i, day))
+        rows = list(self.conn.execute(
+            "SELECT week, sets_done FROM v_weekly_koi"))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], "2026-W01")
+        self.assertEqual(rows[0][1], 2)
+
 
 class MetricsTests(TempDbMixin):
     def setUp(self):

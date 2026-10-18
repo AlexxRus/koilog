@@ -48,8 +48,57 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(load._rolling_mean([1.0, 2.0, 3.0, 4.0], 3),
                          [1.0, 1.5, 2.0, 3.0])
 
+    def test_rolling_mean_has_no_float_residue(self):
+        # инкрементальные +=/-= не должны оставлять ~1e-14
+        self.assertEqual(load._rolling_mean([0.0] * 30, 7), [0.0] * 30)
+
     def test_weekly_tonnage_sums_seven_days(self):
         self.assertEqual(load.weekly_tonnage([1.0] * 10, 7)[-1], 7.0)
+
+
+class GapAwareTests(unittest.TestCase):
+    """Gap-aware ACWR: простой не должен выглядеть как перегруз."""
+
+    def test_no_gap_means_no_flags(self):
+        loads = [100.0] * 30
+        self.assertEqual(load.gap_runs(loads), [])
+        self.assertEqual(load.warmup_flags(loads), [0] * 30)
+        self.assertEqual(load.days_since_gap(loads), [None] * 30)
+
+    def test_short_lull_is_not_a_gap(self):
+        loads = [100.0] * 5 + [0.0] * 10 + [100.0] * 5
+        self.assertEqual(load.gap_runs(loads, gap=14), [])
+
+    def test_gap_is_detected_with_bounds(self):
+        loads = [100.0] * 5 + [0.0] * 20 + [100.0] * 5
+        self.assertEqual(load.gap_runs(loads, gap=14), [(5, 24)])
+
+    def test_warmup_flag_covers_gap_and_28_days_after(self):
+        loads = [100.0] * 5 + [0.0] * 20 + [100.0] * 40
+        flags = load.warmup_flags(loads, gap=14)
+        # внутри разрыва и сразу после - разогрев
+        self.assertEqual(flags[10], 1)
+        self.assertEqual(flags[25], 1)
+        # спустя 28 дней после возврата окно уже чистое
+        self.assertEqual(flags[24 + 28 + 1], 0)
+        since = load.days_since_gap(loads, gap=14)
+        self.assertEqual(since[10], 0)      # внутри простоя
+        self.assertEqual(since[25], 1)      # день после возврата
+        self.assertEqual(since[30], 6)
+
+    def test_gap_aware_ratio_is_sane_where_raw_spikes(self):
+        # 21 день простоя, затем 7 дней возврата с высокой нагрузкой
+        loads = [100.0] * 28 + [0.0] * 21 + [120.0] * 7
+        raw = load.acwr(loads)
+        fixed = load.acwr_warmup(loads)
+        idx = 28 + 21 + 6  # конец первой недели после возврата
+        self.assertGreater(raw[idx], 3.0)       # обычный ACWR взлетает
+        self.assertAlmostEqual(fixed[idx], 1.0)  # gap-aware спокоен
+        self.assertLess(fixed[idx], raw[idx])
+
+    def test_trailing_gap_detected(self):
+        loads = [100.0] * 10 + [0.0] * 15
+        self.assertEqual(load.gap_runs(loads, gap=14), [(10, 24)])
 
 
 class MonotonyStrainTests(unittest.TestCase):

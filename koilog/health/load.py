@@ -38,8 +38,11 @@ __all__ = [
     "LoadDay",
     "acwr",
     "acwr_ewma",
+    "acwr_warmup",
+    "days_since_gap",
     "ewma",
     "format_summary",
+    "gap_runs",
     "health_days",
     "load_daily",
     "monotonicity",
@@ -47,6 +50,7 @@ __all__ = [
     "srpe",
     "strain",
     "summarize",
+    "warmup_flags",
     "weekly_tonnage",
 ]
 
@@ -72,6 +76,11 @@ RM_REGRESS_SHORT = 7
 RM_REGRESS_LONG = 21
 RM_REGRESS_MIN = 3
 RM_REGRESS_DROP = 0.95
+
+#: Простой длиной ≥ стольких дней считается «разрывом»: после него обычный
+#: ACWR арифметически взлетает (в знаменателе 28-дневного окна лежат нули), и
+#: это ложный флаг перегруза. Для таких участков считается gap-aware ACWR.
+ACWR_GAP_DAYS = 14
 
 
 # --------------------------------------------------------------------------
@@ -104,6 +113,10 @@ def _rolling_mean(values: list[float], window: int) -> list[float]:
         total += value
         if index >= window:
             total -= values[index - window]
+        # Инкрементальные +=/-= оставляют ~1e-14 на «нулевом» окне; без этой
+        # зачистки ACWR делится на 3.9e-14 и выдаёт мусор (-2.56 на простое).
+        if abs(total) < 1e-9:
+            total = 0.0
         out.append(total / min(index + 1, window))
     return out
 
@@ -131,6 +144,97 @@ def acwr_ewma(loads: list[float], short: int = 7, long: int = 28) -> list[float 
         (f / s) if s > 0 else None
         for f, s in zip(fast, slow)
     ]
+
+
+def gap_runs(loads: list[float], gap: int = ACWR_GAP_DAYS) -> list[tuple[int, int]]:
+    """Участки простоя длиной ≥ ``gap``: список ``(первый, последний)`` индексов.
+
+    Простой - это подряд идущие дни с нулевой (или отсутствующей) нагрузкой.
+    Границы включительные. Хвостовой простой тоже учитывается.
+    """
+    runs: list[tuple[int, int]] = []
+    start: int | None = None
+    for index, value in enumerate(loads):
+        idle = not value or value <= 0
+        if idle and start is None:
+            start = index
+        elif not idle and start is not None:
+            if index - start >= gap:
+                runs.append((start, index - 1))
+            start = None
+    if start is not None and len(loads) - start >= gap:
+        runs.append((start, len(loads) - 1))
+    return runs
+
+
+def _gap_bounds(loads: list[float], gap: int) -> tuple[list[int], list[int | None]]:
+    """Для каждого индекса: флаг «окно ещё содержит простой» и дней с простоя.
+
+    Возвращает ``(warmup, since)``. ``warmup[i] = 1``, если 28-дневное окно
+    (или его начало) ещё накрывает разрыв ≥ ``gap`` - в это время ``acwr``
+    читать как перегруз нельзя. ``since[i]`` - сколько дней прошло с конца
+    последнего завершённого разрыва (``None``, если разрыва ещё не было;
+    ``0`` - если день внутри разрыва).
+    """
+    runs = gap_runs(loads, gap)
+    long = 28
+    warmup: list[int] = []
+    since: list[int | None] = []
+    for index in range(len(loads)):
+        low = max(0, index - long + 1)
+        covering = [r for r in runs if r[0] <= index and r[1] >= low]
+        warmup.append(1 if covering else 0)
+        inside = [r for r in runs if r[0] <= index <= r[1]]
+        finished = [r for r in runs if r[1] < index]
+        if inside:
+            since.append(0)
+        elif finished:
+            since.append(index - max(r[1] for r in finished))
+        else:
+            since.append(None)
+    return warmup, since
+
+
+def acwr_warmup(
+    loads: list[float],
+    short: int = 7,
+    long: int = 28,
+    gap: int = ACWR_GAP_DAYS,
+) -> list[float | None]:
+    """ACWR, в котором 28-дневное окно не разбавляется днями простоя.
+
+    Обычный :func:`acwr` делит острую нагрузку на хроническую, а та после
+    трёхнедельного перерыва состоит в основном из нулей: знаменатель падает,
+    и ACWR взлетает (в истории автора - до 4,0 после перерыва 2025-08). Здесь
+    из хронического окна выбрасываются дни разрыва ≥ ``gap``, поэтому возврат
+    к нагрузке не выглядит как перегруз.
+    """
+    runs = gap_runs(loads, gap)
+    out: list[float | None] = []
+    for index in range(len(loads)):
+        low = max(0, index - long + 1)
+        effective = low
+        for start, end in runs:
+            if start <= index and end < index and end >= low:
+                effective = max(effective, end + 1)
+        chronic = statistics.fmean(loads[effective:index + 1])
+        acute = statistics.fmean(loads[max(0, index - short + 1):index + 1])
+        out.append((acute / chronic) if chronic > 0 else None)
+    return out
+
+
+def warmup_flags(
+    loads: list[float], long: int = 28, gap: int = ACWR_GAP_DAYS
+) -> list[int]:
+    """Флаг ``gap_warmup``: день попадает в «разогрев» после простоя."""
+    return _gap_bounds(loads, gap)[0]
+
+
+def days_since_gap(
+    loads: list[float], gap: int = ACWR_GAP_DAYS
+) -> list[int | None]:
+    """Дней с конца последнего разрыва (``None``, если разрыва не было)."""
+    return _gap_bounds(loads, gap)[1]
 
 
 def monotonicity(loads: list[float]) -> float | None:
@@ -174,6 +278,8 @@ def weekly_tonnage(tonnages: list[float], window: int = 7) -> list[float]:
         total += value
         if index >= window:
             total -= tonnages[index - window]
+        if abs(total) < 1e-9:
+            total = 0.0
         out.append(total)
     return out
 
@@ -218,6 +324,7 @@ class LoadDay:
         "date", "sets", "tonnage", "tonnage_iw", "koi_sum", "rm_best",
         "duration_min", "srpe", "acute", "chronic", "acwr",
         "acute_ewma", "chronic_ewma", "acwr_ewma",
+        "acwr_warmup", "gap_warmup", "since_gap",
         "weekly_tonnage", "monotony", "strain", "rm_regress", "is_test_day",
     )
 
@@ -236,6 +343,9 @@ class LoadDay:
         self.acute_ewma: float | None = None
         self.chronic_ewma: float | None = None
         self.acwr_ewma: float | None = None
+        self.acwr_warmup: float | None = None
+        self.gap_warmup = 0
+        self.since_gap: int | None = None
         self.weekly_tonnage = 0.0
         self.monotony: float | None = None
         self.strain: float | None = None
@@ -259,6 +369,9 @@ CREATE TABLE IF NOT EXISTS load_daily (
   acute_ewma    REAL,
   chronic_ewma  REAL,
   acwr_ewma     REAL,
+  acwr_warmup   REAL,
+  gap_warmup    INTEGER NOT NULL DEFAULT 0,
+  since_gap     INTEGER,
   weekly_tonnage REAL,
   monotony      REAL,
   strain        REAL,
@@ -286,12 +399,30 @@ LOAD_COLUMNS: tuple[str, ...] = (
     "date", "sets", "tonnage", "tonnage_iw", "koi_sum", "rm_best",
     "duration_min", "srpe", "acute", "chronic", "acwr",
     "acute_ewma", "chronic_ewma", "acwr_ewma",
+    "acwr_warmup", "gap_warmup", "since_gap",
     "weekly_tonnage", "monotony", "strain", "rm_regress", "is_test_day",
+)
+
+#: Колонки, добавленные после первого релиза ``load_daily``: добираются в уже
+#: существующую таблицу через ``ALTER TABLE`` (``CREATE TABLE IF NOT EXISTS``
+#: её не меняет).
+ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("acwr_warmup", "REAL"),
+    ("gap_warmup", "INTEGER NOT NULL DEFAULT 0"),
+    ("since_gap", "INTEGER"),
 )
 
 
 def _d(value: str) -> date_cls:
     return date_cls.fromisoformat(value)
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    """Добрать в существующую ``load_daily`` колонки из :data:`ADDED_COLUMNS`."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(load_daily)")}
+    for name, spec in ADDED_COLUMNS:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE load_daily ADD COLUMN {name} {spec}")
 
 
 # --------------------------------------------------------------------------
@@ -371,6 +502,7 @@ def load_daily(
     месячный простой, и хроническая нагрузка не успевала бы упасть.
     """
     conn.executescript(_SCHEMA)
+    _add_missing_columns(conn)
     sessions = _session_rows(conn)
     workouts = _workout_rows(conn)
     tests = _test_days(conn)
@@ -436,6 +568,8 @@ def _apply_windows(days: list[LoadDay]) -> None:
     slow = ewma(load, 28)
     week = weekly_tonnage(tonnage, 7)
     flags = rm_regress(rm_best)
+    warm = acwr_warmup(load)
+    gap_warm, since = _gap_bounds(load, ACWR_GAP_DAYS)
 
     for index, day in enumerate(days):
         day.acute = acute[index]
@@ -444,6 +578,9 @@ def _apply_windows(days: list[LoadDay]) -> None:
         day.acute_ewma = fast[index]
         day.chronic_ewma = slow[index]
         day.acwr_ewma = (fast[index] / slow[index]) if slow[index] > 0 else None
+        day.acwr_warmup = warm[index]
+        day.gap_warmup = gap_warm[index]
+        day.since_gap = since[index]
         day.weekly_tonnage = week[index]
         day.rm_regress = flags[index]
         window = load[max(0, index - 6):index + 1]
@@ -521,6 +658,7 @@ def summarize(conn: sqlite3.Connection) -> dict:
                AVG(acwr)                        AS acwr,
                AVG(monotony)                    AS monotony,
                MAX(acwr)                        AS acwr_max,
+               MAX(acwr_warmup)                 AS acwr_warmup_max,
                MAX(monotony)                    AS monotony_max,
                SUM(CASE WHEN monotony > ? THEN 1 ELSE 0 END) AS monotony_alert,
                SUM(rm_regress)                  AS rm_regress
@@ -531,7 +669,18 @@ def summarize(conn: sqlite3.Connection) -> dict:
     period = conn.execute(
         "SELECT MIN(date) AS first, MAX(date) AS last FROM load_daily"
     ).fetchone()
-    return {**dict(row), "first": period["first"], "last": period["last"]}
+    # Максимум «сырого» ACWR мог прийтись на окно после простоя: тогда это
+    # ложный флаг перегруза, а не сигнал.
+    peak = conn.execute(
+        """SELECT date, acwr, acwr_warmup, gap_warmup FROM load_daily
+           WHERE acwr IS NOT NULL ORDER BY acwr DESC LIMIT 1"""
+    ).fetchone()
+    out = {**dict(row), "first": period["first"], "last": period["last"]}
+    out["acwr_peak_date"] = peak["date"] if peak else None
+    out["acwr_peak"] = peak["acwr"] if peak else None
+    out["acwr_peak_warmup"] = peak["gap_warmup"] if peak else None
+    out["acwr_peak_fixed"] = peak["acwr_warmup"] if peak else None
+    return out
 
 
 def format_summary(conn: sqlite3.Connection) -> str:
@@ -547,6 +696,13 @@ def format_summary(conn: sqlite3.Connection) -> str:
     if summary["acwr"] is not None:
         lines.append(f"ACWR: средний {summary['acwr']:.2f}, "
                      f"макс {summary['acwr_max']:.2f}")
+        if summary["acwr_peak_warmup"] and summary["acwr_peak_fixed"] is not None:
+            lines.append(
+                f"  пик {summary['acwr_peak']:.2f} пришёлся на "
+                f"{summary['acwr_peak_date']} - в окне после простоя "
+                f"(gap-aware {summary['acwr_peak_fixed']:.2f}); "
+                f"это не перегруз"
+            )
     if summary["monotony"] is not None:
         lines.append(f"монотонность: средняя {summary['monotony']:.2f}, "
                      f"макс {summary['monotony_max']:.2f}, "
@@ -563,6 +719,7 @@ def series(
     params = (window,) if window else ()
     rows = conn.execute(
         f"""SELECT date, sets, tonnage, srpe, acute, chronic, acwr, acwr_ewma,
+                   acwr_warmup, gap_warmup, since_gap,
                    weekly_tonnage, monotony, strain, rm_regress
             FROM load_daily {where} ORDER BY date""",
         params,

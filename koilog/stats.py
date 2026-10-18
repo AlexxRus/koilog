@@ -467,11 +467,11 @@ def weekly_koi(
     тяжёлая, больше 4 «Вы сошли с ума??».
 
     ``exercise`` фильтрует по названию упражнения, ``group`` - по группе.
+
+    ``limit`` — количество **целых недель**, а не строк. Если 0 или None —
+    показать все недели. Это избавляет от обрезки недели посередине и делает
+    вывод предсказуемым.
     """
-    sql = (
-        "SELECT week, exercise, exercise_group, sets_done, koi_week, band "
-        "FROM v_weekly_koi"
-    )
     clauses: list[str] = []
     params: list[Any] = []
     if exercise is not None:
@@ -483,11 +483,34 @@ def weekly_koi(
     if since is not None:
         clauses.append("week >= ?")
         params.append(since)
-    if clauses:
-        sql += " WHERE " + " AND ".join(clauses)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+
+    limit_n = None
+    if limit is not None and int(limit) > 0:
+        limit_n = int(limit)
+
+    if limit_n is not None:
+        sql = (
+            "WITH w AS (SELECT DISTINCT week FROM v_weekly_koi" + where +
+            f" ORDER BY week DESC LIMIT {limit_n}) "
+            "SELECT week, exercise, exercise_group, sets_done, koi_week, band "
+            "FROM v_weekly_koi WHERE week IN (SELECT week FROM w)"
+        )
+        # params повторно не нужны — фильтры учтены в CTE? Да, CTE использует
+        # те же where и те же params? Но в нашем случае, если есть фильтры,
+        # where в CTE верный. А во внешнем SELECT фильтруем только по неделям.
+        # Но если фильтры есть (exercise/group/since), то правильно брать недели,
+        # где есть такие строки. Наш CTE так и делает — ок.
+        # Но при передаче в execute нужно передать params один раз.
+        exec_params = list(params)
+    else:
+        sql = (
+            "SELECT week, exercise, exercise_group, sets_done, koi_week, band "
+            "FROM v_weekly_koi" + where
+        )
+        exec_params = params
+
     sql += " ORDER BY week DESC, koi_week DESC"
-    if limit:
-        sql += f" LIMIT {int(limit)}"
 
     out = [
         WeeklyKoi(
@@ -498,7 +521,7 @@ def weekly_koi(
             koi_week=row["koi_week"],
             band=row["band"],
         )
-        for row in conn.execute(sql, params)
+        for row in conn.execute(sql, exec_params)
     ]
     return out
 

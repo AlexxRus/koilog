@@ -8,6 +8,7 @@ CLI - это тонкий слой, и интересно в нём только
 from __future__ import annotations
 
 import io
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -486,7 +487,7 @@ class OutliersCommandTests(CliFixture):
     def test_stock_gaps_are_listed(self):
         """Вес, которого нет в инвентаре, попадает в тот же отчёт.
 
-        32 кг суммарных - это 16 на руку, а 16 нет среди 17 пар.
+        32 кг суммарных - это 16 на руку, а такой пары гантелей нет.
         """
         code, out, _ = self.run_cli("outliers")
         self.assertEqual(code, 0)
@@ -599,6 +600,63 @@ class WeeksCommandTests(CliFixture):
         code, out, _ = self.run_cli("weeks")
         self.assertEqual(code, 1)
         self.assertIn("недель", out)
+
+
+class ReturnCommandTests(CliFixture):
+    """``return`` читает rm_session, а фикстура кладёт только rm."""
+
+    def setUp(self):
+        super().setUp()
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE sets SET rm_session = rm")
+        conn.commit()
+        conn.close()
+
+    def test_prints_ramp_and_gate(self):
+        code, out, _ = self.run_cli("return", "Жим гантелей лежа")
+        self.assertEqual(code, 0)
+        self.assertIn("возврат к весам", out)
+        self.assertIn("рампа", out)
+        self.assertIn("гейт", out)
+
+    def test_defaults_to_the_most_trained_exercise(self):
+        code, out, _ = self.run_cli("return")
+        self.assertEqual(code, 0)
+        self.assertIn("Жим гантелей лежа", out)
+
+    def test_returns_flag_adds_the_marking(self):
+        code, out, _ = self.run_cli("return", "Жим гантелей лежа", "--returns")
+        self.assertEqual(code, 0)
+        self.assertIn("возвраты по", out)
+
+    def test_json_has_plan_and_curve_fields(self):
+        code, out, _ = self.run_cli("return", "Жим гантелей лежа", "--json")
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        self.assertEqual(payload["exercise"], "Жим гантелей лежа")
+        self.assertIn("gate", payload)
+        self.assertIn("steps", payload)
+
+    def test_missing_health_tables_do_not_crash(self):
+        """База с одними ``sets``: гейт не готов, но команда не падает."""
+        code, out, _ = self.run_cli("return", "Жим гантелей лежа")
+        self.assertEqual(code, 0)
+        self.assertIn("нет данных часов", out)
+
+
+class DigestCommandTests(CliFixture):
+    def test_prints_card_without_health_tables(self):
+        code, out, _ = self.run_cli("digest")
+        self.assertEqual(code, 0)
+        self.assertIn("дневной дайджест", out)
+        self.assertIn("рекомендация", out)
+
+    def test_json_is_valid(self):
+        code, out, _ = self.run_cli("digest", "--json")
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        self.assertIn("recommendation", payload)
+        self.assertIn("gate", payload)
 
 
 class HistoryCommandTests(CliFixture):

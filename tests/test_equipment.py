@@ -15,11 +15,11 @@ from koilog.taxonomy import EXERCISE_GROUP
 
 
 class DumbbellTests(unittest.TestCase):
-    def test_exactly_seventeen_pairs_per_hand(self):
-        self.assertEqual(len(equipment.DUMBBELL_PAIRS), 17)
+    def test_exactly_sixteen_pairs_per_hand(self):
+        self.assertEqual(len(equipment.DUMBBELL_PAIRS), 16)
         self.assertEqual(
             equipment.DUMBBELL_PAIRS,
-            (5.0, 7.0, 9.0, 11.0, 13.0, 15.0, 18.0, 20.0, 22.0, 25.0, 27.0,
+            (5.0, 7.0, 9.0, 11.0, 13.0, 15.0, 18.0, 22.0, 25.0, 27.0,
              29.0, 32.0, 34.0, 36.0, 38.0, 40.0),
         )
 
@@ -154,7 +154,7 @@ class StockGapTests(unittest.TestCase):
 
     def test_zero_is_not_a_gap(self):
         """0 - это «свое тело без добавки», а не чужой снаряд."""
-        self.assertEqual(equipment.stock_gaps("Жим гантелей лежа", [0.0, 40.0]), [])
+        self.assertEqual(equipment.stock_gaps("Жим гантелей лежа", [0.0, 44.0]), [])
 
     def test_exercise_without_inventory_has_no_gaps(self):
         self.assertEqual(equipment.stock_gaps("Планка", [10.0, 20.0, 30.0]), [])
@@ -167,8 +167,10 @@ class StockGapTests(unittest.TestCase):
 
     def test_in_stock(self):
         profile = equipment.PROFILES["dumbbell_2"]
-        self.assertTrue(equipment.in_stock(40.0, profile))
+        # 44 кг суммарных = 2 x 22 кг; 2 x 20 кг в зале нет
+        self.assertTrue(equipment.in_stock(44.0, profile))
         self.assertFalse(equipment.in_stock(42.0, profile))
+        self.assertFalse(equipment.in_stock(40.0, profile))
 
 
 if __name__ == "__main__":  # pragma: no cover

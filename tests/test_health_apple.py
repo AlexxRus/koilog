@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 from koilog.health import apple
@@ -116,6 +117,69 @@ class SourceFilterTests(unittest.TestCase):
 
     def test_manual_entry_rejected(self):
         self.assertFalse(apple.is_watch_source("ALEXEY"))
+
+
+class AppleSourceTests(unittest.TestCase):
+    """Забор выгрузки прямо из архива ``*.zip`` (раунд 5).
+
+    Имя XML-члена в настоящем экспорте записано в cp866, поэтому Python
+    декодирует его в мойибаке; источник обязан выбирать член по суффиксу и
+    размеру, а не по литеральному имени ``экспорт.xml``. Здесь это проверяется
+    именем, не совпадающим с реальным, плюс наличием крупного CDA-дубля,
+    который должен быть проигнорирован.
+    """
+
+    def _make_zip(self, folder: str) -> Path:
+        path = Path(folder) / "выгрузка.zip"
+        xml_name = "apple_health_export/выгрузка.xml"
+        cda_name = "apple_health_export/export_cda.xml"
+        ecg_names = [
+            "apple_health_export/electrocardiograms/ecg_2024-01-17.csv",
+            "apple_health_export/electrocardiograms/ecg_2024-02-01.csv",
+        ]
+        with zipfile.ZipFile(path, "w") as z:
+            z.writestr(xml_name, _XML)
+            # CDA-дубль крупнее XML, но должен отбрасываться по имени.
+            z.writestr(cda_name, "<ClinicalDocument/>" + " " * 4096)
+            for name in ecg_names:
+                z.writestr(name, "timestamp,value\n")
+        return path
+
+    def test_from_zip_picks_xml_not_cda_and_reads_ecg(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = self._make_zip(folder)
+            source = apple.resolve_source(path)
+            self.assertEqual(source.kind, "zip")
+            self.assertTrue(source.member.endswith(".xml"))
+            self.assertNotIn("cda", source.member.lower())
+            self.assertEqual(len(source.ecg), 2)
+            self.assertEqual(source.ecg[0][0], "2024-01-17")
+
+            data = apple.parse_apple(source, window="2024-01-16")
+            self.assertTrue(apple._daily_rows(data))
+            # ExportDate читается в основном проходе, без переоткрытия файла.
+            self.assertEqual(
+                data.meta.get("export_date"), "2026-10-15 12:00:00 +0300")
+            self.assertEqual([d for d, _ in data.ecg],
+                             ["2024-01-17", "2024-02-01"])
+
+    def test_from_path_directory(self):
+        with tempfile.TemporaryDirectory() as folder:
+            xml = Path(folder) / "export.xml"
+            xml.write_text(_XML, encoding="utf-8")
+            ecg_dir = Path(folder) / "electrocardiograms"
+            ecg_dir.mkdir()
+            (ecg_dir / "ecg_2024-01-17.csv").write_text("x", encoding="utf-8")
+            (ecg_dir / "not_ecg.csv").write_text("x", encoding="utf-8")
+            source = apple.resolve_source(folder)
+            self.assertEqual(source.kind, "file")
+            self.assertEqual(source.path, xml)
+            self.assertEqual(len(source.ecg), 1)
+
+    def test_missing_source_raises(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with self.assertRaises(FileNotFoundError):
+                apple.resolve_source(str(Path(folder) / "нет.xml"))
 
 
 if __name__ == "__main__":

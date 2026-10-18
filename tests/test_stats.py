@@ -310,7 +310,7 @@ class AvailableWeightsTests(unittest.TestCase):
         weights = stats.available_weights(self.conn, "Жим гантелей лежа")
         self.assertEqual(weights[0], 10.0)   # 2 x 5 кг
         self.assertEqual(weights[-1], 80.0)  # 2 x 40 кг
-        self.assertEqual(len(weights), 17)
+        self.assertEqual(len(weights), 16)
 
     def test_one_hand_dumbbell_is_in_single_weight(self):
         weights = stats.available_weights(self.conn, "Махи в наклоне одной рукой")
@@ -341,7 +341,7 @@ class AvailableWeightsTests(unittest.TestCase):
             stats.available_weights(
                 self.conn, "Жим гантелей лежа", min_weight=31.0
             )[:3],
-            (36.0, 40.0, 44.0),
+            (36.0, 44.0, 50.0),
         )
 
     def test_every_taxonomy_exercise_has_a_profile(self):

@@ -32,10 +32,11 @@
 
 from __future__ import annotations
 
-import glob
 import os
 import sqlite3
 import xml.etree.ElementTree as ET
+import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date as date_cls
 from datetime import datetime, timedelta
@@ -50,16 +51,17 @@ __all__ = [
     "DEFAULT_WINDOW",
     "AppleData",
     "AppleLoadReport",
+    "AppleSource",
     "COVERAGE_COLUMNS",
     "coverage",
     "coverage_by_year",
     "daily",
-    "default_xml",
     "format_coverage",
     "format_coverage_by_year",
     "is_watch_source",
     "load",
     "parse_apple",
+    "resolve_source",
     "write_apple",
 ]
 
@@ -68,7 +70,12 @@ __all__ = [
 # --------------------------------------------------------------------------
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-APPLE_DIR = ROOT / "data" / "aw" / "apple_health_export"
+DATA_DIR = ROOT / "data"
+APPLE_DIR = DATA_DIR / "aw" / "apple_health_export"
+
+#: Папки, в которых ищется свежая выгрузка: сначала сам ``data/``, где обычно
+#: и лежит скачанный ``экспорт.zip``, затем уже распакованная ``data/aw/``.
+SEARCH_DIRS: tuple[Path, ...] = (DATA_DIR, DATA_DIR / "aw", APPLE_DIR)
 
 #: Первый день, с которого в выгрузке есть полный набор часовых метрик
 #: (ВСР, дыхание, температура запястья, SpO2). Раньше 2024-01-16 есть только
@@ -128,6 +135,134 @@ _SPACE_TRANSLATION = str.maketrans({
 def is_watch_source(source: str) -> bool:
     """Запись сделана Apple Watch, а не сторонним приложением."""
     return WATCH_SOURCE_MARK in source.translate(_SPACE_TRANSLATION)
+
+
+# --------------------------------------------------------------------------
+# Источник выгрузки: распакованный XML, папка или архив
+# --------------------------------------------------------------------------
+
+
+def _ecg_from_names(names) -> list[tuple[str, str]]:
+    """Список ЭКГ ``(дата, имя_файла)`` из имён файлов (папка или архив).
+
+    Имена ЭКГ всегда ASCII (``ecg_2024-01-17.csv``), поэтому кодировка имени
+    члена архива здесь не мешает. Битые имена молча пропускаются.
+    """
+    out: list[tuple[str, str]] = []
+    for raw in names:
+        name = Path(str(raw).replace("\\", "/")).name
+        if not name.startswith("ecg_") or not name.lower().endswith(".csv"):
+            continue
+        day = name[4:14]
+        try:
+            date_cls.fromisoformat(day)
+        except ValueError:
+            continue
+        out.append((day, name))
+    return sorted(out)
+
+
+def _rel(path: Path) -> str:
+    """Путь относительно корня проекта, если это возможно."""
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
+@dataclass(slots=True)
+class AppleSource:
+    """Откуда читается выгрузка: одиночный XML или член архива ``*.zip``.
+
+    Архив Apple кладёт XML в ``apple_health_export/`` вместе с CDA-дублем
+    на 900 МБ и папкой ЭКГ. Читать XML из zip можно потоком
+    (``ZipFile.open`` отдаёт file-like объект, который понимает
+    ``iterparse``), поэтому гигабайт на диск не распаковывается, а CDA-дубль
+    вообще не открывается. Имя XML-члена в архиве записано в cp866, поэтому
+    член выбирается по суффиксу и размеру, а не по имени.
+    """
+
+    path: Path
+    kind: str            # "file" | "zip"
+    member: str | None = None
+    ecg: tuple[tuple[str, str], ...] = ()
+
+    @classmethod
+    def from_zip(cls, path: str | os.PathLike) -> "AppleSource":
+        archive = Path(path)
+        if not archive.exists():
+            raise FileNotFoundError(f"нет архива Apple Health: {archive}")
+        with zipfile.ZipFile(archive) as z:
+            members = [i for i in z.infolist() if not i.is_dir()]
+            xmls = [i for i in members
+                    if i.filename.lower().endswith(".xml")
+                    and "cda" not in i.filename.lower()]
+            if not xmls:
+                raise FileNotFoundError(
+                    f"в архиве нет XML выгрузки (кроме CDA): {archive}")
+            big = max(xmls, key=lambda i: i.file_size)
+            ecg = tuple(_ecg_from_names(i.filename for i in members))
+        return cls(path=archive, kind="zip", member=big.filename, ecg=ecg)
+
+    @classmethod
+    def from_path(cls, path: str | os.PathLike) -> "AppleSource":
+        p = Path(path)
+        if p.is_dir():
+            xmls = [q for q in p.glob("*.xml") if "cda" not in q.name.lower()]
+            if not xmls:
+                raise FileNotFoundError(f"в папке нет XML выгрузки: {p}")
+            p = max(xmls, key=lambda q: q.stat().st_size)
+        if not p.exists():
+            raise FileNotFoundError(f"нет выгрузки Apple Health: {p}")
+        if p.suffix.lower() == ".zip":
+            return cls.from_zip(p)
+        folder = p.parent / "electrocardiograms"
+        ecg = tuple(_ecg_from_names(q.name for q in folder.glob("ecg_*.csv")))
+        return cls(path=p, kind="file", ecg=ecg)
+
+    @contextmanager
+    def open(self):
+        """Бинарный поток XML: член архива или сам файл."""
+        if self.kind == "zip":
+            with zipfile.ZipFile(self.path) as z, z.open(self.member) as f:
+                yield f
+        else:
+            with open(self.path, "rb") as f:
+                yield f
+
+    def describe(self) -> str:
+        where = f"архив: {_rel(self.path)} → {self.member}" \
+            if self.kind == "zip" else f"файл: {_rel(self.path)}"
+        return f"{where}  (ЭКГ: {len(self.ecg)})"
+
+
+def _as_source(path) -> AppleSource:
+    """Привести путь (или готовый источник) к :class:`AppleSource`."""
+    if isinstance(path, AppleSource):
+        return path
+    return AppleSource.from_path(path)
+
+
+def resolve_source(path: str | os.PathLike | None = None) -> AppleSource:
+    """Найти выгрузку.
+
+    Явный ``path`` (XML, папка или архив) имеет приоритет. Иначе берётся
+    **самый свежий архив** ``*.zip`` в ``data/`` и ``data/aw/``; если архивов
+    нет — наибольший ``*.xml`` (без CDA). Это значит, что достаточно положить
+    скачанный ``экспорт.zip`` в ``data/`` и запустить ``apple-load``.
+    """
+    if path:
+        return _as_source(path)
+    zips = [p for root in SEARCH_DIRS for p in root.glob("*.zip")]
+    if zips:
+        return AppleSource.from_zip(max(zips, key=lambda p: p.stat().st_mtime))
+    xmls = [p for root in SEARCH_DIRS for p in root.glob("*.xml")]
+    real = [p for p in xmls if "cda" not in p.name.lower()]
+    pool = real or xmls
+    if pool:
+        return AppleSource.from_path(max(pool, key=lambda p: p.stat().st_size))
+    return AppleSource.from_path(APPLE_DIR / "export.xml")
+
 
 #: Дети ``Workout``: их нельзя очищать, пока не прочитан родитель.
 _WORKOUT_CHILDREN = {
@@ -344,15 +479,16 @@ class AppleData:
 # --------------------------------------------------------------------------
 
 
-def _iter_nodes(path: str | os.PathLike) -> Iterator[tuple[str, ET.Element]]:
-    """Один проход по XML: отдаёт ``Record`` и ``Workout`` по мере закрытия.
+def _iter_nodes(stream) -> Iterator[tuple[str, ET.Element]]:
+    """Один проход по XML: отдаёт ``Record``, ``Workout`` и ``ExportDate``.
 
     Вложенные в ``Workout`` записи пропускаются: они дублируют верхнеуровневые.
     Дети ``Workout`` (``WorkoutStatistics``, ``MetadataEntry``) не очищаются,
-    пока не прочитан родитель.
+    пока не прочитан родитель. ``ExportDate`` (тег в начале документа)
+    отдаётся отдельным видом, чтобы не переоткрывать гигабайт ради заголовка.
     """
     inside_workout = 0
-    for event, elem in ET.iterparse(str(path), events=("start", "end")):
+    for event, elem in ET.iterparse(stream, events=("start", "end")):
         if event == "start":
             if elem.tag == "Workout":
                 inside_workout += 1
@@ -366,58 +502,45 @@ def _iter_nodes(path: str | os.PathLike) -> Iterator[tuple[str, ET.Element]]:
             if not inside_workout:
                 yield "record", elem
             elem.clear()
+        elif tag == "ExportDate":
+            yield "exportdate", elem
+            elem.clear()
         elif tag in _WORKOUT_CHILDREN:
             continue
         else:
-            # Correlation, ActivitySummary, ExportDate, Me, ClinicalRecord и пр.
+            # Correlation, ActivitySummary, Me, ClinicalRecord и пр.
             elem.clear()
 
 
 def parse_apple(
-    path: str | os.PathLike,
+    path,
     window: str | None = DEFAULT_WINDOW,
 ) -> AppleData:
     """Прочитать выгрузку и собрать :class:`AppleData`.
 
-    ``window`` - первая дата включительно; всё раньше пропускается. ``None``
-    означает «весь файл».
+    ``path`` - путь к XML, папке, архиву ``*.zip`` или готовый
+    :class:`AppleSource`. ``window`` - первая дата включительно; всё раньше
+    пропускается. ``None`` означает «весь файл».
     """
+    source = _as_source(path) if not isinstance(path, AppleSource) else path
     start = date_cls.fromisoformat(window) if window else None
     data = AppleData()
 
     def keep(day: str) -> bool:
         return start is None or day >= start.isoformat()
 
-    for kind, elem in _iter_nodes(path):
-        if kind == "workout":
-            _read_workout(elem, data, keep)
-        else:
-            _read_record(elem, data, keep)
+    with source.open() as stream:
+        for kind, elem in _iter_nodes(stream):
+            if kind == "exportdate":
+                data.meta["export_date"] = elem.get("value") or ""
+            elif kind == "workout":
+                _read_workout(elem, data, keep)
+            else:
+                _read_record(elem, data, keep)
 
-    _read_meta(path, data)
+    data.ecg = list(source.ecg)
     _finalize(data)
     return data
-
-
-def _read_meta(path: str | os.PathLike, data: AppleData) -> None:
-    """Заголовок и электрокардиограммы (отдельные CSV рядом с XML)."""
-    try:
-        for event, elem in ET.iterparse(str(path), events=("start",)):
-            if elem.tag == "ExportDate":
-                data.meta["export_date"] = elem.get("value") or ""
-                break
-    except ET.ParseError:
-        pass
-    folder = Path(path).parent / "electrocardiograms"
-    if folder.is_dir():
-        for ecg_path in sorted(glob.glob(str(folder / "ecg_*.csv"))):
-            name = Path(ecg_path).name
-            day = name[4:14]
-            try:
-                date_cls.fromisoformat(day)
-            except ValueError:
-                continue
-            data.ecg.append((day, name))
 
 
 def _read_record(elem: ET.Element, data: AppleData, keep) -> None:
@@ -678,10 +801,13 @@ class AppleLoadReport:
     first: str | None = None
     last: str | None = None
     written: bool = False
+    source: str = ""
 
     def lines(self) -> list[str]:
         head = "записано" if self.written else "проверка (без записи)"
         out = [f"Apple Health: {head}, окно с {self.window}"]
+        if self.source:
+            out.append(f"  источник: {self.source}")
         out.append(
             f"  записей: {self.records}, тренировок: {self.workouts}, "
             f"дней: {self.days}, пульса: {self.hr_samples}"
@@ -695,7 +821,9 @@ class AppleLoadReport:
         return out
 
 
-def summarize(data: AppleData, window: str, written: bool = False) -> AppleLoadReport:
+def summarize(
+    data: AppleData, window: str, written: bool = False, source: str = ""
+) -> AppleLoadReport:
     rows = _daily_rows(data)
     days = [row[0] for row in rows]
     return AppleLoadReport(
@@ -709,6 +837,7 @@ def summarize(data: AppleData, window: str, written: bool = False) -> AppleLoadR
         first=min(days) if days else None,
         last=max(days) if days else None,
         written=written,
+        source=source,
     )
 
 
@@ -748,16 +877,6 @@ def write_apple(conn: sqlite3.Connection, data: AppleData) -> None:
     )
     conn.executemany("INSERT OR REPLACE INTO aw_meta VALUES (?, ?)", list(data.meta.items()))
     conn.commit()
-
-
-def default_xml() -> Path:
-    """Найти XML выгрузки: самый большой ``*.xml``, кроме CDA-дубля."""
-    candidates = [Path(p) for p in glob.glob(str(APPLE_DIR / "*.xml"))]
-    if not candidates:
-        return APPLE_DIR / "export.xml"
-    real = [p for p in candidates if "cda" not in p.name.lower()]
-    pool = real or candidates
-    return max(pool, key=lambda p: p.stat().st_size)
 
 
 # --------------------------------------------------------------------------
@@ -897,12 +1016,16 @@ def load(
     window: str | None = DEFAULT_WINDOW,
     check: bool = False,
 ) -> AppleLoadReport:
-    """Разобрать выгрузку; при ``check=False`` записать в базу ``aw_*``."""
-    path = Path(xml) if xml else default_xml()
-    if not path.exists():
-        raise FileNotFoundError(f"нет выгрузки Apple Health: {path}")
-    data = parse_apple(path, window)
-    report = summarize(data, window or "вся история", written=not check)
+    """Разобрать выгрузку; при ``check=False`` записать в базу ``aw_*``.
+
+    ``xml`` - путь к XML, папке или архиву ``*.zip``. Без него берётся самый
+    свежий архив в ``data/`` (см. :func:`resolve_source`).
+    """
+    source = resolve_source(xml)
+    data = parse_apple(source, window)
+    report = summarize(
+        data, window or "вся история", written=not check, source=source.describe()
+    )
     if check:
         return report
     conn = etl.connect(db)

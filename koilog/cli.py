@@ -37,8 +37,10 @@ from typing import Sequence
 from . import equipment, etl, rules, stats
 from .core import BODY_WEIGHT
 from .health import apple as health_apple
+from .health import digest as health_digest
 from .health import illness as health_illness
 from .health import load as health_load
+from .health import retrain as health_retrain
 
 __all__ = ["build_parser", "main"]
 
@@ -410,6 +412,20 @@ def cmd_weeks(args: argparse.Namespace) -> int:
         rows = stats.weekly_koi(
             conn, exercise=args.exercise, group=args.group, limit=args.limit
         )
+        # подсчёт общего числа недель (целых) с учётом фильтров
+        clauses: list[str] = []
+        params: list[Any] = []
+        if args.exercise is not None:
+            clauses.append("exercise = ?")
+            params.append(args.exercise)
+        if args.group is not None:
+            clauses.append("exercise_group = ?")
+            params.append(args.group)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        total_weeks = conn.execute(
+            "SELECT COUNT(DISTINCT week) FROM v_weekly_koi" + where,
+            params,
+        ).fetchone()[0]
     finally:
         conn.close()
 
@@ -417,6 +433,10 @@ def cmd_weeks(args: argparse.Namespace) -> int:
         print("недель с посчитанным КОИ нет")
         return 1
     print(stats.format_weekly_koi(rows), end="")
+    if args.limit and total_weeks > (args.limit if args.limit > 0 else total_weeks):
+        shown_weeks = min(args.limit, total_weeks) if args.limit > 0 else total_weeks
+        print(f"показано {shown_weeks} из {total_weeks} недель "
+              f"(--limit 0 - показать все)")
     return 0
 
 
@@ -765,6 +785,57 @@ def cmd_ml(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_return(args: argparse.Namespace) -> int:
+    """Возврат к рабочим весам после болезни: кривая, рампа, гейт."""
+    conn = _open(args)
+    try:
+        exercise = args.exercise or health_retrain.default_exercise(conn)
+        plan = health_retrain.return_plan(
+            conn, exercise, steps=args.steps)
+        if args.json:
+            payload = plan.to_dict()
+            if args.returns:
+                payload["returns"] = [
+                    row.to_dict()
+                    for row in health_retrain.returns(conn, exercise)
+                ]
+        else:
+            curve = health_retrain.detraining_curve(conn, exercise)
+            # Сначала расчёты (возврат к весам), потом описательная кривая с
+            # литературными ориентирами в самом конце.
+            blocks = [health_retrain.format_return(plan)]
+            if args.returns:
+                blocks += [
+                    "",
+                    health_retrain.format_returns(
+                        health_retrain.returns(conn, exercise), exercise),
+                ]
+            blocks += ["", health_retrain.format_curve(curve, exercise)]
+    finally:
+        conn.close()
+
+    if args.json:
+        print(health_retrain.dumps(payload))
+    else:
+        print("\n".join(blocks))
+    return 0
+
+
+def cmd_digest(args: argparse.Namespace) -> int:
+    """Одна карточка дня: каналы часов, нагрузка, рекомендация."""
+    conn = _open(args)
+    try:
+        state = health_digest.day_state(conn, args.date)
+    finally:
+        conn.close()
+
+    if args.json:
+        print(health_digest.dumps(state))
+    else:
+        print(health_digest.format_digest(state))
+    return 0
+
+
 # --------------------------------------------------------------------------
 # Разбор аргументов
 # --------------------------------------------------------------------------
@@ -918,7 +989,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_apple = sub.add_parser(
         "apple-load", help="разобрать выгрузку Apple Health (export.xml) в aw_*")
     p_apple.add_argument("--xml", default=None,
-                         help="путь к export.xml (по умолчанию ищется сам)")
+                         help="путь к export.xml, папке выгрузки или архиву "
+                              "экспорт.zip (по умолчанию берётся самый свежий "
+                              "архив в data/)")
     p_apple.add_argument("--window", default=health_apple.DEFAULT_WINDOW,
                          help=f"первая дата включительно (по умолчанию "
                               f"{health_apple.DEFAULT_WINDOW})")
@@ -950,6 +1023,30 @@ def build_parser() -> argparse.ArgumentParser:
                       help="показать лаг-анализ: на сколько дней до эпизода "
                            "признаки отклоняются сильнее всего")
     p_ml.set_defaults(func=cmd_ml)
+
+    p_return = sub.add_parser(
+        "return", help="возврат к рабочим весам после болезни: "
+                       "детрейн-кривая, рампа, гейт")
+    p_return.add_argument("exercise", nargs="?", default=None,
+                          help="упражнение (по умолчанию - самое частое "
+                               "в журнале)")
+    p_return.add_argument("--steps", type=int, default=None,
+                          help="сколько шагов рампы показать (по умолчанию "
+                               "зависит от полосы простоя)")
+    p_return.add_argument("--returns", action="store_true",
+                          help="добавить разметку прошлых возвратов: "
+                               "жёсткий / средний / мягкий и рецидивы")
+    p_return.add_argument("--json", action="store_true", help="машинный вывод")
+    p_return.set_defaults(func=cmd_return)
+
+    p_digest = sub.add_parser(
+        "digest", help="день одной карточкой: каналы часов, нагрузка, "
+                       "рекомендация")
+    p_digest.add_argument("--date", default=None,
+                          help="день в виде ГГГГ-ММ-ДД (по умолчанию - "
+                               "последний день с данными)")
+    p_digest.add_argument("--json", action="store_true", help="машинный вывод")
+    p_digest.set_defaults(func=cmd_digest)
 
     return parser
 
