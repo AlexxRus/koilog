@@ -72,6 +72,63 @@ class FeatureTests(unittest.TestCase):
         self.assertIsNotNone(row["z_rhr"])
         self.assertGreater(row["sleep_debt7"], 0.0)
 
+    def test_v2_features_are_built(self):
+        """Признаки v2: скользящие суммы, тренды, разрыв серии."""
+        conn = _synthetic_db()
+        ml.build_features(conn, window=None)
+        late = conn.execute(
+            "SELECT * FROM ml_features WHERE date = '2024-03-15'").fetchone()
+        # тоннаж в синтетике 900 через день: за 10 дней - 5 тренировок
+        self.assertAlmostEqual(late["cum_tonnage_10"], 5 * 900.0)
+        self.assertAlmostEqual(late["cum_tonnage_21"], 11 * 900.0)
+        self.assertIsNotNone(late["hrv_slope3"])
+        self.assertIsNotNone(late["hrv_slope5"])
+        self.assertIsNotNone(late["rhr_slope3"])
+        self.assertIsNotNone(late["rhr_slope5"])
+        # серия тренировок чередуется: разрыва >= 14 дней нет
+        self.assertEqual(late["gap_14"], 0)
+        self.assertLessEqual(late["days_since_training"], 1)
+        self.assertIsNotNone(late["interaction21"])
+
+    def test_cum_tonnage_is_none_until_window_fills(self):
+        """Суммы за 10/21 день - None, пока окно не набралось."""
+        conn = _synthetic_db()
+        ml.build_features(conn, window=None)
+        early = conn.execute(
+            "SELECT cum_tonnage_10, cum_tonnage_21 FROM ml_features "
+            "ORDER BY date LIMIT 1").fetchone()
+        self.assertIsNone(early["cum_tonnage_10"])
+        self.assertIsNone(early["cum_tonnage_21"])
+
+    def test_gap_length_counts_days_without_training(self):
+        """Разрыв серии: дни подряд без тренировки, включая сегодня."""
+        self.assertEqual(ml._gap_lengths([1, 0, 0, 1, 0]), [0, 1, 2, 0, 1])
+
+    def test_old_schema_is_migrated(self):
+        """Старые ml_features/ml_labels получают новые колонки, а не падают."""
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(ml._FEATURE_SCHEMA)
+        conn.execute("DROP TABLE ml_features")
+        conn.executescript(
+            "CREATE TABLE ml_features ("
+            " date TEXT PRIMARY KEY, y INTEGER NOT NULL DEFAULT 0,"
+            " episode_id INTEGER, z_rhr REAL, trained INTEGER DEFAULT 0)")
+        conn.execute("DROP TABLE ml_labels")
+        conn.executescript(
+            "CREATE TABLE ml_labels (date TEXT PRIMARY KEY,"
+            " y INTEGER DEFAULT 0, episode_id INTEGER, onset TEXT)")
+        conn.commit()
+        ml._ensure_columns(conn)
+        columns = {row[1] for row in conn.execute(
+            "PRAGMA table_info(ml_features)")}
+        self.assertIn("cum_tonnage_10", columns)
+        self.assertIn("y_onset", columns)
+        self.assertIn("at_risk", columns)
+        labels = {row[1] for row in conn.execute(
+            "PRAGMA table_info(ml_labels)")}
+        self.assertIn("y_onset", labels)
+
     def test_labels_horizon(self):
         conn = _synthetic_db()
         ml.build_features(conn, window=None)
@@ -89,6 +146,44 @@ class FeatureTests(unittest.TestCase):
             conn.execute("SELECT episode_id FROM ml_features WHERE date = '2024-02-25'")
             .fetchone()["episode_id"], 1)
 
+    def test_labels_onset_window(self):
+        """Метка v2: y_onset за H_ONSET = 7 дней до начала эпизода."""
+        conn = _synthetic_db()
+        ml.build_features(conn, window=None)
+        conn.execute(
+            "INSERT INTO illness_episodes (id, start, end, level, source, type) "
+            "VALUES (1, '2024-02-26', '2024-02-26', 'confirmed', 'watch', 'unknown')")
+        conn.commit()
+        ml.build_labels(conn, window=None)
+        # за 7 дней до - метка есть
+        self.assertEqual(
+            conn.execute(
+                "SELECT y_onset FROM ml_features WHERE date = '2024-02-19'")
+            .fetchone()["y_onset"], 1)
+        # за 8 дней - уже нет (а старая метка y ещё есть)
+        row = conn.execute(
+            "SELECT y, y_onset FROM ml_features WHERE date = '2024-02-18'").fetchone()
+        self.assertEqual(row["y"], 1)
+        self.assertEqual(row["y_onset"], 0)
+
+    def test_episode_days_are_not_at_risk(self):
+        """Дни внутри эпизода - «не жив»: hazard их не видит."""
+        conn = _synthetic_db()
+        ml.build_features(conn, window=None)
+        conn.execute(
+            "INSERT INTO illness_episodes (id, start, end, level, source, type) "
+            "VALUES (1, '2024-02-26', '2024-02-27', 'confirmed', 'watch', 'unknown')")
+        conn.commit()
+        ml.build_labels(conn, window=None)
+        inside = conn.execute(
+            "SELECT at_risk FROM ml_features WHERE date = '2024-02-26'"
+        ).fetchone()["at_risk"]
+        self.assertEqual(inside, 0)
+        before = conn.execute(
+            "SELECT at_risk FROM ml_features WHERE date = '2024-02-25'"
+        ).fetchone()["at_risk"]
+        self.assertEqual(before, 1)
+
     def test_gap_only_not_a_positive(self):
         conn = _synthetic_db()
         ml.build_features(conn, window=None)
@@ -97,6 +192,38 @@ class FeatureTests(unittest.TestCase):
             "VALUES (1, '2024-02-26', '2024-03-01', 'gap_only', 'gap', 'unknown')")
         conn.commit()
         self.assertEqual(ml.build_labels(conn, window=None), 0)
+
+    def test_cluster_days_belong_to_nearest_onset(self):
+        """Два эпизода в 4 днях: день уходит **своему** (ближайшему) onset'у.
+
+        Раньше ``episode_id`` затирал эпизод, обработанный позже: день за
+        6 дней до первого получал id второго, и в CV ``lead`` вылезал за
+        горизонт (баг с lead 8-14 при окне в 7 дней).
+        """
+        conn = _synthetic_db()
+        ml.build_features(conn, window=None)
+        conn.executescript(
+            "INSERT INTO illness_episodes (id, start, end, level, source, type) "
+            "VALUES (1, '2024-02-20', '2024-02-21', 'confirmed', 'watch', 'x');"
+            "INSERT INTO illness_episodes (id, start, end, level, source, type) "
+            "VALUES (2, '2024-02-24', '2024-02-24', 'confirmed', 'watch', 'x');")
+        conn.commit()
+        ml.build_labels(conn, window=None)
+        # за 6 дней до первого: его окно, id = 1 (не 2)
+        row = conn.execute(
+            "SELECT y_onset, episode_id FROM ml_features "
+            "WHERE date = '2024-02-18'").fetchone()
+        self.assertEqual((row["y_onset"], row["episode_id"]), (1, 1))
+        # день после начала первого эпизода - уже окно второго, id = 2
+        row = conn.execute(
+            "SELECT y_onset, episode_id FROM ml_features "
+            "WHERE date = '2024-02-21'").fetchone()
+        self.assertEqual((row["y_onset"], row["episode_id"]), (1, 2))
+        # в окне первого нет дней второго эпизода
+        ids = {r[0] for r in conn.execute(
+            "SELECT DISTINCT episode_id FROM ml_features "
+            "WHERE y_onset = 1 AND date BETWEEN '2024-02-13' AND '2024-02-19'")}
+        self.assertEqual(ids, {1})
 
 
 @unittest.skipUnless(ml.HAS_ML, "нет numpy/scikit-learn (koilog[ml])")
@@ -114,6 +241,35 @@ class ModelTests(unittest.TestCase):
         self.assertIn("episode_recall", result)
         self.assertIn("false_positives_per_month", result)
 
+    def test_onset_cv_runs_with_event_metrics(self):
+        """v2: риск на горизонте, event-метрики (lead, ложные алерты/мес)."""
+        conn = _synthetic_db()
+        ml.build_features(conn, window=None)
+        # два эпизода, чтобы у второго в обучении были положительные дни
+        conn.executescript(
+            "INSERT INTO illness_episodes (id, start, end, level, source, type) "
+            "VALUES (1, '2024-01-21', '2024-01-21', 'confirmed', 'watch', 'unknown');"
+            "INSERT INTO illness_episodes (id, start, end, level, source, type) "
+            "VALUES (2, '2024-02-26', '2024-02-26', 'confirmed', 'watch', 'unknown');")
+        conn.commit()
+        ml.build_labels(conn, window=None)
+        result = ml.onset_cv(conn, ml.V2_FEATURES, model="logreg")
+        self.assertEqual(result["episodes"], 2)
+        self.assertEqual(result["horizon"], ml.H_ONSET)
+        self.assertEqual(result["min_lead"], ml.H_MIN)
+        self.assertIn("episodes_caught", result)
+        self.assertIn("episodes_late", result)
+        self.assertIn("median_lead", result)
+        self.assertIn("false_alarms_per_month", result)
+        # поэпизодные детали: нужны, чтобы видеть, какие эпизоды пойманы
+        self.assertIn("per_episode", result)
+        self.assertIn("fp_days", result)
+        self.assertEqual(len(result["per_episode"]), 2)
+        self.assertIn(result["per_episode"][0]["status"],
+                      {"caught", "late", "missed", "no_window", "no_train"})
+        self.assertGreaterEqual(
+            result["episodes_caught"] + result["episodes_late"], 0)
+
     def test_report_assembles_blocks(self):
         conn = _synthetic_db()
         conn.execute(
@@ -122,10 +278,116 @@ class ModelTests(unittest.TestCase):
         conn.commit()
         data = ml.report(conn, window=None, as_json=True)
         self.assertIn("cv_logreg", data)
+        self.assertIn("onset_v2", data)
+        self.assertIn("onset_baseline", data)
         self.assertIn("lag_tonnage", data)
         self.assertIn("red_flag", data)
+        # честная оценка: бюджеты алертов и AUC с интервалом по эпизодам
+        self.assertIn("walk_v2", data)
+        self.assertIn("walk_baseline", data)
+        self.assertIn("matched_v2", data)
+        self.assertIn("matched_baseline", data)
         import json
         self.assertIsInstance(json.loads(ml.dumps(data)), dict)
+
+    def test_format_report_shows_both_protocols(self):
+        """Отчёт печатает и v2 (события), и старую day-классификацию."""
+        conn = _synthetic_db()
+        conn.execute(
+            "INSERT INTO illness_episodes (id, start, end, level, source, type) "
+            "VALUES (1, '2024-02-26', '2024-02-26', 'confirmed', 'watch', 'unknown')")
+        conn.commit()
+        text = ml.format_report(ml.report(conn, window=None, as_json=True))
+        self.assertIn("v2: риск эпизода", text)
+        self.assertIn("day-классификация", text)
+        self.assertIn("recall@бюджет", text)
+        self.assertIn("случайный", text)
+
+    def test_metrics_auc_and_pr_auc(self):
+        """AUC/PR-AUC считаем сами - без sklearn, проверено на known cases."""
+        self.assertAlmostEqual(
+            ml._roc_auc([0.9, 0.8, 0.3, 0.1], [1, 1, 0, 0]), 1.0)
+        self.assertAlmostEqual(
+            ml._roc_auc([0.1, 0.2, 0.7, 0.9], [1, 1, 0, 0]), 0.0)
+        self.assertAlmostEqual(
+            ml._roc_auc([0.4, 0.4, 0.4, 0.4], [1, 0, 1, 0]), 0.5)
+        # одно неверное сравнение из четырёх: (4 - 1) / 4 = 0.75
+        self.assertAlmostEqual(
+            ml._roc_auc([0.9, 0.3, 0.8, 0.2], [1, 1, 0, 0]), 0.75)
+        self.assertIsNone(ml._roc_auc([0.4], [1]))
+        self.assertIsNone(ml._roc_auc([], []))
+        # ранжирование идеальное: 1/1 + 2/2 + 3/4 = 2.75 на 3 положительных
+        self.assertAlmostEqual(
+            ml._average_precision([0.9, 0.8, 0.2, 0.1], [1, 1, 0, 1]),
+            2.75 / 3)
+        # все дни положительные - как у случайной модели 1.0
+        self.assertAlmostEqual(
+            ml._average_precision([0.1, 0.9, 0.2], [1, 1, 1]), 1.0)
+        self.assertIsNone(ml._average_precision([0.5, 0.4], [0, 0]))
+
+    def test_quantile_picks_threshold_for_budget(self):
+        self.assertEqual(ml._quantile([1, 2, 3, 4, 5], 0.0), 1)
+        self.assertEqual(ml._quantile([1, 2, 3, 4, 5], 1.0), 5)
+        self.assertEqual(ml._quantile([1, 2, 3, 4, 5], 0.5), 3)
+
+    def test_walk_forward_recall_at_budget(self):
+        """Порог под бюджет: модель и случайный ноль сравниваются одинаково."""
+        conn = _synthetic_db()
+        ml.build_features(conn, window=None)
+        conn.executescript(
+            "INSERT INTO illness_episodes (id, start, end, level, source, type) "
+            "VALUES (1, '2024-01-21', '2024-01-21', 'confirmed', 'watch', 'unknown');"
+            "INSERT INTO illness_episodes (id, start, end, level, source, type) "
+            "VALUES (2, '2024-02-26', '2024-02-26', 'confirmed', 'watch', 'unknown');")
+        conn.commit()
+        ml.build_labels(conn, window=None)
+        result = ml.walk_forward(conn, ml.V2_FEATURES, model="logreg",
+                                 budgets=(2.0, 4.0), random_repeats=5,
+                                 auc_bootstrap=20)
+        self.assertEqual(result["episodes"], 2)
+        self.assertEqual(len(result["budgets"]), 2)
+        self.assertGreater(result["evaluated"], 0)
+        self.assertLessEqual(result["evaluated"], result["days"])
+        alerts = [row["model"]["alert_days"] for row in result["budgets"]]
+        self.assertEqual(alerts, sorted(alerts))
+        for row in result["budgets"]:
+            for side in ("model", "random"):
+                recall = row[side]["episode_recall"]
+                self.assertIsNotNone(recall)
+                self.assertGreaterEqual(recall, 0.0)
+                self.assertLessEqual(recall, 1.0)
+                self.assertLessEqual(row[side]["episodes_caught"],
+                                     result["episodes"])
+        self.assertGreater(result["seasonal"]["alert_days"], 0)
+        self.assertGreater(result["always"]["alerts_per_month"], 0)
+        # расклад ложных алертов по зонам до onset'а - видно, что вне
+        # окна алерты структуры не имеют
+        self.assertIn("fp_zone_base", result)
+        self.assertIn("fp_zones", result["budgets"][0]["model"])
+        self.assertIsNotNone(result["auc"])
+        self.assertTrue(0.0 <= result["auc"] <= 1.0)
+        self.assertLessEqual(result["auc_ci"]["low"], result["auc_ci"]["high"])
+        self.assertEqual(set(result["auc_by_lead"]), {"near", "far"})
+
+    def test_matched_auc_bootstrap_by_episode(self):
+        """Интервал AUC - по эпизодам (дни внутри эпизода не независимы)."""
+        conn = _synthetic_db()
+        ml.build_features(conn, window=None)
+        conn.executescript(
+            "INSERT INTO illness_episodes (id, start, end, level, source, type) "
+            "VALUES (1, '2024-01-21', '2024-01-21', 'confirmed', 'watch', 'unknown');"
+            "INSERT INTO illness_episodes (id, start, end, level, source, type) "
+            "VALUES (2, '2024-02-26', '2024-02-26', 'confirmed', 'watch', 'unknown');")
+        conn.commit()
+        ml.build_labels(conn, window=None)
+        block = ml.matched_auc(conn, ml.V2_FEATURES, control=(8, 14),
+                               bootstrap=50)
+        self.assertEqual(block["episodes"], 2)
+        self.assertEqual(block["control"], [8, 14])
+        self.assertEqual(block["bootstrap"], 50)
+        self.assertIsNotNone(block["auc"])
+        self.assertTrue(0.0 <= block["auc"] <= 1.0)
+        self.assertLessEqual(block["low"], block["high"])
 
 
 class IsolationTests(unittest.TestCase):

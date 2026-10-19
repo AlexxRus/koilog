@@ -12,13 +12,33 @@
 - **Признаки** (:func:`build_features`) - на каждый день непрерывного ряда:
   личные z-скоры часовых метрик, долг сна, разброс времени отбоя, внешняя
   нагрузка (ACWR, EWMA-ACWR, монотонность, стрейн, недельный тоннаж),
-  флаг просадки e1RM, взаимодействие «недосып × тоннаж».
-- **Связь с болезнью** (:func:`build_labels`) - ``y=1`` у дней за ``horizon``
-  дней до начала эпизода. ``gap_only`` в обучение не идёт.
-- **Протокол** (:func:`leave_one_episode_out`) - каждый эпизод по очереди
+  флаг просадки e1RM, взаимодействие «недосып × тоннаж». С v2 добавлены
+  **тренды и разрывы серии**: ``hrv_slope3/5``, ``rhr_slope3/5`` (наклон
+  z-ряда, не уровень), ``cum_tonnage_10/21``, ``days_since_training``,
+  ``gap_14``, «долг × тоннаж за 21 день».
+- **Две метки** (:func:`build_labels`) - старая day-классификация
+  (``y``, окно 14 дней) и **v2** (``y_onset``): «эпизод начнётся в
+  ``(t, t + 7]``», плюс флаг ``at_risk`` - дни внутри эпизода из обучения
+  исключены.
+- **Протокол v1** (:func:`leave_one_episode_out`) - каждый эпизод по очереди
   уходит в тест целиком; случайные фолды запрещены, иначе утечка времени.
-  Метрика - не точность по дням, а **recall эпизодов** и число ложных
-  срабатываний в месяц, плюс обязательный бейзлайн «только пульс и сон».
+  Метрика - recall эпизодов и ложные срабатывания в месяц, плюс
+  обязательный бейзлайн «только пульс и сон».
+- **Протокол v2** (:func:`onset_cv`) - то же поэпизодное разделение, но
+  постановка «риск на горизонте» (landmark survival): P(onset в
+  ``(t, t+H]`` | жив на t). Метрики событийные - ``lead_time`` первого
+  алерта, поимка эпизодов с ``lead >= H_MIN = 3``, ложные алерты в месяц.
+  Буквальный h(t) = P(onset в день t) здесь не берётся: признаки самого
+  дня t (ВСР уже подняты) учат модель предсказывать «сегодня болен», а не
+  «через 3-5 дней».
+- **Честная оценка** (:func:`walk_forward`, :func:`matched_auc`) - главная
+  оценка v2: день за днём, трейн только по прошлому, и вместо порога 0.5
+  (для ``class_weight=balanced`` он ничего не значит) - operating point:
+  порог = квантиль прошлых вероятностей под бюджет ``b`` алерт-дней в месяц.
+  ``recall@бюджет`` сравнивается с двумя нулями - случайным алертом того же
+  размера и сезонным календарём; AUC против далёкого контроля (15-28 дней
+  до начала) даётся с **bootstrap-CI по эпизодам**, потому что дни одного
+  эпизода не независимы.
 - **Лаг-анализ** (:func:`lag_analysis`) - за сколько дней до эпизода нагрузка
   и физиология отклоняются сильнее всего.
 - **Красный флаг** (:func:`red_flag_report`) - операционализация Meeusen et al.
@@ -33,10 +53,13 @@
 from __future__ import annotations
 
 import json
+import random
 import sqlite3
 import statistics
 import warnings
+from bisect import bisect_right
 from dataclasses import dataclass
+from datetime import date as _date, timedelta as _timedelta
 
 from . import illness as health_illness
 from . import load as health_load
@@ -69,17 +92,33 @@ __all__ = [
     "BASELINE_FEATURES",
     "HAS_ML",
     "HORIZON",
+    "H_MIN",
+    "H_ONSET",
     "MODEL_FEATURES",
+    "V2_BASELINE_FEATURES",
+    "V2_FEATURES",
     "build_features",
     "build_labels",
     "lag_analysis",
     "leave_one_episode_out",
+    "matched_auc",
+    "onset_cv",
     "red_flag_report",
     "report",
+    "walk_forward",
 ]
 
 #: Горизонт алерта: болезнь предсказывается за столько дней до начала.
 HORIZON = 14
+
+#: Горизонт ML v2: день ``t`` положителен, если эпизод начнётся в
+#: ``(t, t + H_ONSET]`` («риск на горизонте», landmark survival - см.
+#: докстринг :func:`leave_one_episode_out_onset`).
+H_ONSET = 7
+
+#: Минимальный lead time v2: срабатывание ближе чем за ``H_MIN`` дней до
+#: начала эпизода опоздало и поимкой не считается.
+H_MIN = 3
 
 #: Окно личного базлайна для z-скоров.
 BASELINE_DAYS = 60
@@ -92,15 +131,31 @@ MODEL_FEATURES: tuple[str, ...] = (
     "rm_regress", "interaction",
 )
 
+#: Признаки ML v2: к основной модели добавлены тренды и разрывы серии -
+#: то, что отстаёт от «уровня» и потому раньше предупреждает (§9.1 плана).
+V2_FEATURES: tuple[str, ...] = MODEL_FEATURES + (
+    "cum_tonnage_10", "cum_tonnage_21",
+    "hrv_slope3", "hrv_slope5", "rhr_slope3", "rhr_slope5",
+    "days_since_training", "gap_14", "interaction21",
+)
+
 #: Бейзлайн без нагрузки: только физиология.
 BASELINE_FEATURES: tuple[str, ...] = (
     "z_rhr", "z_hrv", "z_resp", "z_wrist", "sleep_debt7",
+)
+
+#: Бейзлайн v2 без нагрузки: физиология плюс её же тренды.
+V2_BASELINE_FEATURES: tuple[str, ...] = (
+    "z_rhr", "z_hrv", "z_resp", "z_wrist", "sleep_debt7",
+    "hrv_slope3", "rhr_slope3",
 )
 
 _FEATURE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS ml_features (
   date            TEXT PRIMARY KEY,
   y               INTEGER NOT NULL DEFAULT 0,
+  y_onset         INTEGER NOT NULL DEFAULT 0,
+  at_risk         INTEGER NOT NULL DEFAULT 1,
   episode_id      INTEGER,
   z_rhr           REAL, z_hrv REAL, z_resp REAL, z_wrist REAL, z_spo2 REAL,
   sleep_debt7     REAL,
@@ -109,21 +164,51 @@ CREATE TABLE IF NOT EXISTS ml_features (
   weekly_tonnage  REAL,
   rm_regress      INTEGER NOT NULL DEFAULT 0,
   interaction     REAL,
+  cum_tonnage_10  REAL,
+  cum_tonnage_21  REAL,
+  hrv_slope3      REAL, hrv_slope5 REAL,
+  rhr_slope3      REAL, rhr_slope5 REAL,
+  days_since_training INTEGER NOT NULL DEFAULT 0,
+  gap_14          INTEGER NOT NULL DEFAULT 0,
+  interaction21   REAL,
   trained         INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS ml_labels (
   date       TEXT PRIMARY KEY,
   y          INTEGER NOT NULL DEFAULT 0,
+  y_onset    INTEGER NOT NULL DEFAULT 0,
   episode_id INTEGER,
   onset      TEXT
 );
 """
 
+#: Колонки, добавляемые в старые базы (миграция без пересоздания).
+_MIGRATION: tuple[tuple[str, str, str], ...] = (
+    ("ml_features", "y_onset", "INTEGER NOT NULL DEFAULT 0"),
+    ("ml_features", "at_risk", "INTEGER NOT NULL DEFAULT 1"),
+    ("ml_features", "cum_tonnage_10", "REAL"),
+    ("ml_features", "cum_tonnage_21", "REAL"),
+    ("ml_features", "hrv_slope3", "REAL"),
+    ("ml_features", "hrv_slope5", "REAL"),
+    ("ml_features", "rhr_slope3", "REAL"),
+    ("ml_features", "rhr_slope5", "REAL"),
+    ("ml_features", "days_since_training", "INTEGER NOT NULL DEFAULT 0"),
+    ("ml_features", "gap_14", "INTEGER NOT NULL DEFAULT 0"),
+    ("ml_features", "interaction21", "REAL"),
+    ("ml_labels", "y_onset", "INTEGER NOT NULL DEFAULT 0"),
+)
+
 _FEATURE_COLUMNS: tuple[str, ...] = (
-    "date", "z_rhr", "z_hrv", "z_resp", "z_wrist", "z_spo2",
+    # метки (y, y_onset, at_risk, episode_id) сюда не входят: их пишет
+    # build_labels, здесь - только признаки
+    "date",
+    "z_rhr", "z_hrv", "z_resp", "z_wrist", "z_spo2",
     "sleep_debt7", "sleep_start_sd7", "acwr", "acwr_ewma", "monotony",
-    "strain", "weekly_tonnage", "rm_regress", "interaction", "trained",
+    "strain", "weekly_tonnage", "rm_regress", "interaction",
+    "cum_tonnage_10", "cum_tonnage_21",
+    "hrv_slope3", "hrv_slope5", "rhr_slope3", "rhr_slope5",
+    "days_since_training", "gap_14", "interaction21", "trained",
 )
 
 
@@ -157,8 +242,8 @@ def _load_rows(conn: sqlite3.Connection, window: str | None) -> list[dict]:
     external = {
         row["date"]: dict(row)
         for row in conn.execute(
-            "SELECT date, acwr, acwr_ewma, monotony, strain, weekly_tonnage, "
-            "rm_regress FROM load_daily "
+            "SELECT date, tonnage, acwr, acwr_ewma, monotony, strain, "
+            "weekly_tonnage, rm_regress FROM load_daily "
             + ("WHERE date >= ? " if window else "")
             + "ORDER BY date",
             (window,) if window else (),
@@ -214,12 +299,76 @@ def _minutes(clock: str) -> float:
     return value if value >= 12 * 60 else value + 24 * 60
 
 
+def _rolling_sum(values: list[float], window: int) -> list[float | None]:
+    """Сумма за ``window`` дней, отстающая (включает текущий день).
+
+    Пока в окне не набралось ``window`` наблюдений - ``None``: честнее
+    начинать серию с полного окна, чем учить модель на неполных суммах.
+    """
+    out: list[float | None] = []
+    for index in range(len(values)):
+        if index + 1 < window:
+            out.append(None)
+        else:
+            out.append(sum(values[index - window + 1:index + 1]))
+    return out
+
+
+def _slope(series: list[float | None], window: int) -> list[float | None]:
+    """Наклон линейного тренда за последние ``window`` дней (в единицах/день).
+
+    Это **тренд, а не уровень**: z-скор держится высоким и во время, и
+    после болезни, а наклон показывает, куда ряд идёт. Нужны все ``window``
+    значений подряд без пропусков, иначе ``None``.
+    """
+    out: list[float | None] = []
+    for index in range(len(series)):
+        chunk = series[index - window + 1:index + 1] if index + 1 >= window else []
+        if len(chunk) < window or any(value is None for value in chunk):
+            out.append(None)
+            continue
+        # наклон МНК по x = 0..window-1: Cov(x, y) / Var(x)
+        mean_x = (window - 1) / 2
+        mean_y = sum(chunk) / window
+        var_x = sum((x - mean_x) ** 2 for x in range(window))
+        cov = sum((x - mean_x) * (y - mean_y)
+                  for x, y in enumerate(chunk))
+        out.append(cov / var_x)
+    return out
+
+
+def _gap_lengths(trained: list[int]) -> list[int]:
+    """Длина текущего «разрыва серии»: дней без тренировки подряд, включая сегодня."""
+    out: list[int] = []
+    streak = 0
+    for flag in trained:
+        streak = 0 if flag else streak + 1
+        out.append(streak)
+    return out
+
+
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    """Миграция старых ``ml_features``/``ml_labels``: добавить новые колонки.
+
+    Таблицы материализуются заново при каждом запуске, но пересоздавать их
+    ради колонок жалко - вдруг лежат в долгой личной базе. ``ALTER TABLE``
+    добавляет недостающее и не трогает остальное.
+    """
+    for table, column, decl in _MIGRATION:
+        existing = {
+            row[1] for row in conn.execute(f"PRAGMA table_info({table})")
+        }
+        if _has_table(conn, table) and column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
 def build_features(
     conn: sqlite3.Connection,
     window: str | None = health_load.DEFAULT_WINDOW,
 ) -> int:
     """Материализовать ``ml_features``; вернуть число дней."""
     conn.executescript(_FEATURE_SCHEMA)
+    _ensure_columns(conn)
     if not (_has_table(conn, "aw_daily") and _has_table(conn, "load_daily")):
         raise RuntimeError(
             "нет aw_daily/load_daily - сначала:  "
@@ -245,16 +394,29 @@ def build_features(
     debt7 = _sleep_debt([r["sleep_hours"] for r in rows])
     start_sd = _sleep_start_sd(rows)
 
+    tonnage = [row.get("tonnage") or 0.0 for row in rows]
+    cum10 = _rolling_sum(tonnage, 10)
+    cum21 = _rolling_sum(tonnage, 21)
+    hrv3, hrv5 = _slope(z_hrv, 3), _slope(z_hrv, 5)
+    rhr3, rhr5 = _slope(z_rhr, 3), _slope(z_rhr, 5)
+    gaps = _gap_lengths([row["trained"] or 0 for row in rows])
+
     payload = []
     for index, row in enumerate(rows):
-        tonnage = row.get("weekly_tonnage") or 0.0
+        tonnage_week = row.get("weekly_tonnage") or 0.0
         debt = debt7[index]
+        cum21_value = cum21[index]
         payload.append((
             row["date"], z_rhr[index], z_hrv[index], z_resp[index],
             z_wrist[index], z_spo2[index], debt, start_sd[index],
             row.get("acwr"), row.get("acwr_ewma"), row.get("monotony"),
             row.get("strain"), row.get("weekly_tonnage"),
-            row.get("rm_regress") or 0, debt * tonnage, row["trained"] or 0,
+            row.get("rm_regress") or 0, debt * tonnage_week,
+            cum10[index], cum21_value,
+            hrv3[index], hrv5[index], rhr3[index], rhr5[index],
+            gaps[index], 1 if gaps[index] >= 14 else 0,
+            debt * cum21_value if cum21_value is not None else None,
+            row["trained"] or 0,
         ))
     conn.execute("DELETE FROM ml_features")
     placeholders = ", ".join("?" * len(_FEATURE_COLUMNS))
@@ -276,41 +438,86 @@ def build_labels(
     conn: sqlite3.Connection,
     window: str | None = health_load.DEFAULT_WINDOW,
     horizon: int = HORIZON,
+    onset_horizon: int = H_ONSET,
 ) -> int:
-    """Разметить дни: ``y=1`` за ``horizon`` дней до начала эпизода.
+    """Разметить дни.
+
+    Две метки:
+
+    - ``y=1`` за ``horizon`` дней до начала эпизода - **старая**
+      day-классификация, остаётся как бейзлайн (§9.1);
+    - ``y_onset=1``, если эпизод начнётся в ``(t, t + onset_horizon]``
+      («риск на горизонте», H_ONSET = 7) - метка ML v2;
+    - ``at_risk=0`` внутри эпизода: эти дни «не жив» и в обучение
+      hazard-модели не идут (P(onset | не было до t)).
 
     ``gap_only`` в обучение не берётся (§5): смысла в «перерыве без болезни»
     как в положительном классе нет, а как в отрицательном он бы врал, потому
     что внутри перерыва тренировок и не было.
+
+    **Привязка к ближайшему будущему эпизоду.** Окна плотных кластеров
+    (onset'ы ближе горизонта) перекрываются, и день принадлежал сразу двум
+    эпизодам: ``episode_id`` затирал тот, что обработан позже, а ``onset``
+    жил при этом от первого. В CV это давало ``lead`` до 14 при окне 7 и
+    «вымышленные» onset'ы. Теперь каждый день привязан к **первому
+    будущему** onset'у — к тому, что этот день и должен предсказывать;
+    окно второго эпизода кластера начинается после первого.
     """
     conn.executescript(_FEATURE_SCHEMA)
+    _ensure_columns(conn)
     episodes = [e for e in health_illness.episodes(conn) if e.level != "gap_only"]
     dates = [row["date"] for row in conn.execute(
         "SELECT date FROM ml_features ORDER BY date")]
     index_of = {day: i for i, day in enumerate(dates)}
 
-    labels = {day: (0, None, None) for day in dates}
+    # дни самого эпизода — «не жив»: в hazard не идут
     for episode in episodes:
-        onset = episode.start
-        if onset not in index_of:
+        if episode.start not in index_of:
             continue
-        start = max(0, index_of[onset] - horizon)
-        for position in range(start, index_of[onset]):
-            labels[dates[position]] = (1, episode.id, onset)
+        for position in range(index_of[episode.start], len(dates)):
+            day = dates[position]
+            if day > episode.end:
+                break
+            conn.execute(
+                "UPDATE ml_features SET at_risk = 0 WHERE date = ?", (day,))
+
+    onsets = sorted((e.start, e.id) for e in episodes if e.start in index_of)
+    starts = [start for start, _ in onsets]
+    labels: dict[str, tuple] = {}
+    for day in dates:
+        position = bisect_right(starts, day)  # первый onset строго после дня
+        y = onset_label = 0
+        eid = stored_onset = None
+        if position < len(onsets):
+            first_start, first_id = onsets[position]
+            lead_days = (_date.fromisoformat(first_start)
+                         - _date.fromisoformat(day)).days
+            if lead_days <= horizon:
+                y = 1
+                eid = first_id
+                stored_onset = first_start
+                if lead_days <= onset_horizon:
+                    onset_label = 1
+        labels[day] = (y, onset_label, eid, stored_onset)
 
     conn.execute("DELETE FROM ml_labels")
     conn.executemany(
-        "INSERT INTO ml_labels (date, y, episode_id, onset) VALUES (?, ?, ?, ?)",
-        [(day, y, eid, onset) for day, (y, eid, onset) in labels.items()],
+        "INSERT INTO ml_labels (date, y, y_onset, episode_id, onset) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [(day, y, onset_label, eid, stored_onset)
+         for day, (y, onset_label, eid, stored_onset) in labels.items()],
     )
     conn.execute(
         "UPDATE ml_features SET y = COALESCE("
         "(SELECT y FROM ml_labels WHERE ml_labels.date = ml_features.date), 0), "
+        "y_onset = COALESCE("
+        "(SELECT y_onset FROM ml_labels "
+        " WHERE ml_labels.date = ml_features.date), 0), "
         "episode_id = (SELECT episode_id FROM ml_labels "
         "WHERE ml_labels.date = ml_features.date)"
     )
     conn.commit()
-    return sum(1 for y, _, _ in labels.values() if y)
+    return sum(1 for y, _, _, _ in labels.values() if y)
 
 
 # --------------------------------------------------------------------------
@@ -320,11 +527,13 @@ def build_labels(
 
 @dataclass(slots=True)
 class Dataset:
-    """День × признаки плюс метка и «свой» эпизод."""
+    """День × признаки плюс метки, «свой» эпизод и флаг риска."""
 
     dates: list[str]
     X: "object"  # numpy.ndarray
-    y: "object"   # numpy.ndarray
+    y: "object"   # numpy.ndarray (старая метка)
+    y_onset: "object"  # numpy.ndarray (метка v2)
+    at_risk: "object"  # numpy.ndarray (день вне эпизода)
     episode: list[int | None]
 
 
@@ -332,15 +541,18 @@ def _dataset(conn: sqlite3.Connection, features: tuple[str, ...]) -> Dataset:
     _require_ml()
     columns = ", ".join(features)
     rows = conn.execute(
-        f"SELECT date, y, episode_id, {columns} FROM ml_features ORDER BY date"
+        f"SELECT date, y, y_onset, at_risk, episode_id, {columns} "
+        "FROM ml_features ORDER BY date"
     ).fetchall()
     dates = [row["date"] for row in rows]
     y = _np.array([row["y"] for row in rows], dtype=float)
+    y_onset = _np.array([row["y_onset"] for row in rows], dtype=float)
+    at_risk = _np.array([row["at_risk"] for row in rows], dtype=bool)
     episode = [row["episode_id"] for row in rows]
     matrix = _np.array(
         [[_num(row[name]) for name in features] for row in rows], dtype=float
     )
-    return Dataset(dates, matrix, y, episode)
+    return Dataset(dates, matrix, y, y_onset, at_risk, episode)
 
 
 def _num(value) -> float:
@@ -432,6 +644,558 @@ def leave_one_episode_out(
         "false_positives_per_month": total_fp / months,
         "negatives": negatives,
         "model": model,
+    }
+
+
+def onset_cv(
+    conn: sqlite3.Connection,
+    features: tuple[str, ...] = V2_FEATURES,
+    horizon: int = H_ONSET,
+    min_lead: int = H_MIN,
+    model: str = "logreg",
+) -> dict:
+    """Оценить **v2**: риск начала эпизода на горизонте ``horizon`` дней.
+
+    Постановка - дискретная выживаемость в landmark-форме (по плану §9.1,
+    «риск на горизонте»): метка дня ``t`` - «эпизод начнётся в
+    ``(t, t + horizon]``», то есть P(onset | жив на t). Буквальный
+    h(t) = P(onset в день t) здесь хуже: признаки самого дня t (ВСР и пульс
+    уже подняты) учат модель предсказывать «сегодня болен», а не
+    «через 3-5 дней».
+
+    Протокол тот же, что в :func:`leave_one_episode_out` - по одному
+    эпизоду в тест, случайных фолдов нет. Дни **внутри** эпизодов
+    (``at_risk=0``) из обучения исключены целиком: они «не жив», и
+    hazard без них не имеет смысла.
+
+    Метрики событийные: поимка эпизода с ``lead_time >= min_lead``,
+    медианный lead первого алерта и ложные алерты в месяц.
+    """
+    _require_ml()
+    data = _dataset(conn, features)
+    y = data.y_onset
+    episodes = sorted({ep for ep in data.episode if ep is not None})
+    if not episodes:
+        return {"episodes": 0, "note": "нет подтверждённых/вероятных эпизодов"}
+
+    at_risk = data.at_risk
+    caught = late = total_fp = 0
+    leads: list[int] = []
+    per_episode: list[dict] = []
+    fp_days: list[str] = []
+    months = max(1.0, len(data.dates) / 30.44)
+    starts = {e.id: e.start for e in health_illness.episodes(conn)
+              if e.level != "gap_only"}
+    date_index = {day: i for i, day in enumerate(data.dates)}
+    for episode in episodes:
+        # в тест идут только дни **метки v2** (y_onset=1) и «живые»
+        # (at_risk=1): дни за 8-14 дней до эпизода метки не имеют, и алерт
+        # там - это ложный, а не «очень ранний»; дни внутри прошлого
+        # эпизода - не «жив», и hazard их не рассматривает
+        test_pos = [
+            i for i, ep in enumerate(data.episode)
+            if ep == episode and y[i] == 1 and at_risk[i]
+        ]
+        # onset берём из таблицы эпизодов, а не «последний день окна + 1»:
+        # в плотном кластере окно обрезано, и такая реконструкция врала
+        onset_date = starts.get(episode)
+        if onset_date is None and test_pos:
+            tail = test_pos[-1] + 1
+            onset_date = data.dates[onset_position] if (
+                (onset_position := test_pos[-1] + 1) < len(data.dates)) else None
+        onset_position = date_index.get(onset_date) if onset_date else None
+        if not test_pos or onset_position is None:
+            per_episode.append({"episode": episode, "onset": onset_date,
+                                "status": "no_window", "lead": None,
+                                "alarms": 0, "alarm_day": None})
+            continue
+        train = [
+            i for i in range(len(data.dates))
+            if at_risk[i] and data.episode[i] != episode
+        ]
+        # если в обучении не осталось ни одного положительного дня (например,
+        # эпизод всего один), учить не на чем: считаем пропущенным, а не
+        # роняем протокол
+        if len(set(y[train].tolist())) < 2:
+            per_episode.append({"episode": episode, "onset": onset_date,
+                                "status": "no_train", "lead": None,
+                                "alarms": 0, "alarm_day": None})
+            continue
+        # контроль: «живые» дни без метки, ближайшие по календарю к эпизоду
+        center = sum(test_pos) // len(test_pos)
+        neg_idx = [i for i, value in enumerate(y) if value == 0 and at_risk[i]]
+        neg_idx.sort(key=lambda i: abs(i - center))
+        test_neg = neg_idx[:len(test_pos)]
+        test = test_pos + test_neg
+
+        x_train, x_test = _impute(data.X[train], data.X[test])
+        scaler = _Scaler()
+        x_train = scaler.fit_transform(x_train)
+        x_test = scaler.transform(x_test)
+        estimator = _estimator(model)
+        estimator.fit(x_train, y[train])
+        predicted = estimator.predict(x_test)
+
+        # первый алерт = ближайший к эпизоду день, где модель сработала
+        alarms = [i for pos, i in enumerate(test)
+                  if i in test_pos and predicted[pos] == 1]
+        alarms.sort()
+        lead = None
+        status = "missed"
+        if alarms:
+            lead = onset_position - alarms[0]
+            if lead >= min_lead:
+                status = "caught"
+                caught += 1
+                leads.append(lead)
+            else:
+                status = "late"
+                late += 1
+        per_episode.append({
+            "episode": episode, "onset": onset_date, "status": status,
+            "lead": lead, "alarms": len(alarms),
+            "alarm_day": data.dates[alarms[0]] if alarms else None,
+        })
+        here_fp = [i for pos, i in enumerate(test)
+                   if i in test_neg and predicted[pos] == 1]
+        total_fp += len(here_fp)
+        fp_days.extend(data.dates[i] for i in here_fp)
+
+    median_lead = int(statistics.median(leads)) if leads else None
+    return {
+        "episodes": len(episodes),
+        "episodes_caught": caught,
+        "episode_recall": caught / len(episodes),
+        "episodes_late": late,
+        "median_lead": median_lead,
+        "false_alarms": total_fp,
+        "false_alarms_per_month": total_fp / months,
+        "horizon": horizon,
+        "min_lead": min_lead,
+        "model": model,
+        # поэпизодные детали - для аудита сравнения моделей и распределения
+        # lead (медиана ровно на капе горизонта выглядит подозрительно);
+        # fp_days - даты ложных дней, чтобы считать их стриками
+        "per_episode": per_episode,
+        "fp_days": fp_days,
+    }
+
+
+# --------------------------------------------------------------------------
+# Честная оценка: различение и recall@бюджет
+# --------------------------------------------------------------------------
+
+
+def _roc_auc(scores: list[float], labels: list[int]) -> float | None:
+    """ROC-AUC без sklearn: ранги Манна-Уитни, связи - средний ранг."""
+    if not scores or len(scores) != len(labels):
+        return None
+    order = sorted(range(len(scores)), key=lambda i: scores[i])
+    ranks = [0.0] * len(order)
+    position = 0
+    while position < len(order):
+        end = position
+        while (end + 1 < len(order)
+               and scores[order[end + 1]] == scores[order[position]]):
+            end += 1
+        average = (position + end) / 2 + 1
+        for step in range(position, end + 1):
+            ranks[order[step]] = average
+        position = end + 1
+    positives = [i for i, value in enumerate(labels) if value == 1]
+    negatives = len(labels) - len(positives)
+    if not positives or not negatives:
+        return None
+    rank_sum = sum(ranks[i] for i in positives)
+    return (rank_sum - len(positives) * (len(positives) + 1) / 2) / (
+        len(positives) * negatives)
+
+
+def _average_precision(scores: list[float], labels: list[int]) -> float | None:
+    """PR-AUC (average precision); у случайной модели = доля положительных."""
+    total = sum(labels)
+    if not total or len(scores) != len(labels):
+        return None
+    order = sorted(range(len(scores)), key=lambda i: -scores[i])
+    found = 0
+    precision_sum = 0.0
+    for step, index in enumerate(order, start=1):
+        if labels[index] == 1:
+            found += 1
+            precision_sum += found / step
+    return precision_sum / total
+
+
+def _quantile(values: list[float], fraction: float) -> float:
+    """Квантиль ряда (ближайший индекс) - порог под бюджет алертов."""
+    if not values:
+        raise ValueError("пустой ряд")
+    ordered = sorted(values)
+    index = int(round(fraction * (len(ordered) - 1)))
+    return ordered[max(0, min(len(ordered) - 1, index))]
+
+
+def _day_before(day: str, other: str) -> bool:
+    """``other`` - ровно следующий календарный день после ``day``."""
+    return (_date.fromisoformat(other) - _date.fromisoformat(day)).days == 1
+
+
+def _episode_bootstrap_auc(
+    groups: list[list[float]],
+    negatives: list[float],
+    bootstrap: int,
+    seed: int = 17,
+) -> dict:
+    """AUC «дни эпизодов против прочих дней» + CI, ресемплим эпизоды.
+
+    Дни одного эпизода почти не независимы, поэтому интервал строится по
+    эпизодам: берутся группы дней одного эпизода целиком. Отрицательные дни
+    фиксированы - их много, и изменчивость интервала от них мала.
+    """
+    if not groups or not negatives:
+        return {"auc": None, "low": None, "high": None, "bootstrap": 0}
+    truth = [1] * sum(len(group) for group in groups) + [0] * len(negatives)
+    point = _roc_auc(
+        [value for group in groups for value in group] + negatives, truth)
+    chooser = random.Random(seed)
+    sample: list[float] = []
+    for _ in range(max(1, bootstrap)):
+        chosen = [chooser.choice(groups) for _ in groups]
+        values = [value for group in chosen for value in group] + negatives
+        marks = ([1] * sum(len(group) for group in chosen)
+                 + [0] * len(negatives))
+        value = _roc_auc(values, marks)
+        if value is not None:
+            sample.append(value)
+    return {
+        "auc": point,
+        "low": _quantile(sample, 0.025) if sample else None,
+        "high": _quantile(sample, 0.975) if sample else None,
+        "bootstrap": len(sample),
+    }
+
+
+def walk_forward(
+    conn: sqlite3.Connection,
+    features: tuple[str, ...] = V2_FEATURES,
+    model: str = "logreg",
+    budgets: tuple[float, ...] = (2.0, 4.0, 8.0),
+    min_lead: int = H_MIN,
+    horizon: int = H_ONSET,
+    season_months: tuple[int, ...] = (12, 1, 2),
+    seed: int = 17,
+    random_repeats: int = 50,
+    auc_bootstrap: int = 500,
+) -> dict:
+    """День за днём, прогноз только по прошлому; порог - под бюджет.
+
+    Дефолтный порог ``0.5`` на несбалансированных классах ничего не
+    значит. Здесь на каждый день берётся квантиль **прошлых** вероятностей
+    так, чтобы выходило ``b`` алерт-дней в месяц (``b`` из ``budgets``), -
+    это и есть operating point. Главное в отчёте - recall эпизодов при
+    фиксированном бюджете против двух нулей:
+
+    - **случайный** алерт с тем же числом дней (берётся **реализованный**
+      бюджет модели, а не номинальный: из-за плато вероятностей квантиль
+      даёт меньше алертов, и сравнивать с номиналом было бы нечестно);
+    - **сезонный календарь** - все дни ``season_months`` (зима, где эпизоды
+      действительно скучены, см. кластеризацию стартов).
+
+    Поимка - та же, что в :func:`onset_cv` (``lead >= min_lead``), чтобы
+    цифры стояли в одной таблице, а не в двух разных определениях.
+    """
+    _require_ml()
+    data = _dataset(conn, features)
+    at_risk = data.at_risk
+    dates = data.dates
+    n = len(dates)
+    probs: list[float | None] = [None] * n
+    for t in range(n):
+        # обучение строго на прошлом; до 30 дней истории и до первого
+        # эпизода положительных нет - день не оценивается
+        if not at_risk[t]:
+            continue
+        history = [i for i in range(t) if at_risk[i]]
+        if len(history) < 30:
+            continue
+        y = data.y_onset[history]
+        if len(set(y.tolist())) < 2:
+            continue
+        x_train, x_day = _impute(data.X[history], data.X[[t]])
+        scaler = _Scaler()
+        x_train = scaler.fit_transform(x_train)
+        x_day = scaler.transform(x_day)
+        estimator = _estimator(model)
+        estimator.fit(x_train, y)
+        probs[t] = float(estimator.predict_proba(x_day)[0][1])
+
+    scored = [t for t in range(n) if probs[t] is not None]
+    scores = [probs[t] for t in scored]
+    labels = [int(bool(data.y_onset[t])) for t in scored]
+    months = max(1.0, n / 30.44)
+
+    starts = {e.id: e.start for e in health_illness.episodes(conn)
+              if e.level != "gap_only"}
+    position_of = {day: i for i, day in enumerate(dates)}
+    windows: dict[int, tuple[list[int], int]] = {}
+    for episode in sorted({ep for ep in data.episode if ep is not None}):
+        test_pos = [i for i, ep in enumerate(data.episode)
+                    if ep == episode and data.y_onset[i] == 1 and at_risk[i]]
+        onset = position_of.get(starts.get(episode, ""))
+        if test_pos and onset is not None:
+            windows[episode] = (test_pos, onset)
+
+    # зона дня до ближайшего будущего onset'а: если ложные алерты вне
+    # 7-дневного окна распределены как календарь, у них нет структуры -
+    # алерт «за 15-28 дней» ничего не знает про будущий эпизод
+    upcoming = sorted(_date.fromisoformat(day) for day in starts.values())
+    zone_of: list[str] = []
+    for day in dates:
+        moment = _date.fromisoformat(day)
+        lead = next(((d - moment).days for d in upcoming if d >= moment), None)
+        zone_of.append("none" if lead is None
+                       else "1-7" if lead <= 7
+                       else "8-14" if lead <= 14
+                       else "15-28" if lead <= 28 else "29+")
+    zone_base: dict[str, int] = {}
+    for t in scored:
+        if not data.y_onset[t]:
+            zone_base[zone_of[t]] = zone_base.get(zone_of[t], 0) + 1
+
+    def fp_zones(flags: list[bool]) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for t in range(n):
+            if flags[t] and data.y_onset[t] == 0:
+                out[zone_of[t]] = out.get(zone_of[t], 0) + 1
+        return out
+
+    def episode_stats(flags: list[bool]) -> dict:
+        caught = late = missed = 0
+        leads: list[int] = []
+        for test_pos, onset in windows.values():
+            alarms = [i for i in test_pos if flags[i]]
+            if not alarms:
+                missed += 1
+                continue
+            lead = onset - min(alarms)
+            if lead >= min_lead:
+                caught += 1
+                leads.append(lead)
+            else:
+                late += 1
+        return {
+            "episodes_caught": caught,
+            "episodes_late": late,
+            "episodes_missed": missed,
+            "episode_recall": caught / len(windows) if windows else None,
+            "median_lead": int(statistics.median(leads)) if leads else None,
+        }
+
+    def streak_stats(flags: list[bool]) -> tuple[int, int]:
+        count = longest = current = 0
+        last = None
+        for t in range(n):
+            if flags[t]:
+                if last is not None and _day_before(dates[last], dates[t]):
+                    current += 1
+                else:
+                    current = 1
+                    count += 1
+                last = t
+                longest = max(longest, current)
+            else:
+                last = None
+                current = 0
+        return count, longest
+
+    def describe(flags: list[bool]) -> dict:
+        alerts = sum(1 for value in flags if value)
+        false_days = sum(1 for t in range(n)
+                         if flags[t] and data.y_onset[t] == 0)
+        count, longest = streak_stats(flags)
+        out = {
+            "alert_days": alerts,
+            "alerts_per_month": alerts / months,
+            "false_alarm_days": false_days,
+            "false_alarms_per_month": false_days / months,
+            "streaks": count,
+            "longest_streak": longest,
+            "fp_zones": fp_zones(flags),
+        }
+        out.update(episode_stats(flags))
+        return out
+
+    def budget_flags(budget: float) -> list[bool]:
+        fraction = min(0.5, budget / 30.44)
+        flags = [False] * n
+        history: list[float] = []
+        for t in range(n):
+            if probs[t] is None:
+                continue
+            if len(history) >= 30:
+                flags[t] = probs[t] >= _quantile(history, 1.0 - fraction)
+            history.append(probs[t])
+        return flags
+
+    def average_metrics(rows: list[dict]) -> dict:
+        keys = ("alert_days", "alerts_per_month", "false_alarm_days",
+                "false_alarms_per_month", "streaks", "longest_streak",
+                "episodes_caught", "episodes_late", "episodes_missed",
+                "episode_recall")
+        out = {}
+        for key in keys:
+            values = [row[key] for row in rows if row[key] is not None]
+            out[key] = sum(values) / len(values) if values else None
+        leads = [row["median_lead"] for row in rows
+                 if row["median_lead"] is not None]
+        out["median_lead"] = int(statistics.median(leads)) if leads else None
+        return out
+
+    generator = random.Random(seed)
+    by_budget = []
+    for budget in budgets:
+        model_row = describe(budget_flags(budget))
+        fraction = min(0.5, model_row["alert_days"] / len(scored)) if scored else 0.0
+        random_rows = [
+            describe([probs[t] is not None and generator.random() < fraction
+                      for t in range(n)])
+            for _ in range(max(1, random_repeats))
+        ]
+        by_budget.append({
+            "budget": budget,
+            "model": model_row,
+            "random": average_metrics(random_rows),
+        })
+
+    def collect(predicate) -> list[list[float]]:
+        groups = []
+        for test_pos, onset in windows.values():
+            part = [probs[i] for i in test_pos
+                    if probs[i] is not None and predicate(onset - i)]
+            if part:
+                groups.append(part)
+        return groups
+
+    negatives = [probs[t] for t in scored if not data.y_onset[t]]
+    auc_ci = _episode_bootstrap_auc(
+        collect(lambda lead: True), negatives, auc_bootstrap, seed)
+    # расклад по lead: физиология и продром живут ближе к onset'у, чем
+    # горизонт алерта (гипотеза §9.1 - «продром срывает тренировки»)
+    auc_by_lead = {
+        "near": _episode_bootstrap_auc(
+            collect(lambda lead: lead <= 2), negatives, auc_bootstrap, seed),
+        "far": _episode_bootstrap_auc(
+            collect(lambda lead: lead >= min_lead),
+            negatives, auc_bootstrap, seed),
+    }
+
+    seasonal = [bool(at_risk[t]) and int(dates[t][5:7]) in season_months
+                for t in range(n)]
+    return {
+        "days": n,
+        "evaluated": len(scored),
+        "positive_days": int(sum(labels)),
+        "positive_rate": (sum(labels) / len(labels)) if labels else None,
+        "auc": auc_ci["auc"],
+        "auc_ci": auc_ci,
+        "auc_by_lead": auc_by_lead,
+        "pr_auc": _average_precision(scores, labels),
+        "episodes": len(windows),
+        "budgets": by_budget,
+        "fp_zone_base": zone_base,
+        "season_months": list(season_months),
+        "seasonal": describe(seasonal),
+        "always": describe([bool(value) for value in at_risk]),
+        "horizon": horizon,
+        "min_lead": min_lead,
+        "model": model,
+    }
+
+
+def matched_auc(
+    conn: sqlite3.Connection,
+    features: tuple[str, ...] = V2_FEATURES,
+    model: str = "logreg",
+    control: tuple[int, int] = (15, 28),
+    bootstrap: int = 2000,
+    seed: int = 17,
+) -> dict:
+    """AUC «окно эпизода vs дальний контроль» + CI по эпизодам.
+
+    Различение окна против **далёких** дней (``control`` дней до onset) -
+    то, что отличает модель от «алертить каждый день»: соседние дни слишком
+    похожи на предвестники (продром сам срывает тренировки), и AUC против
+    ближайшего контроля ничего не доказывает.
+
+    Интервал - не по дням, а **по эпизодам**: дни одного эпизода почти не
+    независимы, наивный по дням был бы ложно узким. Эпизоды ресемплируются
+    с возвращением, внутри фолда сохраняется LOO-схема (эпизод целиком вне
+    обучения). Это и есть поправка на то, что конфигурацию контроля выбрали,
+    посмотрев на данные.
+    """
+    _require_ml()
+    data = _dataset(conn, features)
+    at_risk = data.at_risk
+    dates = data.dates
+    y = data.y_onset
+    starts = {e.id: e.start for e in health_illness.episodes(conn)
+              if e.level != "gap_only"}
+    position_of = {day: i for i, day in enumerate(dates)}
+    folds: list[tuple[list[float], list[int]]] = []
+    for episode in sorted({ep for ep in data.episode if ep is not None}):
+        test_pos = [i for i, ep in enumerate(data.episode)
+                    if ep == episode and data.y_onset[i] == 1 and at_risk[i]]
+        start = starts.get(episode)
+        onset = position_of.get(start) if start else None
+        if not test_pos or onset is None:
+            continue
+        test_neg = []
+        for shift in range(control[0], control[1] + 1):
+            day = (_date.fromisoformat(start) - _timedelta(days=shift)).isoformat()
+            index = position_of.get(day)
+            if index is not None and at_risk[index]:
+                test_neg.append(index)
+        if not test_neg:
+            continue
+        train = [i for i in range(len(dates))
+                 if at_risk[i] and data.episode[i] != episode]
+        if len(set(data.y_onset[train].tolist())) < 2:
+            continue
+        test = test_pos + test_neg
+        fold_labels = [1] * len(test_pos) + [0] * len(test_neg)
+        x_train, x_test = _impute(data.X[train], data.X[test])
+        scaler = _Scaler()
+        x_train = scaler.fit_transform(x_train)
+        x_test = scaler.transform(x_test)
+        estimator = _estimator(model)
+        estimator.fit(x_train, data.y_onset[train])
+        predicted = estimator.predict_proba(x_test)[:, 1]
+        folds.append(([float(value) for value in predicted], fold_labels))
+
+    if not folds:
+        return {"auc": None, "low": None, "high": None, "episodes": 0}
+
+    point = _roc_auc(
+        [score for part, _ in folds for score in part],
+        [label for _, part in folds for label in part],
+    )
+    generator = random.Random(seed)
+    sample: list[float] = []
+    for _ in range(max(1, bootstrap)):
+        chosen = [generator.choice(folds) for _ in folds]
+        value = _roc_auc(
+            [score for part, _ in chosen for score in part],
+            [label for _, part in chosen for label in part],
+        )
+        if value is not None:
+            sample.append(value)
+    return {
+        "auc": point,
+        "low": _quantile(sample, 0.025) if sample else None,
+        "high": _quantile(sample, 0.975) if sample else None,
+        "episodes": len(folds),
+        "bootstrap": len(sample),
+        "control": list(control),
     }
 
 
@@ -539,7 +1303,13 @@ def report(
     window: str | None = health_load.DEFAULT_WINDOW,
     as_json: bool = False,
 ) -> dict:
-    """Полный отчёт: признаки, лаги, CV-протокол, красный флаг."""
+    """Полный отчёт: признаки, лаги, CV-протоколы, красный флаг, бюджеты.
+
+    Помимо v1/v2-CV здесь считаются блоки честной оценки: ``walk_v2`` и
+    ``walk_baseline`` (recall@бюджет против случайного и сезонного нуля,
+    AUC с bootstrap-CI по эпизодам) и ``matched_v2``/``matched_baseline``
+    (AUC против далёкого контроля с тем же интервалом).
+    """
     build_features(conn, window)
     positives = build_labels(conn, window)
 
@@ -559,6 +1329,17 @@ def report(
             data["cv_logreg"] = leave_one_episode_out(conn, MODEL_FEATURES, model="logreg")
             data["cv_baseline"] = leave_one_episode_out(conn, BASELINE_FEATURES, model="logreg")
             data["cv_gbm"] = leave_one_episode_out(conn, MODEL_FEATURES, model="gbm")
+            # v2 - риск на горизонте H: основная строка отчёта
+            data["onset_v2"] = onset_cv(conn, V2_FEATURES, model="logreg")
+            data["onset_baseline"] = onset_cv(
+                conn, V2_BASELINE_FEATURES, model="logreg")
+            # честная оценка: порог под бюджет и AUC с CI по эпизодам
+            data["walk_v2"] = walk_forward(conn, V2_FEATURES, model="logreg")
+            data["walk_baseline"] = walk_forward(
+                conn, V2_BASELINE_FEATURES, model="logreg")
+            data["matched_v2"] = matched_auc(conn, V2_FEATURES, model="logreg")
+            data["matched_baseline"] = matched_auc(
+                conn, V2_BASELINE_FEATURES, model="logreg")
     if as_json:
         return data
     return data
@@ -579,6 +1360,11 @@ def format_lag(rows: list[dict], feature: str) -> str:
     return f"лаг-анализ: {feature}\n\n{body}" if body else f"лаг-анализ: {feature} — нет данных"
 
 
+def _rate(value) -> str:
+    """Доля для отчёта - «—», когда считать не на чем (нет окон)."""
+    return "—" if value is None else f"{value:.2f}"
+
+
 def format_report(data: dict) -> str:
     """Готовый текстовый отчёт для CLI и ноутбука."""
     lines = [f"окно с {data['window']}, положительных дней: "
@@ -591,6 +1377,117 @@ def format_report(data: dict) -> str:
     flag = data["red_flag"]
     lines.append(f"красный флаг (>=2 признака): эпизодов с флагом "
                  f"{flag['episodes_with_flag']} из {flag['episodes']}")
+
+    # v2 - риск на горизонте H (7 дней), event-метрики
+    onset_rows = []
+    for key, title in (("onset_v2", "v2 все признаки"),
+                       ("onset_baseline", "v2 только физиология")):
+        block = data.get(key)
+        if not block or not block.get("episodes"):
+            continue
+        onset_rows.append((
+            title, block["episodes"], block["episodes_caught"],
+            block.get("episodes_late", 0),
+            "—" if block.get("median_lead") is None else block["median_lead"],
+            f"{block['false_alarms_per_month']:.1f}",
+        ))
+    if onset_rows:
+        lines.append("")
+        lines.append(f"v2: риск эпизода на горизонте "
+                     f"{data.get('onset_v2', {}).get('horizon', H_ONSET)} дн "
+                     f"(поимка при lead >= "
+                     f"{data.get('onset_v2', {}).get('min_lead', H_MIN)})")
+        lines.append(table(
+            ("модель", "эпизодов", "поймано", "опоздало",
+             "медианный lead", "ложн./мес"),
+            onset_rows,
+        ))
+
+    # честная оценка: recall@бюджет против нулей + AUC с CI по эпизодам
+    for walk_key, walk_title in (("walk_v2", "все признаки"),
+                                 ("walk_baseline", "только физиология")):
+        walk = data.get(walk_key)
+        if not walk or not walk.get("budgets"):
+            continue
+        lines.append("")
+        lines.append(
+            f"recall@бюджет ({walk_title}, день за днём, порог по прошлому, "
+            f"поимка при lead >= {walk.get('min_lead', H_MIN)}, "
+            f"эпизодов {walk['episodes']})")
+        budget_rows = []
+        for budget in walk["budgets"]:
+            model_row = budget["model"]
+            random_row = budget["random"]
+            budget_rows.append((
+                f"{budget['budget']:.0f}",
+                f"{model_row['alerts_per_month']:.1f}",
+                _rate(model_row["episode_recall"]),
+                f"{model_row['episodes_caught']}",
+                _rate(random_row["episode_recall"]),
+            ))
+        lines.append(table(
+            ("цель/мес", "факт/мес", "recall", "поймано", "случайный"),
+            budget_rows,
+        ))
+        # есть ли у ложных алертов структура вне окна 7 дней?
+        far = max(walk["budgets"], key=lambda item: item["budget"])
+        zones = far["model"].get("fp_zones") or {}
+        base = walk.get("fp_zone_base") or {}
+        total = sum(zones.values())
+        if total:
+            parts = []
+            for key in ("8-14", "15-28", "29+"):
+                if key not in zones and key not in base:
+                    continue
+                parts.append(
+                    f"{key} дн {100 * zones.get(key, 0) / total:.0f}% "
+                    f"(календарь {100 * base.get(key, 0) / max(1, sum(base.values())):.0f}%)")
+            if parts:
+                lines.append(
+                    "ложные алерты (макс. бюджет), зона до следующего "
+                    "onset'а: " + "; ".join(parts))
+        seasonal = walk.get("seasonal") or {}
+        if seasonal.get("episode_recall") is not None:
+            lines.append(
+                f"сезонный календарь ({'-'.join(str(m) for m in walk['season_months'])}): "
+                f"recall {_rate(seasonal['episode_recall'])} при "
+                f"{seasonal['alerts_per_month']:.1f} алертов/мес")
+        always = walk.get("always") or {}
+        if always.get("episode_recall") is not None:
+            lines.append(
+                f"всегда алерт (потолок): recall "
+                f"{_rate(always['episode_recall'])} при "
+                f"{always['alerts_per_month']:.1f} алертов/мес")
+        if walk.get("auc") is not None:
+            interval = walk.get("auc_ci") or {}
+            bounds = ""
+            if interval.get("low") is not None:
+                bounds = f" [{interval['low']:.3f}, {interval['high']:.3f}]"
+            lines.append(
+                f"различение всех дней: AUC {walk['auc']:.3f}{bounds}, "
+                f"PR-AUC {walk['pr_auc']:.3f}, доля положительных "
+                f"{walk['positive_rate']:.3f}")
+        for key, lead_title in (("near", "1-2 дня до начала"),
+                                ("far", ">= 3 дней до начала")):
+            lead_block = (walk.get("auc_by_lead") or {}).get(key) or {}
+            if lead_block.get("auc") is None or lead_block.get("low") is None:
+                continue
+            lines.append(
+                f"  AUC по lead ({lead_title}): {lead_block['auc']:.3f} "
+                f"[{lead_block['low']:.3f}, {lead_block['high']:.3f}]")
+
+    for key, title in (("matched_v2", "все признаки"),
+                       ("matched_baseline", "только физиология")):
+        block = data.get(key)
+        if not block or block.get("auc") is None:
+            continue
+        lines.append(
+            f"AUC окно vs {block['control'][0]}-{block['control'][1]} дн "
+            f"({title}): {block['auc']:.3f} "
+            f"[{block['low']:.3f}, {block['high']:.3f}] "
+            f"по {block['episodes']} эпизодам")
+
+    # старая day-классификация - бейзлайн
     lines.append("")
     rows = []
     for key, title in (("cv_logreg", "L2-логистика"),
@@ -611,5 +1508,6 @@ def format_report(data: dict) -> str:
         rows,
     )
     if body:
+        lines.append("day-классификация (бейзлайн v1, окно 14 дн):")
         lines.append(body)
     return "\n".join(lines)
