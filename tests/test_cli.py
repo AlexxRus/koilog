@@ -125,6 +125,32 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(args.min_sets, 5)
         self.assertEqual(args.limit, 3)
 
+    def test_score_defaults(self):
+        args = self.parser.parse_args(["score"])
+        self.assertIsNone(args.date)
+        self.assertIsNone(args.since)
+        self.assertFalse(args.replay)           # по умолчанию - запись дня
+        self.assertEqual(args.last, 10)
+        self.assertEqual(args.model, "logreg")
+        self.assertIsNone(args.budget)          # None - взять умолчание
+        self.assertFalse(args.prospective)
+
+    def test_score_flags_parse(self):
+        args = self.parser.parse_args(
+            ["score", "--date", "2026-10-18", "--budget", "4", "--last", "3",
+             "--prospective", "--json"])
+        self.assertEqual(args.date, "2026-10-18")
+        self.assertEqual(args.budget, 4.0)
+        self.assertEqual(args.last, 3)
+        self.assertTrue(args.prospective)
+        self.assertTrue(args.json)
+
+    def test_score_replay_flag_parses(self):
+        args = self.parser.parse_args(
+            ["score", "--replay", "--since", "2025-01-01"])
+        self.assertTrue(args.replay)
+        self.assertEqual(args.since, "2025-01-01")
+
 
 # --------------------------------------------------------------------------
 # Вспомогательные функции
@@ -657,6 +683,19 @@ class DigestCommandTests(CliFixture):
         payload = json.loads(out)
         self.assertIn("recommendation", payload)
         self.assertIn("gate", payload)
+
+
+class ScoreCommandTests(CliFixture):
+    def test_without_ml_tables_prints_the_missing_step(self):
+        """Не «нет данных», а какой шаг конвейера не прогнан."""
+        code, _, err = self.run_cli("score")
+        self.assertEqual(code, 1)
+        self.assertIn("refresh --deep", err)
+
+    def test_date_flag_without_ml_tables_also_hints(self):
+        code, _, err = self.run_cli("score", "--date", "2024-01-20")
+        self.assertEqual(code, 1)
+        self.assertIn("ml_features", err)
 
 
 class HistoryCommandTests(CliFixture):

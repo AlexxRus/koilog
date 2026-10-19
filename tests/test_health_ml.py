@@ -446,6 +446,8 @@ class IsolationTests(unittest.TestCase):
             "import sys\n"
             "import koilog.health.apple, koilog.health.load, koilog.health.illness\n"
             "import koilog.health.analysis, koilog.health.text\n"
+            "import koilog.health.digest, koilog.health.retrain\n"
+            "import koilog.health.refresh\n"
             "bad = [m for m in ('numpy', 'sklearn') if m in sys.modules]\n"
             "assert not bad, bad\n"
             "print('ok')\n"

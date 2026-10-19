@@ -90,15 +90,19 @@ HAS_ML = _np is not None and _LogReg is not None
 
 __all__ = [
     "BASELINE_FEATURES",
+    "CAUSAL_LABEL_RULE",
     "HAS_ML",
     "HORIZON",
     "H_MIN",
     "H_ONSET",
+    "MIN_HISTORY",
     "MODEL_FEATURES",
     "V2_BASELINE_FEATURES",
     "V2_FEATURES",
     "build_features",
     "build_labels",
+    "causal_score",
+    "causal_scores",
     "lag_analysis",
     "leave_one_episode_out",
     "matched_auc",
@@ -106,6 +110,7 @@ __all__ = [
     "red_flag_report",
     "report",
     "walk_forward",
+    "walk_probs",
 ]
 
 #: Горизонт алерта: болезнь предсказывается за столько дней до начала.
@@ -906,6 +911,211 @@ def _episode_bootstrap_delta(
     }
 
 
+#: Минимум прошлых ``at_risk``-дней, чтобы вообще оценивать день. До него
+#: модель училась бы на слишком короткой истории, а положительных примеров
+#: в ней ещё нет.
+MIN_HISTORY = 30
+
+#: Версия **причинного** правила меток (см. :func:`_causal_train`). Меняется,
+#: если изменится правило метки, горизонт или окно трейна: старая история
+#: скоров не переписывается, а помечается другим ``spec_hash`` в ledger'е
+#: (:mod:`koilog.health.score`), и анализ сегментирует по нему.
+CAUSAL_LABEL_RULE = "causal-v1"
+
+
+def _predict(train_x, day_x, y, model: str) -> float:
+    """Обучить модель на ``train_x``/``y`` и вернуть вероятность для ``day_x``.
+
+    Общий шаг для причинного walk-forward (:func:`_walk_probs_data`) и
+    дневного скора (:func:`causal_score`): если развести их по разным
+    копиям, «скор дня» и оценка разойдутся, а это ровно то, чего быть не
+    должно.
+    """
+    x_train, x_day = _impute(train_x, day_x)
+    scaler = _Scaler()
+    x_train = scaler.fit_transform(x_train)
+    x_day = scaler.transform(x_day)
+    estimator = _estimator(model)
+    estimator.fit(x_train, y)
+    return float(estimator.predict_proba(x_day)[0][1])
+
+
+def _walk_probs_data(data: "Dataset", model: str,
+                     min_history: int = MIN_HISTORY) -> list[float | None]:
+    """Цикл walk-forward: вероятность на каждый день, трейн строго по прошлому.
+
+    Метки берутся из ``ml_features.y_onset`` (полные данные): это
+    **оракульная** ретро-оценка :func:`walk_forward`. Живой скор считается
+    причинно (:func:`causal_score`, общий шаг обучения - :func:`_predict`),
+    потому что ретро-метка дня ``t`` подглядывает исход после ``t``.
+    """
+    at_risk = data.at_risk
+    probs: list[float | None] = [None] * len(data.dates)
+    for t in range(len(data.dates)):
+        # обучение строго на прошлом; до min_history дней истории и до
+        # первого эпизода положительных нет - день не оценивается
+        if not at_risk[t]:
+            continue
+        history = [i for i in range(t) if at_risk[i]]
+        if len(history) < min_history:
+            continue
+        y = data.y_onset[history]
+        if len(set(y.tolist())) < 2:
+            continue
+        probs[t] = _predict(data.X[history], data.X[[t]], y, model)
+    return probs
+
+
+def _plus_days(day: str, days: int) -> str:
+    """ISO-дата ``day + days`` (сравнения ISO-строк лексикографичны)."""
+    return (_date.fromisoformat(day) + _timedelta(days=days)).isoformat()
+
+
+def _causal_train(
+    dates: list[str],
+    at_risk,
+    starts: list[str],
+    t: int,
+    horizon: int = H_ONSET,
+) -> tuple[list[int], list[float]]:
+    """Индексы и метки трейна для eval-дня ``t`` - только известное к ``t``.
+
+    Причинное правило (``CAUSAL_LABEL_RULE``) на день ``T = dates[t]`` для
+    дня ``i`` с окном ``(dates[i], dates[i]+horizon]``:
+
+    - метка **1**, если в окне есть onset, уже случившийся к ``T`` (``o <= T``);
+    - метка **0**, если окно к ``T`` закрылось (``dates[i]+horizon <= T``),
+      а onset'а в нём так и нет;
+    - день **исключается**, если окно ещё открыто и исход неизвестен.
+
+    Последнее - суть правки: «исход неизвестен → 0» записало бы ложные
+    негативы в каждом дне перед эпизодом (ровно там, где скор и важен).
+    Дни внутри эпизода (``at_risk=0``) не берутся, как и раньше.
+    """
+    index: list[int] = []
+    labels: list[float] = []
+    for i in range(t):
+        if not at_risk[i]:
+            continue
+        day_i = dates[i]
+        position = bisect_right(starts, day_i)   # первый onset строго после i
+        onset = starts[position] if position < len(starts) else None
+        edge = _plus_days(day_i, horizon)
+        if onset is not None and onset <= edge and onset <= dates[t]:
+            index.append(i)
+            labels.append(1.0)
+        elif edge <= dates[t]:
+            index.append(i)
+            labels.append(0.0)
+    return index, labels
+
+
+def _causal_score_at(
+    data: "Dataset", starts: list[str], t: int, model: str,
+    min_history: int = MIN_HISTORY,
+) -> dict | None:
+    """Скор дня ``t``, посчитанный только по известному к этому дню."""
+    if not data.at_risk[t]:
+        return {"scored": False, "reason": "day_inside_episode", "score": None,
+                "n_train": None, "n_pos": None, "last_train_day": None}
+    index, labels = _causal_train(data.dates, data.at_risk, starts, t)
+    if len(index) < min_history or len(set(labels)) < 2:
+        return {"scored": False, "reason": "not_enough_history", "score": None,
+                "n_train": len(index), "n_pos": int(sum(labels)),
+                "last_train_day": None}
+    y = _np.array(labels, dtype=float)
+    prob = _predict(data.X[index], data.X[[t]], y, model)
+    return {
+        "scored": True,
+        "reason": None,
+        "score": prob,
+        "n_train": len(index),
+        "n_pos": int(sum(labels)),
+        "last_train_day": data.dates[index[-1]],
+    }
+
+
+def causal_score(
+    conn: sqlite3.Connection,
+    day: str | None = None,
+    features: tuple[str, ...] = V2_FEATURES,
+    model: str = "logreg",
+    min_history: int = MIN_HISTORY,
+) -> dict | None:
+    """Скор одного дня ``day`` (по умолчанию - последнего) по причинному правилу.
+
+    В отличие от :func:`walk_probs` (ретро-оценка на полных метках) здесь
+    обучающая история обрезана по ``day``: метка дня, у которого окно ещё
+    открыто, неизвестна и день исключается, а не обнуляется. Именно это
+    число должна была бы выдать развёрнутая система, поэтому оно и идёт в
+    ledger (:mod:`koilog.health.score`).
+
+    Возвращает ``None``, если данных нет; иначе словарь со ``scored``,
+    ``score`` и диагностикой ``n_train``/``n_pos``/``last_train_day``.
+    """
+    _require_ml()
+    data = _dataset(conn, features)
+    if not data.dates:
+        return None
+    t = None
+    for i, value in enumerate(data.dates):
+        if day is None or value <= day:
+            t = i
+    if t is None:
+        return None
+    starts = sorted(e.start for e in health_illness.episodes(conn)
+                    if e.level != "gap_only")
+    info = _causal_score_at(data, starts, t, model, min_history)
+    return {"day": data.dates[t], **(info or {})}
+
+
+def causal_scores(
+    conn: sqlite3.Connection,
+    features: tuple[str, ...] = V2_FEATURES,
+    model: str = "logreg",
+    min_history: int = MIN_HISTORY,
+) -> tuple[list[str], list[dict | None]]:
+    """Причинные скоры на все дни за один проход (холодный старт ledger'а).
+
+    Тот же :func:`_causal_score_at`, что и у :func:`causal_score`, поэтому
+    воспроизведение истории и живая запись - одно и то же число, а не две
+    похожие формулы.
+    """
+    _require_ml()
+    data = _dataset(conn, features)
+    starts = sorted(e.start for e in health_illness.episodes(conn)
+                    if e.level != "gap_only")
+    out = [_causal_score_at(data, starts, t, model, min_history)
+           for t in range(len(data.dates))]
+    return data.dates, out
+
+
+def walk_probs(
+    conn: sqlite3.Connection,
+    features: tuple[str, ...] = V2_FEATURES,
+    model: str = "logreg",
+    min_history: int = MIN_HISTORY,
+) -> tuple[list[str], list[float | None]]:
+    """``(даты, вероятности)``: скор на каждый день, трейн строго по прошлому.
+
+    ``probs[t]`` равен ``None``, если день не оценивался: это дни внутри
+    эпизода (``at_risk=0``, там «не жив»), первые ``min_history`` дней и дни
+    до появления в прошлом обоих классов.
+
+    Это **оракульная** ретро-оценка: метки ``y_onset`` построены по полным
+    данным, поэтому день ``t`` учится на днях, чей исход стал известен
+    только после ``t``. Оптимизм тут максимален за 1-2 дня до onset'а -
+    ровно на тех lead, на которых стоит nowcast, - поэтому каузальная
+    оценка (:func:`causal_score`) ниже, и именно она идёт в ledger
+    (:mod:`koilog.health.score`), а эти числа остаются верхней границей.
+    Разницу формализует причинное воспроизведение истории (см. README).
+    """
+    _require_ml()
+    data = _dataset(conn, features)
+    probs = _walk_probs_data(data, model, min_history)
+    return data.dates, probs
+
+
 def walk_forward(
     conn: sqlite3.Connection,
     features: tuple[str, ...] = V2_FEATURES,
@@ -955,25 +1165,7 @@ def walk_forward(
     at_risk = data.at_risk
     dates = data.dates
     n = len(dates)
-    probs: list[float | None] = [None] * n
-    for t in range(n):
-        # обучение строго на прошлом; до 30 дней истории и до первого
-        # эпизода положительных нет - день не оценивается
-        if not at_risk[t]:
-            continue
-        history = [i for i in range(t) if at_risk[i]]
-        if len(history) < 30:
-            continue
-        y = data.y_onset[history]
-        if len(set(y.tolist())) < 2:
-            continue
-        x_train, x_day = _impute(data.X[history], data.X[[t]])
-        scaler = _Scaler()
-        x_train = scaler.fit_transform(x_train)
-        x_day = scaler.transform(x_day)
-        estimator = _estimator(model)
-        estimator.fit(x_train, y)
-        probs[t] = float(estimator.predict_proba(x_day)[0][1])
+    probs = _walk_probs_data(data, model)
 
     scored = [t for t in range(n) if probs[t] is not None]
     scores = [probs[t] for t in scored]

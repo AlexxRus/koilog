@@ -130,6 +130,45 @@ class RecommendTests(unittest.TestCase):
             self.assertTrue(rec["title"])
             self.assertTrue(rec["text"])
 
+    # -- скор дня в карточке ------------------------------------------------
+
+    def test_hold_text_explains_channel_gate_difference(self):
+        """«В фоне» по каналам и «держит» по гейту - разные пороги, не спор."""
+        rec = digest.recommend(
+            _ok_channels(), _load(),
+            _Gate(False, ("2026-10-17: RHR z +1.2 выше фона (>1)",)))
+        self.assertEqual(rec["level"], "hold")
+        self.assertIn("±1", rec["text"])
+        self.assertIn("±1.5", rec["text"])
+
+    def test_score_note_says_the_model_is_quiet(self):
+        score = {"score": 0.42, "threshold": 0.6, "alert": 0}
+        rec = digest.recommend(
+            _ok_channels(), _load(),
+            _Gate(False, ("2026-10-17: RHR z +1.2 выше фона (>1)",)), score)
+        self.assertIn("0.42", rec["text"])
+        self.assertIn("модель в фоне", rec["text"])
+
+    def test_score_note_mentions_alert(self):
+        score = {"score": 0.88, "threshold": 0.7, "alert": 1}
+        rec = digest.recommend(
+            _ok_channels(), _load(),
+            _Gate(False, (), window_only=True), score)
+        self.assertEqual(rec["level"], "ramp")
+        self.assertIn("выше порога", rec["text"])
+
+    def test_score_note_survives_missing_threshold(self):
+        score = {"score": 0.42, "threshold": None, "alert": None}
+        rec = digest.recommend(
+            _ok_channels(), _load(),
+            _Gate(False, ("2026-10-17: RHR z +1.2 выше фона (>1)",)), score)
+        self.assertIn("0.42", rec["text"])
+        self.assertIn("порог", rec["text"])
+
+    def test_recommend_without_score_stays_short(self):
+        rec = digest.recommend(_ok_channels(), _load(), _Gate(True))
+        self.assertNotIn("Скор дня", rec["text"])
+
 
 class ChannelTests(unittest.TestCase):
     def _db(self, days: int = 30) -> sqlite3.Connection:
@@ -283,6 +322,66 @@ class DayStateTests(unittest.TestCase):
         self.assertEqual(payload["today"], "2024-01-30")
         self.assertIsInstance(payload["channels"][0], dict)
         self.assertIn("label", payload["channels"][0])
+
+    # -- скор из ledger'а ---------------------------------------------------
+
+    def _score_db(self) -> sqlite3.Connection:
+        conn = self._db()
+        conn.executescript(
+            """
+            CREATE TABLE ml_score (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                day TEXT NOT NULL, as_of TEXT, computed_at TEXT NOT NULL,
+                score REAL, spec_hash TEXT NOT NULL, n_train INTEGER,
+                n_pos INTEGER, last_train_day TEXT, threshold REAL,
+                alert INTEGER
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO ml_score (day, as_of, computed_at, score, spec_hash, "
+            "n_train, n_pos, last_train_day, threshold, alert) "
+            "VALUES ('2024-01-30', '2024-01-30', '2024-01-30T20:00:00', 0.83, "
+            "'spec00000001', 40, 6, '2024-01-29', 0.75, 1)",
+        )
+        conn.commit()
+        return conn
+
+    def test_day_state_reads_canonical_score_row(self):
+        conn = self._score_db()
+        self.addCleanup(conn.close)
+        state = digest.day_state(conn, "2024-01-30")
+        self.assertEqual(state["score"]["score"], 0.83)
+        self.assertEqual(state["score"]["alert"], 1)
+        self.assertEqual(state["score"]["threshold"], 0.75)
+
+    def test_format_digest_shows_gate_and_score(self):
+        conn = self._score_db()
+        self.addCleanup(conn.close)
+        text = digest.format_digest(digest.day_state(conn, "2024-01-30"))
+        self.assertIn("гейт возврата", text)
+        self.assertIn("скор (причинный): 0.83", text)
+        self.assertIn("выше порога 0.75", text)
+
+    def test_card_falls_back_to_last_scored_day(self):
+        """День эпизода модель не оценивает - показываем последний скор с датой."""
+        conn = self._score_db()
+        self.addCleanup(conn.close)
+        state = digest.day_state(conn, "2024-02-01")   # строки за этот день нет
+        self.assertEqual(state["score"]["day"], "2024-01-30")
+        self.assertEqual(state["score"]["score"], 0.83)
+        text = digest.format_digest(state)
+        self.assertIn("скор (причинный за 2024-01-30): 0.83", text)
+
+    def test_day_state_without_score_table_has_no_score(self):
+        conn = self._db()
+        self.addCleanup(conn.close)
+        state = digest.day_state(conn, "2024-01-30")
+        self.assertIsNone(state["score"])
+        text = digest.format_digest(state)
+        self.assertNotIn("скор (причинный", text)
+        # гейт при этом всё равно показан: он не зависит от ML
+        self.assertIn("гейт возврата", text)
 
 
 if __name__ == "__main__":

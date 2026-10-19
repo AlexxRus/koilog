@@ -102,10 +102,10 @@ class Channel:
         }
 
 
-def _query(conn: sqlite3.Connection, sql: str) -> list[tuple]:
+def _query(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> list[tuple]:
     """Выполнить запрос, вернув пустой список, если таблицы ещё нет."""
     try:
-        return [tuple(row) for row in conn.execute(sql).fetchall()]
+        return [tuple(row) for row in conn.execute(sql, params).fetchall()]
     except sqlite3.OperationalError:
         return []
 
@@ -184,13 +184,34 @@ def load_state(
     }
 
 
-def recommend(channels_list: list[Channel], load: dict, gate) -> dict:
-    """Одна рекомендация по правилам (см. модуль). Возвращает словарь."""
+def recommend(
+    channels_list: list[Channel], load: dict, gate, score: dict | None = None
+) -> dict:
+    """Одна рекомендация по правилам (см. модуль). Возвращает словарь.
+
+    ``score`` - канонический скор дня из ledger'а (``{"score", "threshold",
+    "alert"}``), если он уже записан. Он не переопределяет решение (это
+    по-прежнему правила по каналам и гейту), но объясняет его: без скора
+    карточка в дни, когда таблица каналов показывает «в фоне», а рекомендация
+    «покой», выглядела противоречивой.
+    """
     by_key = {c.key: c for c in channels_list}
 
     def bad(key: str) -> bool:
         channel = by_key.get(key)
         return bool(channel and channel.bad)
+
+    def score_note() -> str:
+        if not score or score.get("score") is None:
+            return ""
+        if score.get("threshold") is None:
+            tail = "порог ещё не накоплен"
+        elif score.get("alert"):
+            tail = (f"выше порога бюджета "
+                    f"({score['threshold']:.2f}) - модель тоже сигналит")
+        else:
+            tail = f"ниже порога бюджета ({score['threshold']:.2f}) - модель в фоне"
+        return f" Скор дня {score['score']:.2f} - {tail}."
 
     monotony = load.get("monotony") or 0.0
     acwr = load.get("acwr") or 0.0
@@ -217,7 +238,7 @@ def recommend(channels_list: list[Channel], load: dict, gate) -> dict:
             "text": "каналы в фоне, но сразу после болезни фона мало: высокая ВСР "
                     "тут - отскок, а не «готов». Возврат по рампе: "
                     "`python -m koilog return` ("
-                    + "; ".join(gate.reasons) + ").",
+                    + "; ".join(gate.reasons) + ")." + score_note(),
         }
 
     # 2. Покой: активный эпизод или гейт ВСР/RHR не пройден.
@@ -229,15 +250,19 @@ def recommend(channels_list: list[Channel], load: dict, gate) -> dict:
             "title": "покой",
             "text": "возврат к нагрузке закрыт гейтом ВСР/RHR: "
                     + (reasons or "фон вне нормы")
-                    + ". С симптомами (температура, миалгия) не тренируйся - "
-                      "риск вирусного миокардита.",
+                    + ". Гейт смотрит на две ночи подряд и с порогом ±1 "
+                      "(мягче, чем «откл.» в таблице каналов, там ±1.5), "
+                      "поэтому «в фоне» по каналам и «держит» по гейту - не "
+                      "противоречие. С симптомами (температура, миалгия) не "
+                      "тренируйся - риск вирусного миокардита." + score_note(),
         }
     if gate is not None and any("эпизод" in r for r in gate.reasons):
         return {
             "level": "hold",
             "title": "покой",
             "text": "активный эпизод болезни: держи покой, вернись по рампе "
-                    "(`python -m koilog return`) после 24 ч без симптомов.",
+                    "(`python -m koilog return`) после 24 ч без симптомов."
+                    + score_note(),
         }
 
     # 3. Прототип алерта: ЧДД + RHR + ВСР ушли в «плохую» сторону вместе.
@@ -269,8 +294,41 @@ def recommend(channels_list: list[Channel], load: dict, gate) -> dict:
     }
 
 
+def _score_row(conn: sqlite3.Connection, day: str | None) -> dict | None:
+    """Канонический скор дня из ledger'а ``ml_score`` (:mod:`...score`).
+
+    Читается **последняя** строка дня (ledger append-only), а если
+    строки за сам день нет (день внутри эпизода модель не оценивает) - берётся
+    ближайшая прошлая: карточка тогда показывает последний честный скор с
+    датой, а не пустоту. Здесь намеренно нет импорта ``score`` - иначе
+    получилось бы кольцо (``score`` зовёт :func:`recommend`), а вся нужная
+    информация лежит в таблице.
+    """
+    if day is None:
+        return None
+    rows = _query(
+        conn,
+        "SELECT s.day, s.score, s.threshold, s.alert, s.as_of, s.computed_at "
+        "FROM ml_score s WHERE s.day <= ? AND s.score IS NOT NULL "
+        "AND s.id = (SELECT MAX(id) FROM ml_score WHERE day = s.day) "
+        "ORDER BY s.day DESC LIMIT 1",
+        (day,),
+    )
+    if not rows:
+        return None
+    day_of, score, threshold, alert, as_of, computed_at = rows[0]
+    return {
+        "day": day_of,
+        "score": score,
+        "threshold": threshold,
+        "alert": alert,
+        "as_of": as_of,
+        "computed_at": computed_at,
+    }
+
+
 def day_state(conn: sqlite3.Connection, today: str | None = None) -> dict:
-    """Полное состояние дня: дата, каналы, нагрузка, гейт, рекомендация."""
+    """Полное состояние дня: дата, каналы, нагрузка, гейт, скор, рекомендация."""
     channels_list = channels(conn, today)
     load = load_state(conn, today)
     resolved = today
@@ -280,12 +338,14 @@ def day_state(conn: sqlite3.Connection, today: str | None = None) -> dict:
         elif load.get("available"):
             resolved = load["date"]
     gate = health_retrain.baseline_gate(conn, resolved)
-    recommendation = recommend(channels_list, load, gate)
+    score = _score_row(conn, resolved)
+    recommendation = recommend(channels_list, load, gate, score=score)
     return {
         "today": resolved,
         "channels": channels_list,
         "load": load,
         "gate": gate.to_dict(),
+        "score": score,
         "recommendation": recommendation,
     }
 
@@ -327,6 +387,25 @@ def format_digest(state: dict) -> str:
             f"дней с последней тренировки "
             f"{load['days_since_training'] if load['days_since_training'] is not None else '?'}"
         )
+
+    gate = state.get("gate") or {}
+    lines.append("")
+    if gate.get("reasons") and not gate.get("ready"):
+        lines.append("гейт возврата: держит — " + "; ".join(gate["reasons"]))
+    elif gate:
+        lines.append("гейт возврата: готов (две ночи ВСР/RHR в фоне)")
+
+    score = state.get("score")
+    if score is not None and score.get("score") is not None:
+        if score.get("threshold") is None:
+            tail = "порог ещё не накоплен"
+        elif score.get("alert"):
+            tail = f"выше порога {score['threshold']:.2f} (алерт)"
+        else:
+            tail = f"ниже порога {score['threshold']:.2f}"
+        when = ("" if score.get("day") in (None, state.get("today"))
+                else f" за {score['day']}")
+        lines.append(f"скор (причинный{when}): {score['score']:.2f} — {tail}")
 
     rec = state["recommendation"]
     lines.append("")

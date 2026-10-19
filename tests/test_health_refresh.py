@@ -128,6 +128,7 @@ class RefreshRunTests(unittest.TestCase):
         fresh = dict(refresh._freshness(self.conn))
         self.assertEqual(fresh["aw_daily"], None)
         self.assertEqual(fresh["ml_features"], None)
+        self.assertEqual(fresh["ml_score"], None)
 
     def test_format_freshness_shows_export_date_and_tables(self):
         text = refresh.format_freshness(self._run())
@@ -148,6 +149,20 @@ class RefreshRunTests(unittest.TestCase):
         # deep-перегонка тоже кешируется слепком, а не парсит каждый раз
         again = self._run(deep=True)
         self.assertFalse(again.parsed)
+
+    @unittest.skipUnless(ml.HAS_ML, "нет numpy/scikit-learn (koilog[ml])")
+    def test_shallow_run_writes_no_score_ledger(self):
+        # ledger скора живёт в deep-ветке: обычный шаг журнала не тянет ML
+        step = self._run()
+        self.assertFalse(any(stage.startswith("скор") for stage in step.stages))
+        self.assertFalse(refresh._has_table(self.conn, "ml_score"))
+
+    @unittest.skipUnless(ml.HAS_ML, "нет numpy/scikit-learn (koilog[ml])")
+    def test_deep_runs_score_stage(self):
+        step = self._run(deep=True)
+        self.assertTrue(any(stage.startswith("скор") for stage in step.stages))
+        # на одном дне скора нет (истории мало), но таблица и свежесть есть
+        self.assertIn("ml_score", dict(step.freshness))
 
 
 if __name__ == "__main__":

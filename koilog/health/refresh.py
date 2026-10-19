@@ -31,6 +31,7 @@ _FRESHNESS: tuple[tuple[str, str], ...] = (
     ("load_daily", "date"),
     ("health_days", "date"),
     ("ml_features", "date"),
+    ("ml_score", "day"),
     ("illness_episodes", "start"),
 )
 
@@ -100,9 +101,17 @@ def run(
 ) -> Step:
     """Прогнать конвейер целиком: часы -> нагрузка -> эпизоды -> (-> ML).
 
-    ``deep`` - пересобрать ли ML-блок (``ml_features``/``ml_labels``). Он
-    требует numpy/scikit-learn (extra ``ml``), которых нет у ноутбука
-    журнала, поэтому по умолчанию не пересобирается.
+    ``deep`` - пересобрать ML-блок: ``ml_features``/``ml_labels`` (чистая
+    стандартная библиотека) и, если есть sklearn, **ledger дневного скора**
+    (:mod:`koilog.health.score`). Он требует numpy/scikit-learn (extra
+    ``ml``), которых нет у ноутбука журнала, поэтому в обычном шаге ML-блок
+    не трогается: ``koilog.ipynb`` не должен тянуть numpy ради дайджеста.
+
+    Ledger скора живёт именно здесь, потому что его ценность - в записи
+    **в тот день, когда исход ещё не известен** (append-only, без
+    перезаписи - см. :mod:`koilog.health.score`). Первый прогон на чистой
+    базе засевает историю причинным воспроизведением, дальше добавляется
+    только последний день.
     """
     resolved = None
     try:
@@ -148,6 +157,19 @@ def run(
         health_ml.build_features(conn)
         health_ml.build_labels(conn)
         step.stages.append("ML-признаки")
+        if health_ml.HAS_ML:
+            # ledger дня пишется здесь: пока исход не известен, запись
+            # проспективная, а перезапись задним числом её бы стёрла
+            from . import score as health_score
+            summary = health_score.sync(conn)
+            if summary.get("written"):
+                step.stages.append(f"скор (записан {summary.get('latest') or summary.get('day')})")
+            elif summary.get("seeded"):
+                step.stages.append("скор (ledger посеян, новых дней нет)")
+            else:
+                step.stages.append(
+                    f"скор (день не оценён: "
+                    f"{health_score.reason_text(summary.get('reason'))})")
 
     step.freshness = _freshness(conn)
     return step

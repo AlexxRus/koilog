@@ -848,6 +848,71 @@ def cmd_digest(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_score(args: argparse.Namespace) -> int:
+    """Ledger дневного скора: записать день (append) и показать последние."""
+    from .health import score as health_score
+
+    conn = _open(args)
+    budget = (health_score.DEFAULT_BUDGET if args.budget is None
+              else args.budget)
+    try:
+        try:
+            if args.date:
+                day = health_score.audit(
+                    conn, args.date, model=args.model, budget=budget)
+                if args.json:
+                    print(health_score.dumps(day))
+                else:
+                    print(health_score.format_day(day))
+                    print()
+                    empty = ("проспективных строк нет" if args.prospective
+                             else None)
+                    print(health_score.format_scores(
+                        health_score.rows(conn, limit=args.last,
+                                          prospective_only=args.prospective),
+                        empty=empty))
+                return 0
+
+            if args.replay:
+                summary = health_score.replay(
+                    conn, since=args.since, model=args.model, budget=budget)
+            else:
+                summary = health_score.sync(
+                    conn, model=args.model, budget=budget)
+        except (RuntimeError, sqlite3.OperationalError) as exc:
+            # нет ML-таблиц или нет extra ml - это не повод для трассировки:
+            # говорим, какой шаг конвейера пропущен
+            print(str(exc), file=sys.stderr)
+            return 1
+
+        items = health_score.rows(conn, limit=args.last,
+                                  prospective_only=args.prospective)
+        if args.json:
+            print(health_score.dumps({"summary": summary, "rows": items}))
+            return 0
+        if summary.get("seeded") or args.replay:
+            print(f"ledger скора: посеян - +{summary['written']} дней, "
+                  f"пропущено {summary.get('skipped', 0)}, последний "
+                  f"{summary.get('latest') or '—'}")
+        elif summary.get("written"):
+            print(f"ledger скора: записан {summary['day']} "
+                  f"(скор {summary['score']:.2f}"
+                  + (f", порог {summary['threshold']:.2f}"
+                     if summary.get("threshold") is not None else "")
+                  + f", решение {'алерт' if summary.get('alert') else 'тихо'}"
+                  f", трейн {summary.get('n_train')}/{summary.get('n_pos')})")
+        else:
+            print(f"ledger скора: день не записан "
+                  f"({health_score.reason_text(summary.get('reason'))})")
+        print()
+        empty = ("проспективных строк нет" if args.prospective
+                 else None)
+        print(health_score.format_scores(items, empty=empty))
+    finally:
+        conn.close()
+    return 0
+
+
 # --------------------------------------------------------------------------
 # Разбор аргументов
 # --------------------------------------------------------------------------
@@ -1070,6 +1135,30 @@ def build_parser() -> argparse.ArgumentParser:
                                "последний день с данными)")
     p_digest.add_argument("--json", action="store_true", help="машинный вывод")
     p_digest.set_defaults(func=cmd_digest)
+
+    p_score = sub.add_parser(
+        "score", help="ledger дневного скора: записать последний день "
+                      "причинным скором (append-only, без перезаписи)")
+    p_score.add_argument("--date", default=None,
+                         help="пересчитать один день (ГГГГ-ММ-ДД) без записи "
+                              "(аудит воспроизводимости)")
+    p_score.add_argument("--replay", action="store_true",
+                         help="засеять ledger причинным воспроизведением всей "
+                              "истории (холодный старт; повторный прогон "
+                              "ничего не дублирует)")
+    p_score.add_argument("--since", default=None,
+                         help="при --replay - засевать только с этой даты")
+    p_score.add_argument("--last", type=int, default=10,
+                         help="сколько последних дней показать (по умолчанию 10)")
+    p_score.add_argument("--prospective", action="store_true",
+                         help="только строки, записанные до того, как исход "
+                              "дня стал известен")
+    p_score.add_argument("--model", default="logreg", help="logreg или gbm")
+    p_score.add_argument("--budget", type=float,
+                         default=None,
+                         help="алерт-дней в месяц под порог (по умолчанию 2)")
+    p_score.add_argument("--json", action="store_true", help="машинный вывод")
+    p_score.set_defaults(func=cmd_score)
 
     return parser
 
