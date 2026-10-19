@@ -40,6 +40,7 @@ from .health import apple as health_apple
 from .health import digest as health_digest
 from .health import illness as health_illness
 from .health import load as health_load
+from .health import refresh as health_refresh
 from .health import retrain as health_retrain
 
 __all__ = ["build_parser", "main"]
@@ -722,6 +723,17 @@ def cmd_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_refresh(args: argparse.Namespace) -> int:
+    """Единый шаг конвейера: выгрузка -> нагрузка -> эпизоды -> (-> ML)."""
+    conn = _open(args)
+    try:
+        step = health_refresh.run(conn, deep=args.deep, source=args.xml)
+    finally:
+        conn.close()
+    print(health_refresh.format_freshness(step))
+    return 0
+
+
 def cmd_apple_load(args: argparse.Namespace) -> int:
     """Разобрать выгрузку Apple Health в таблицы ``aw_*``."""
     report = health_apple.load(
@@ -985,6 +997,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_export = sub.add_parser("export", help="выгрузка в CSV")
     p_export.add_argument("--out", default=etl.DEFAULT_EXPORT)
     p_export.set_defaults(func=cmd_export)
+
+    p_refresh = sub.add_parser(
+        "refresh", help="весь конвейер разом: выгрузка -> нагрузка -> "
+                        "эпизоды (и ML-блок с --deep), с пропуском "
+                        "неизменённого архива")
+    p_refresh.add_argument("--deep", action="store_true",
+                           help="пересобрать и ML-блок (ml_features, ml_labels)")
+    p_refresh.add_argument("--xml", default=None,
+                           help="путь к выгрузке (по умолчанию самый свежий "
+                                "архив в data/)")
+    p_refresh.set_defaults(func=cmd_refresh)
 
     p_apple = sub.add_parser(
         "apple-load", help="разобрать выгрузку Apple Health (export.xml) в aw_*")

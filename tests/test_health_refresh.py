@@ -1,0 +1,137 @@
+"""Тесты единого шага обновления: ``koilog.health.refresh``.
+
+Шаг - единственная точка, которая двигает все звенья конвейера в правильном
+порядке и умеет скипать дорогой разбор выгрузки (~45 с). Здесь проверяется
+ровно это: порядок звеньев, скип по слепку файла, повторный разбор после
+изменения файла, то, что упавший разбор не оставляет слепок, и свежесть в
+виде максимумов дат по таблицам.
+
+Ни одна из проверок не пишет в боевую базу: шаг получает соединение, а
+``apple.load`` (своё соединение к ``DEFAULT_DB``) в нём не используется.
+"""
+
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+
+from koilog import etl
+from koilog.health import ml, refresh
+
+# Синтетическая выгрузка: один день (2024-01-17), чтобы разбор был мгновенным.
+# Имя источника - с неразрывным пробелом, как в настоящем экспорте.
+_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<HealthData locale="ru_RU">
+  <ExportDate value="2026-10-15 12:00:00 +0300"/>
+  <Record type="HKQuantityTypeIdentifierRestingHeartRate" value="62" sourceName="Apple\xa0Watch\xa0— Алексей" startDate="2024-01-17 00:00:00 +0300" endDate="2024-01-17 00:00:00 +0300"/>
+  <Record type="HKQuantityTypeIdentifierHeartRateVariabilitySDNN" value="40.5" sourceName="Apple\xa0Watch\xa0— Алексей" startDate="2024-01-17 03:10:00 +0300" endDate="2024-01-17 03:10:00 +0300"/>
+  <Record type="HKQuantityTypeIdentifierRespiratoryRate" value="15.2" sourceName="Apple\xa0Watch\xa0— Алексей" startDate="2024-01-17 03:10:00 +0300" endDate="2024-01-17 03:10:00 +0300"/>
+  <Record type="HKCategoryTypeIdentifierSleepAnalysis" value="HKCategoryValueSleepAnalysisInBed" sourceName="Apple\xa0Watch\xa0— Алексей" startDate="2024-01-17 01:30:00 +0300" endDate="2024-01-17 07:30:00 +0300"/>
+  <Record type="HKQuantityTypeIdentifierStepCount" value="1200" sourceName="Apple\xa0Watch\xa0— Алексей" startDate="2024-01-17 12:00:00 +0300" endDate="2024-01-17 12:30:00 +0300"/>
+</HealthData>
+"""
+
+# Тот же файл с добавленным днём - «свежая выгрузка».
+_XML_NEXT_DAY = _XML.replace(
+    "</HealthData>",
+    '  <Record type="HKQuantityTypeIdentifierRestingHeartRate" value="63" '
+    'sourceName="Apple\xa0Watch\xa0— Алексей" '
+    'startDate="2024-01-18 00:00:00 +0300" '
+    'endDate="2024-01-18 00:00:00 +0300"/>\n</HealthData>',
+)
+
+
+class RefreshRunTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        folder = Path(self._tmp.name)
+        self.xml = folder / "выгрузка.xml"
+        self.xml.write_text(_XML, encoding="utf-8")
+        self.conn = etl.connect(folder / "training.db")
+        etl.create_schema(self.conn)
+
+    def tearDown(self) -> None:
+        self.conn.close()
+        self._tmp.cleanup()
+
+    def _run(self, **kwargs) -> refresh.Step:
+        kwargs.setdefault("source", self.xml)
+        return refresh.run(self.conn, **kwargs)
+
+    # -- порядок звеньев ---------------------------------------------------
+
+    def test_stages_run_in_pipeline_order(self):
+        step = self._run()
+        self.assertEqual(
+            step.stages,
+            ["выгрузка (разобрана)", "нагрузка", "календарь", "эпизоды"],
+        )
+
+    def test_shallow_run_does_not_build_ml_tables(self):
+        # без deep ML-таблицы не трогаются: koilog.ipynb не тянет numpy
+        self._run()
+        self.assertFalse(refresh._has_table(self.conn, "ml_features"))
+
+    # -- скип разбора по слепку ---------------------------------------------
+
+    def test_second_run_skips_parse(self):
+        self._run()
+        step = self._run()
+        self.assertFalse(step.parsed)
+        self.assertIn("скип", step.stages[0])
+        # данные предыдущего разбора не тронуты
+        row = self.conn.execute("SELECT COUNT(*) FROM aw_daily").fetchone()
+        self.assertEqual(row[0], 1)
+
+    def test_changed_source_is_reparsed(self):
+        self._run()
+        self.xml.write_text(_XML_NEXT_DAY, encoding="utf-8")
+        step = self._run()
+        self.assertTrue(step.parsed)
+        row = self.conn.execute("SELECT MAX(date) FROM aw_daily").fetchone()
+        self.assertEqual(row[0], "2024-01-18")
+
+    def test_failed_parse_leaves_no_stamp(self):
+        self.xml.write_text("это не XML", encoding="utf-8")
+        with self.assertRaises(Exception):
+            self._run()
+        # слепок пишется только после успешной записи: следующий шаг
+        # попробует разобрать файл заново, а не сочтёт его обработанным
+        self.assertTrue(refresh._need_parse(self.conn, self.xml))
+
+    # -- свежесть -----------------------------------------------------------
+
+    def test_freshness_reports_max_dates(self):
+        step = self._run()
+        fresh = dict(step.freshness)
+        self.assertEqual(fresh["aw_daily"], "2024-01-17")
+        self.assertEqual(fresh["illness_episodes"], None)  # эпизодов нет
+        self.assertIsNotNone(fresh["load_daily"])
+        self.assertIsNotNone(fresh["health_days"])
+
+    def test_freshness_of_missing_tables_is_none(self):
+        fresh = dict(refresh._freshness(self.conn))
+        self.assertEqual(fresh["aw_daily"], None)
+        self.assertEqual(fresh["ml_features"], None)
+
+    def test_format_freshness_shows_export_date_and_tables(self):
+        text = refresh.format_freshness(self._run())
+        self.assertIn("выгрузка от 2026-10-15 12:00:00 +0300", text)
+        self.assertIn("aw_daily 2024-01-17", text)
+
+    # -- deep ---------------------------------------------------------------
+
+    @unittest.skipUnless(ml.HAS_ML, "нет numpy/scikit-learn (koilog[ml])")
+    def test_deep_rebuilds_ml_features(self):
+        step = self._run(deep=True)
+        self.assertIn("ML-признаки", step.stages)
+        fresh = dict(step.freshness)
+        self.assertEqual(fresh["ml_features"], fresh["aw_daily"])
+        # deep-перегонка тоже кешируется слепком, а не парсит каждый раз
+        again = self._run(deep=True)
+        self.assertFalse(again.parsed)
+
+
+if __name__ == "__main__":
+    unittest.main()

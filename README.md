@@ -28,6 +28,7 @@ python -m koilog check                      # что в данных требу�
 python -m koilog outliers                   # разбор выбросов по правилам
 python -m koilog export                     # выгрузка таблицы sets в CSV
 
+python -m koilog refresh --deep             # весь конвейер часов разом
 python -m koilog apple-load                 # разобрать выгрузку Apple Health
 python -m koilog health-load                # внешняя нагрузка + дни здоровья
 python -m koilog illness                    # эпизоды болезни по уровням
@@ -332,6 +333,7 @@ python -m koilog plan "Жим штанг" --csv
 восстановлением.
 
 ```
+python -m koilog refresh    # весь конвейер разом; --deep добавляет ML-блок
 python -m koilog apple-load    # разобрать выгрузку Apple Health в таблицы aw_*
 python -m koilog health-load   # внешняя нагрузка: load_daily, health_days
 python -m koilog illness       # метки эпизодов: confirmed / probable / gap_only
@@ -340,6 +342,13 @@ python -m koilog digest        # день одной карточкой: кан�
 python -m koilog ml            # признаки, CV-отчёт, красный флаг (extra ml)
 python -m koilog ml --lag      # + лаг-анализ признаков (0-21 дн)
 ```
+
+`refresh` гонит конвейер целиком и **в правильном порядке** — выгрузка →
+нагрузка → календарь → эпизоды (→ ML-блок с `--deep`) — и печатает свежесть
+по каждой таблице, чтобы отставание было видно сразу, а не вычислялось вручную.
+Разбор гигабайтного архива (~45 с) скипается, если файл не менялся: после
+успешной загрузки в `aw_meta` пишется слепок «mtime + размер», и следующий
+запуск занимает доли секунды; слепок не записывается, если разбор упал.
 
 `apple-load` читает выгрузку **прямо из архива** `data/*.zip` (или из
 `export.xml`, если он распакован) одним проходом `iterparse`: файл около
