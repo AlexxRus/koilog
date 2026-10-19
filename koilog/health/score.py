@@ -85,6 +85,7 @@ __all__ = [
     "replay",
     "rows",
     "spec_hash",
+    "spec_warning",
     "sync",
     "threshold",
 ]
@@ -460,6 +461,23 @@ def rows(
     if limit is not None:
         items = items[-limit:]
     return items
+
+
+def spec_warning(
+    conn: sqlite3.Connection,
+    features: tuple[str, ...] = health_ml.V2_FEATURES,
+    model: str = "logreg",
+    min_history: int = health_ml.MIN_HISTORY,
+) -> str | None:
+    """Канонический ряд записан не по текущей спеке (или смешан по винтам).
+
+    Тонкость вызывающего слоя над :func:`koilog.health.digest.spec_warning`:
+    здесь считается **текущий** ``spec_hash``, а сравнение уже SQL по ledger'у.
+    Печатается в ``score`` и в карточке дайджеста, чтобы винты не смешались
+    незаметно - см. :func:`rows`.
+    """
+    return health_digest.spec_warning(
+        conn, current=spec_hash(features, model, min_history))
 
 
 def _num(value: float | None, digits: int = 2) -> str:

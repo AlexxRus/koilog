@@ -837,7 +837,9 @@ def cmd_digest(args: argparse.Namespace) -> int:
     """Одна карточка дня: каналы часов, нагрузка, рекомендация."""
     conn = _open(args)
     try:
-        state = health_digest.day_state(conn, args.date)
+        from .health import score as health_score
+        state = health_digest.day_state(
+            conn, args.date, spec=health_score.spec_hash())
     finally:
         conn.close()
 
@@ -864,6 +866,9 @@ def cmd_score(args: argparse.Namespace) -> int:
                     print(health_score.dumps(day))
                 else:
                     print(health_score.format_day(day))
+                    note = health_score.spec_warning(conn, model=args.model)
+                    if note:
+                        print(note)
                     print()
                     empty = ("проспективных строк нет" if args.prospective
                              else None)
@@ -904,6 +909,9 @@ def cmd_score(args: argparse.Namespace) -> int:
         else:
             print(f"ledger скора: день не записан "
                   f"({health_score.reason_text(summary.get('reason'))})")
+        note = health_score.spec_warning(conn, model=args.model)
+        if note:
+            print(note)
         print()
         empty = ("проспективных строк нет" if args.prospective
                  else None)

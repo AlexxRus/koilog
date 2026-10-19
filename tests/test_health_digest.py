@@ -354,6 +354,8 @@ class DayStateTests(unittest.TestCase):
         self.assertEqual(state["score"]["score"], 0.83)
         self.assertEqual(state["score"]["alert"], 1)
         self.assertEqual(state["score"]["threshold"], 0.75)
+        # винт строки виден извне - без него не проверить смену спеки
+        self.assertEqual(state["score"]["spec_hash"], "spec00000001")
 
     def test_format_digest_shows_gate_and_score(self):
         conn = self._score_db()
@@ -382,6 +384,55 @@ class DayStateTests(unittest.TestCase):
         self.assertNotIn("скор (причинный", text)
         # гейт при этом всё равно показан: он не зависит от ML
         self.assertIn("гейт возврата", text)
+        self.assertIsNone(state["spec_warning"])
+
+    # -- гигиена spec_hash --------------------------------------------------
+
+    def test_spec_warning_absent_when_single_vintage_matches(self):
+        conn = self._score_db()
+        self.addCleanup(conn.close)
+        self.assertIsNone(digest.spec_warning(conn, current="spec00000001"))
+        state = digest.day_state(conn, "2024-01-30", spec="spec00000001")
+        self.assertIsNone(state["spec_warning"])
+        self.assertNotIn("внимание:", digest.format_digest(state))
+
+    def test_spec_warning_when_history_not_reseeded(self):
+        """Рецептура сменилась, а история ещё старого винта - карточка скажет."""
+        conn = self._score_db()
+        self.addCleanup(conn.close)
+        state = digest.day_state(conn, "2024-01-30", spec="spec00000009")
+        self.assertIn("не пересеяна", state["spec_warning"])
+        self.assertIn("внимание:", digest.format_digest(state))
+        # без текущей спеки видно только смешение винтов, а о пока одной строке
+        # сообщать не о чем
+        self.assertIsNone(digest.spec_warning(conn))
+
+    def test_spec_warning_mixed_vintages_in_canonical_series(self):
+        """Смесь винтов в каноническом ряду ловится и без текущей спеки."""
+        conn = self._score_db()
+        self.addCleanup(conn.close)
+        conn.execute(
+            "INSERT INTO ml_score (day, as_of, computed_at, score, spec_hash, "
+            "n_train, n_pos, last_train_day, threshold, alert) "
+            "VALUES ('2024-01-25', '2024-01-25', '2024-01-25T20:00:00', 0.4, "
+            "'spec00000002', 40, 6, '2024-01-24', 0.75, 0)")
+        conn.commit()
+        note = digest.spec_warning(conn)
+        self.assertIn("смешана", note)
+        self.assertIn("spec00000001", note)
+        self.assertIn("spec00000002", note)
+
+    def test_spec_warning_mixed_vintages_wins_over_current(self):
+        """При смешанных винтах важнее сказать про смесь, чем про current."""
+        conn = self._score_db()
+        self.addCleanup(conn.close)
+        conn.execute(
+            "INSERT INTO ml_score (day, as_of, computed_at, score, spec_hash, "
+            "n_train, n_pos, last_train_day, threshold, alert) "
+            "VALUES ('2024-01-25', '2024-01-25', '2024-01-25T20:00:00', 0.4, "
+            "'spec00000002', 40, 6, '2024-01-24', 0.75, 0)")
+        conn.commit()
+        self.assertIn("смешана", digest.spec_warning(conn, current="spec00000009"))
 
 
 if __name__ == "__main__":

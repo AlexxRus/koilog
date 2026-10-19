@@ -283,8 +283,14 @@ class ModelTests(unittest.TestCase):
         self.assertIn("lag_tonnage", data)
         self.assertIn("red_flag", data)
         # честная оценка: бюджеты алертов и AUC с интервалом по эпизодам
+        # главная строка - причинная; оракул рядом как верхняя граница
         self.assertIn("walk_v2", data)
+        self.assertIn("walk_v2_oracle", data)
         self.assertIn("walk_baseline", data)
+        self.assertIn("walk_baseline_oracle", data)
+        self.assertEqual(data["walk_v2"]["label_rule"], ml.CAUSAL_LABEL_RULE)
+        self.assertEqual(data["walk_v2_oracle"]["label_rule"],
+                         ml.ORACLE_LABEL_RULE)
         self.assertIn("matched_v2", data)
         self.assertIn("matched_baseline", data)
         import json
@@ -302,6 +308,13 @@ class ModelTests(unittest.TestCase):
         self.assertIn("day-классификация", text)
         self.assertIn("recall@бюджет", text)
         self.assertIn("случайный", text)
+        # заголовок таблицы говорит, по какому правилу меток она посчитана
+        self.assertIn("причинные метки", text)
+        self.assertIn(ml.CAUSAL_LABEL_RULE, text)
+        # оракул - рядом, явно верхней границей, а не результатом
+        self.assertIn("оракул", text)
+        self.assertIn("верхняя граница", text)
+        self.assertIn("precision", text)
         # знаменатель и nowcast видны читателю отдельно
         self.assertIn("уловимых", text)
         self.assertIn("nowcast", text)
@@ -418,6 +431,117 @@ class ModelTests(unittest.TestCase):
         self.assertTrue(0.0 <= result["auc"] <= 1.0)
         self.assertLessEqual(result["auc_ci"]["low"], result["auc_ci"]["high"])
         self.assertEqual(set(result["auc_by_lead"]), {"near", "far"})
+        # правило меток видно в результате, дефолт - оракул
+        self.assertFalse(result["causal"])
+        self.assertEqual(result["label_rule"], ml.ORACLE_LABEL_RULE)
+        for row in result["budgets"]:
+            self.assertIn("precision", row["model"])
+            self.assertIn("recall_delta", row)
+            delta = row["recall_delta"]
+            if delta["delta"] is not None:
+                self.assertLessEqual(delta["low"], delta["high"])
+                # сумма catchable_hits = episodes_caught_catchable: дельта
+                # bootstrap обязана сойтись с разницей долей из describe,
+                # иначе числитель и знаменатель recall разъехались
+                self.assertAlmostEqual(
+                    delta["delta"],
+                    row["model"]["episode_recall_catchable"]
+                    - row["random"]["episode_recall_catchable"], places=6)
+
+    def test_walk_forward_causal_differs_only_in_labels(self):
+        """Причинный и оракульный прогоны делят историю, бюджеты и ресэмпл.
+
+        Окна эпизодов, зоны FP и бюджеты от правила меток не зависят.
+        Оценённых дней причинный не больше: его трейн строго уже (дни с
+        открытым окном исключены), поэтому при короткой истории он может
+        не набрать ``min_history``.
+        """
+        conn = _synthetic_db()
+        ml.build_features(conn, window=None)
+        conn.executescript(
+            "INSERT INTO illness_episodes (id, start, end, level, source, type) "
+            "VALUES (1, '2024-01-21', '2024-01-21', 'confirmed', 'watch', 'unknown');"
+            "INSERT INTO illness_episodes (id, start, end, level, source, type) "
+            "VALUES (2, '2024-02-26', '2024-02-26', 'confirmed', 'watch', 'unknown');")
+        conn.commit()
+        ml.build_labels(conn, window=None)
+        kwargs = dict(model="logreg", budgets=(2.0, 4.0), random_repeats=5,
+                      auc_bootstrap=20)
+        oracle = ml.walk_forward(conn, ml.V2_FEATURES, **kwargs)
+        causal = ml.walk_forward(conn, ml.V2_FEATURES, causal=True, **kwargs)
+
+        for key in ("days", "episodes", "min_lead", "nowcast_lead"):
+            self.assertEqual(causal[key], oracle[key], key)
+        # ``fp_zone_base`` в проверку не входит: он считается по оценённым
+        # дням, а причинный трейн строже - на коротком ряду база честно уже
+        self.assertEqual(causal["label_rule"], ml.CAUSAL_LABEL_RULE)
+        self.assertEqual(oracle["label_rule"], ml.ORACLE_LABEL_RULE)
+        self.assertGreater(causal["evaluated"], 0)
+        # причинный трейн - подмножество оракульного, не наоборот
+        self.assertLessEqual(causal["evaluated"], oracle["evaluated"])
+        self.assertLessEqual(causal["episodes_catchable"],
+                             oracle["episodes_catchable"])
+        self.assertEqual([row["budget"] for row in causal["budgets"]],
+                         [row["budget"] for row in oracle["budgets"]])
+        # у каждого бюджета есть своё число, но бюджеты - те же
+        for row in causal["budgets"]:
+            self.assertIsNotNone(row["model"]["episode_recall_catchable"])
+            # построчно по уловимым эпизодам - из этого считается страта
+            self.assertEqual(len(row["per_catchable"]),
+                             causal["episodes_catchable"])
+            self.assertEqual(
+                sum(int(item["caught"]) for item in row["per_catchable"]),
+                row["model"]["episodes_caught_catchable"])
+
+    def test_relapse_strata_splits_by_cluster_gap(self):
+        """Второй onset в пределах 14 дней - рецидив, дальше - de novo."""
+        conn = _synthetic_db()
+        conn.executescript(
+            "INSERT INTO illness_episodes (id, start, end, level, source, type) "
+            "VALUES (1, '2024-01-05', '2024-01-05', 'confirmed', 'watch', 'unknown');"
+            "INSERT INTO illness_episodes (id, start, end, level, source, type) "
+            "VALUES (2, '2024-01-12', '2024-01-12', 'confirmed', 'watch', 'unknown');"
+            "INSERT INTO illness_episodes (id, start, end, level, source, type) "
+            "VALUES (3, '2024-02-26', '2024-02-26', 'confirmed', 'watch', 'unknown');")
+        conn.commit()
+        # пустые эпизоды (уровень gap_only) в страты не идут
+        self.assertEqual(ml.relapse_strata(conn), {
+            "2024-01-05": "de novo",
+            "2024-01-12": "relapse",     # +7 дней - тот же кластер
+            "2024-02-26": "de novo",     # +45 дней - новый
+        })
+
+    def test_stratified_recall_reads_per_catchable(self):
+        """Страты считают по своим уловимым эпизодам, знаменатель сходится."""
+        conn = _synthetic_db()
+        ml.build_features(conn, window=None)
+        conn.executescript(
+            "INSERT INTO illness_episodes (id, start, end, level, source, type) "
+            "VALUES (1, '2024-01-21', '2024-01-21', 'confirmed', 'watch', 'unknown');"
+            "INSERT INTO illness_episodes (id, start, end, level, source, type) "
+            "VALUES (2, '2024-02-26', '2024-02-26', 'confirmed', 'watch', 'unknown');")
+        conn.commit()
+        ml.build_labels(conn, window=None)
+        walk = ml.walk_forward(conn, ml.V2_FEATURES, budgets=(2.0,),
+                               random_repeats=3, auc_bootstrap=10)
+        block = ml.stratified_recall(walk, ml.relapse_strata(conn),
+                                     bootstrap=10)
+        self.assertEqual(len(block), 1)
+        row = block[0]
+        total = sum(group["episodes"] for group in row["strata"].values())
+        caught = sum(group["caught"] for group in row["strata"].values())
+        self.assertEqual(total, walk["episodes_catchable"])
+        self.assertEqual(caught,
+                         walk["budgets"][0]["model"]["episodes_caught_catchable"])
+        for group in row["strata"].values():
+            self.assertEqual(group["weak"], group["episodes"] < ml.MIN_STRATUM)
+        # разница определена, когда обе страты имеют уловимые эпизоды
+        if len(row["strata"]) == 2:
+            self.assertIsNotNone(row["delta"]["delta"])
+            self.assertLessEqual(row["delta"]["low"], row["delta"]["high"])
+
+    def test_strata_difference_none_without_one_side(self):
+        self.assertIsNone(ml._strata_difference([], [1.0], 10, 1)["delta"])
 
     def test_matched_auc_bootstrap_by_episode(self):
         """Интервал AUC - по эпизодам (дни внутри эпизода не независимы)."""

@@ -47,6 +47,7 @@ __all__ = [
     "format_digest",
     "load_state",
     "recommend",
+    "spec_warning",
 ]
 
 #: Окно личного фона для z-каналов (как в :mod:`koilog.health.illness`).
@@ -308,7 +309,8 @@ def _score_row(conn: sqlite3.Connection, day: str | None) -> dict | None:
         return None
     rows = _query(
         conn,
-        "SELECT s.day, s.score, s.threshold, s.alert, s.as_of, s.computed_at "
+        "SELECT s.day, s.score, s.threshold, s.alert, s.as_of, s.computed_at, "
+        "s.spec_hash "
         "FROM ml_score s WHERE s.day <= ? AND s.score IS NOT NULL "
         "AND s.id = (SELECT MAX(id) FROM ml_score WHERE day = s.day) "
         "ORDER BY s.day DESC LIMIT 1",
@@ -316,7 +318,7 @@ def _score_row(conn: sqlite3.Connection, day: str | None) -> dict | None:
     )
     if not rows:
         return None
-    day_of, score, threshold, alert, as_of, computed_at = rows[0]
+    day_of, score, threshold, alert, as_of, computed_at, spec = rows[0]
     return {
         "day": day_of,
         "score": score,
@@ -324,11 +326,52 @@ def _score_row(conn: sqlite3.Connection, day: str | None) -> dict | None:
         "alert": alert,
         "as_of": as_of,
         "computed_at": computed_at,
+        "spec_hash": spec,
     }
 
 
-def day_state(conn: sqlite3.Connection, today: str | None = None) -> dict:
-    """Полное состояние дня: дата, каналы, нагрузка, гейт, скор, рекомендация."""
+def spec_warning(conn: sqlite3.Connection, current: str | None = None) -> str | None:
+    """Предупреждение, если канонический ряд ``ml_score`` не по одной спеке.
+
+    Смена рецепта (признаки / модель / правило меток) даёт новый
+    ``spec_hash``, а ledger append-only - старые строки не уходят. Если
+    историю под новой спекой не пересеяли (частичный ``replay``,
+    прямой ``record``), канонический ряд складывается из винтов разных
+    рецептов, и сравнение дней между собой (порог, тренд, recall) уже не
+    легитимно. Отдельный случай - ``current``: строка дня записана по
+    другой спеке, чем текущая рецептура, то есть показывается число,
+    посчитанное другой моделью.
+
+    Проверка - чистым SQL, без импорта ``score``/``ml`` (иначе кольцо:
+    ``score`` зовёт :func:`recommend`); ``current`` подставляет вызывающий.
+    """
+    rows = _query(
+        conn,
+        "SELECT spec_hash, COUNT(DISTINCT day) FROM ml_score s "
+        "WHERE s.id = (SELECT MAX(id) FROM ml_score WHERE day = s.day) "
+        "GROUP BY spec_hash ORDER BY 2 DESC, 1",
+    )
+    if not rows:
+        return None
+    if len(rows) > 1:
+        mix = ", ".join(f"{count} дн по {spec}" for spec, count in rows)
+        return (f"спека скора смешана: {len(rows)} винта ({mix}) - "
+                f"цифры разных дней несопоставимы, нужен полный "
+                f"replay под новой спекой")
+    stored = rows[0][0]
+    if current is not None and stored != current:
+        return (f"спека скора: история записана по {stored}, а текущая "
+                f"рецептура {current} - история ещё не пересеяна")
+    return None
+
+
+def day_state(conn: sqlite3.Connection, today: str | None = None,
+              spec: str | None = None) -> dict:
+    """Полное состояние дня: дата, каналы, нагрузка, гейт, скор, рекомендация.
+
+    ``spec`` - текущий ``spec_hash`` рецептуры (подставляет вызывающий,
+    например CLI): без него видно только смешение винтов внутри ряда.
+    """
     channels_list = channels(conn, today)
     load = load_state(conn, today)
     resolved = today
@@ -346,6 +389,7 @@ def day_state(conn: sqlite3.Connection, today: str | None = None) -> dict:
         "load": load,
         "gate": gate.to_dict(),
         "score": score,
+        "spec_warning": spec_warning(conn, spec),
         "recommendation": recommendation,
     }
 
@@ -402,10 +446,14 @@ def format_digest(state: dict) -> str:
         elif score.get("alert"):
             tail = f"выше порога {score['threshold']:.2f} (алерт)"
         else:
-            tail = f"ниже порога {score['threshold']:.2f}"
+            # скор - тихий мониторинг: порог в строке нужен лишь для
+            # непрерывности ряда, поэтому без решающей интонации
+            tail = f"мониторинг (порог {score['threshold']:.2f})"
         when = ("" if score.get("day") in (None, state.get("today"))
                 else f" за {score['day']}")
         lines.append(f"скор (причинный{when}): {score['score']:.2f} — {tail}")
+    if state.get("spec_warning"):
+        lines.append("внимание: " + state["spec_warning"])
 
     rec = state["recommendation"]
     lines.append("")

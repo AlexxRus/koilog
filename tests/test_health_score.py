@@ -201,6 +201,35 @@ class CausalScoreTests(unittest.TestCase):
         self.assertEqual(len(dates), len(infos))
         self.assertTrue(any(info and info.get("scored") for info in infos))
 
+    def test_invariant_no_day_leaks_from_the_future(self):
+        """Инвариант причинности на всём проходе, а не на одном дне.
+
+        Скор дня ``T`` обязан зависеть только от данных ``<= T``: обрезка
+        базы по ``as_of`` не меняет **ни одного** дня ``<= as_of`` - ни
+        оценённого, ни исключённого. Однодневная проверка выше пропустила бы
+        сдвиг на любом другом дне, поэтому здесь сравнивается весь проход.
+        Это регресс-тест против будущих рефакторингов ``_predict``/меток:
+        утечка будущего ломает проспективность ledger'а незаметно.
+        """
+        conn = _prepared()
+        as_of = "2024-03-05"
+        dates, before = ml.causal_scores(conn, ml.V2_FEATURES)
+        _truncate(conn, as_of)
+        dates_cut, after = ml.causal_scores(conn, ml.V2_FEATURES)
+        self.assertEqual([d for d in dates_cut if d <= as_of],
+                         [d for d in dates if d <= as_of])
+        pairs = [(day, old, new) for day, old, new
+                 in zip(dates, before, after) if day <= as_of]
+        scored = [(day, old, new) for day, old, new in pairs
+                  if old and old.get("scored")]
+        self.assertTrue(scored, "на усечённой базе не оценен ни один день")
+        for day, old, new in pairs:
+            self.assertEqual(bool(new and new.get("scored")),
+                             bool(old and old.get("scored")), day)
+            if old and old.get("scored"):
+                self.assertEqual(old["score"], new["score"], day)
+                self.assertEqual(old["n_train"], new["n_train"], day)
+
 
 @unittest.skipUnless(ml.HAS_ML, "нет numpy/scikit-learn (koilog[ml])")
 class AuditTests(unittest.TestCase):
@@ -311,6 +340,23 @@ class LedgerTests(unittest.TestCase):
         self.assertIsNotNone(score.threshold(conn, spec, "2024-03-10"))
         self.assertIsNone(score.threshold(conn, "deadbeef", "2024-03-10"))
 
+    def test_spec_warning_clean_after_replay_then_on_vintage_mix(self):
+        """Сев даёт один винт под текущей спекой; подмешанный винт виден."""
+        conn = _prepared()
+        self.assertIsNone(score.spec_warning(conn))    # таблицы ещё нет
+        score.replay(conn)
+        self.assertIsNone(score.spec_warning(conn))    # ряд = текущая рецептура
+        # чужой винт становится каноническим (append-only: побеждает MAX(id))
+        day = conn.execute("SELECT MAX(day) FROM ml_score").fetchone()[0]
+        conn.execute(
+            "INSERT INTO ml_score (day, as_of, computed_at, score, spec_hash, "
+            "n_train, n_pos, last_train_day, threshold, alert) "
+            "VALUES (?, ?, '2024-06-01T10:00:00', 0.5, 'deadbeef', 10, 1, "
+            "'2024-02-09', 0.7, 0)",
+            (day, day))
+        conn.commit()
+        self.assertIn("смешана", score.spec_warning(conn))
+
     def test_prospective_uses_computed_at(self):
         conn = _prepared()
         score.replay(conn)
@@ -351,6 +397,13 @@ class LedgerTests(unittest.TestCase):
         self.assertIn("day", columns)
 
     def test_record_without_numpy_raises_with_hint(self):
+        """Подсказка «поставьте extra ml» проверяется только без sklearn.
+
+        Пропуск (``skipped=1`` в прогоне со sklearn) — env-условный, а не
+        ошибка: с установленным sklearn ветка без numpy недостижима, поэтому
+        тесту нечего проверять. Смысл — не потерять поведение на чистом
+        окружении, где numpy/scikit-learn нет.
+        """
         if ml.HAS_ML:
             self.skipTest("sklearn есть: подсказка про extra ml не проверится")
         conn = _prepared()

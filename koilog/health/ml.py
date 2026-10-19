@@ -96,7 +96,10 @@ __all__ = [
     "H_MIN",
     "H_ONSET",
     "MIN_HISTORY",
+    "MIN_STRATUM",
     "MODEL_FEATURES",
+    "ORACLE_LABEL_RULE",
+    "RELAPSE_GAP_DAYS",
     "V2_BASELINE_FEATURES",
     "V2_FEATURES",
     "build_features",
@@ -108,7 +111,9 @@ __all__ = [
     "matched_auc",
     "onset_cv",
     "red_flag_report",
+    "relapse_strata",
     "report",
+    "stratified_recall",
     "walk_forward",
     "walk_probs",
 ]
@@ -124,6 +129,18 @@ H_ONSET = 7
 #: Минимальный lead time v2: срабатывание ближе чем за ``H_MIN`` дней до
 #: начала эпизода опоздало и поимкой не считается.
 H_MIN = 3
+
+#: Граница кластера рецидивов (D10): onset'ы ближе ``RELAPSE_GAP_DAYS`` дней
+#: относятся к одному кластеру, то есть второй и последующие - рецидивы, а не
+#: de novo. Страта оценочная (см. :func:`relapse_strata`), в скоринге не
+#: участвует.
+RELAPSE_GAP_DAYS = 14
+
+#: Минимум уловимых эпизодов в страте, чтобы её recall считался выводом
+#: (меньше - печатается как число с пометкой ``weak``). Пререгистрировано в
+#: ``docs/causal-replay-spec.md`` до прогона: при 6-10 рецидивах это нижняя
+#: граница хоть какой-то различимости.
+MIN_STRATUM = 3
 
 #: Окно личного базлайна для z-скоров.
 BASELINE_DAYS = 60
@@ -922,6 +939,11 @@ MIN_HISTORY = 30
 #: (:mod:`koilog.health.score`), и анализ сегментирует по нему.
 CAUSAL_LABEL_RULE = "causal-v1"
 
+#: Версия **оракульного** правила меток: метка дня берётся по полным данным
+#: (исход после дня виден). Не идёт в ledger - это ретро-верхняя граница,
+#: а не то, что говорила система.
+ORACLE_LABEL_RULE = "oracle"
+
 
 def _predict(train_x, day_x, y, model: str) -> float:
     """Обучить модель на ``train_x``/``y`` и вернуть вероятность для ``day_x``.
@@ -1035,6 +1057,24 @@ def _causal_score_at(
     }
 
 
+def _causal_probs_data(data: "Dataset", starts: list[str], model: str,
+                       min_history: int = MIN_HISTORY) -> list[float | None]:
+    """Цикл walk-forward, но на **причинных** метках (``causal-v1``).
+
+    Параллель :func:`_walk_probs_data` и та же история: отличие только в
+    правиле меток - день ``t`` учится лишь на исходах, уже известных к
+    ``t``, а день с открытым окном исключается, а не обнуляется. Шаг
+    обучения и здесь :func:`_predict`, поэтому причинный и оракульный
+    прогоны отличаются **только** метками, а не двумя разными моделями.
+    """
+    probs: list[float | None] = [None] * len(data.dates)
+    for t in range(len(data.dates)):
+        info = _causal_score_at(data, starts, t, model, min_history)
+        if info is not None and info.get("scored"):
+            probs[t] = info["score"]
+    return probs
+
+
 def causal_score(
     conn: sqlite3.Connection,
     day: str | None = None,
@@ -1128,6 +1168,7 @@ def walk_forward(
     seed: int = 17,
     random_repeats: int = 50,
     auc_bootstrap: int = 500,
+    causal: bool = False,
 ) -> dict:
     """День за днём, прогноз только по прошлому; порог - под бюджет.
 
@@ -1142,6 +1183,23 @@ def walk_forward(
       даёт меньше алертов, и сравнивать с номиналом было бы нечестно);
     - **сезонный календарь** - все дни ``season_months`` (зима, где эпизоды
       действительно скучены, см. кластеризацию стартов).
+
+    Два правила меток на **одной** истории (:data:`causal`):
+
+    - ``causal=False`` - **оракульное** (:data:`ORACLE_LABEL_RULE`): метка
+      дня ``i`` построена по полным данным, поэтому день ``t`` учится и на
+      днях, чей исход стал известен только после ``t``. Это **верхняя
+      граница**, а не то, что говорила бы система;
+    - ``causal=True`` - **причинное** (:data:`CAUSAL_LABEL_RULE`): трейн
+      обрезан по ``dates[t]`` (см. :func:`_causal_train`), день с
+      открытым окном исключается, а не обнуляется. Именно это число
+      должно стоять главной строкой.
+
+    Варианты отличаются ровно одним - правилом меток: шаг обучения
+    (:func:`_predict`), история, бюджеты, ресэмпл и зоны FP общие. Набор
+    оцениваемых дней в норме совпадает, но не гарантирован: причинный
+    трейн строже, поэтому при очень короткой истории день может остаться
+    без причинного скора.
 
     Поимка - та же, что в :func:`onset_cv` (``lead >= min_lead``), чтобы
     цифры стояли в одной таблице, а не в двух разных определениях.
@@ -1165,15 +1223,21 @@ def walk_forward(
     at_risk = data.at_risk
     dates = data.dates
     n = len(dates)
-    probs = _walk_probs_data(data, model)
+    episode_rows = [e for e in health_illness.episodes(conn)
+                    if e.level != "gap_only"]
+    # одна история, одно правило шага обучения - отличие только в метках
+    if causal:
+        probs = _causal_probs_data(data, sorted(e.start for e in episode_rows),
+                                   model)
+    else:
+        probs = _walk_probs_data(data, model)
 
     scored = [t for t in range(n) if probs[t] is not None]
     scores = [probs[t] for t in scored]
     labels = [int(bool(data.y_onset[t])) for t in scored]
     months = max(1.0, n / 30.44)
 
-    starts = {e.id: e.start for e in health_illness.episodes(conn)
-              if e.level != "gap_only"}
+    starts = {e.id: e.start for e in episode_rows}
     position_of = {day: i for i, day in enumerate(dates)}
     windows: dict[int, tuple[list[int], int]] = {}
     for episode in sorted({ep for ep in data.episode if ep is not None}):
@@ -1247,6 +1311,22 @@ def walk_forward(
                 onset - i <= nowcast_lead for i in alarms)) else 0.0)
         return hits
 
+    catchable_order = [episode for episode in episode_order
+                       if episode in catchable]
+
+    def catchable_hits(flags: list[bool]) -> list[float]:
+        """Поимка (``lead >= min_lead``) по уловимым эпизодам.
+
+        Порядок - ``catchable_order`` (подмножество ``episode_order``), та же
+        логика, что в :func:`episode_stats`: 1.0, если алерт попал в ``far``
+        - окно днями ``lead >= min_lead``. Ровно эти эпизоды входят в
+        знаменатель ``episode_recall_catchable``, поэтому сумма битов и есть
+        ``episodes_caught_catchable``, а bootstrap по ним даёт CI именно для
+        recall (парный против случайного нуля, как ``nowcast_delta``).
+        """
+        return [1.0 if any(flags[i] for i in catchable[episode]) else 0.0
+                for episode in catchable_order]
+
     def episode_stats(flags: list[bool]) -> dict:
         caught = late = missed = caught_catchable = 0
         leads: list[int] = []
@@ -1299,12 +1379,16 @@ def walk_forward(
         alerts = sum(1 for value in flags if value)
         false_days = sum(1 for t in range(n)
                          if flags[t] and data.y_onset[t] == 0)
+        # precision = доля алерт-дней, попавших в окно (t, t+H_ONSET] к
+        # onset'у. Считается бюджетно, как и любая доля FP (см. README).
+        precision = (alerts - false_days) / alerts if alerts else None
         count, longest = streak_stats(flags)
         out = {
             "alert_days": alerts,
             "alerts_per_month": alerts / months,
             "false_alarm_days": false_days,
             "false_alarms_per_month": false_days / months,
+            "precision": precision,
             "streaks": count,
             "longest_streak": longest,
             "fp_zones": fp_zones(flags),
@@ -1326,11 +1410,11 @@ def walk_forward(
 
     def average_metrics(rows: list[dict]) -> dict:
         keys = ("alert_days", "alerts_per_month", "false_alarm_days",
-                "false_alarms_per_month", "streaks", "longest_streak",
-                "episodes_caught", "episodes_late", "episodes_missed",
-                "episodes_caught_nowcast", "episodes_caught_catchable",
-                "episode_recall", "episode_recall_catchable",
-                "episode_recall_nowcast")
+                "false_alarms_per_month", "precision", "streaks",
+                "longest_streak", "episodes_caught", "episodes_late",
+                "episodes_missed", "episodes_caught_nowcast",
+                "episodes_caught_catchable", "episode_recall",
+                "episode_recall_catchable", "episode_recall_nowcast")
         out = {}
         for key in keys:
             values = [row[key] for row in rows if row[key] is not None]
@@ -1348,24 +1432,42 @@ def walk_forward(
         fraction = min(0.5, model_row["alert_days"] / len(scored)) if scored else 0.0
         random_rows = []
         random_hits: list[list[float]] = []
+        random_catch: list[list[float]] = []
         for _ in range(max(1, random_repeats)):
             flags = [probs[t] is not None and generator.random() < fraction
                      for t in range(n)]
             random_rows.append(describe(flags))
             random_hits.append(nowcast_hits(flags))
+            random_catch.append(catchable_hits(flags))
         # ноль усредняется на уровне эпизода (доля повторов, поймавших
         # эпизод), чтобы интервал разницы был парным и честным
         baseline_hits = [
             sum(hits[index] for hits in random_hits) / len(random_hits)
             for index in range(len(episode_order))
         ]
+        baseline_catch = [
+            sum(hits[index] for hits in random_catch) / len(random_catch)
+            for index in range(len(catchable_order))
+        ]
+        catch_bits = catchable_hits(model_flags)
         by_budget.append({
             "budget": budget,
             "model": model_row,
             "random": average_metrics(random_rows),
+            # bootstrap по уловимым эпизодам: модель - случайный ноль,
+            # парный ресэмпл (тот же seed, что у nowcast_delta)
+            "recall_delta": _episode_bootstrap_delta(
+                catch_bits, baseline_catch, auc_bootstrap, seed + budget),
             "nowcast_delta": _episode_bootstrap_delta(
                 nowcast_hits(model_flags), baseline_hits,
                 auc_bootstrap, seed + budget),
+            # построчно по уловимым эпизодам: из этого считается
+            # стратификация relapse/de novo (:func:`stratified_recall`)
+            "per_catchable": [
+                {"episode": episode, "onset": starts[episode],
+                 "caught": bool(hit)}
+                for episode, hit in zip(catchable_order, catch_bits)
+            ],
         })
 
     def collect(predicate) -> list[list[float]]:
@@ -1414,6 +1516,91 @@ def walk_forward(
         "min_lead": min_lead,
         "nowcast_lead": nowcast_lead,
         "model": model,
+        "causal": causal,
+        "label_rule": CAUSAL_LABEL_RULE if causal else ORACLE_LABEL_RULE,
+    }
+
+
+def relapse_strata(conn: sqlite3.Connection) -> dict[str, str]:
+    """Страта onset'а: «relapse» (в кластере за предыдущим) или «de novo».
+
+    Гипотеза спеки ``docs/causal-replay-spec.md``: ML ловит de novo и
+    промахивается по рецидивам - после эпизода отскок фона маскирует продром
+    следующего. Классификация детерминированная: onset относится к рецидиву,
+    если от предыдущего onset'а прошло ``<= RELAPSE_GAP_DAYS`` дней (та же
+    граница кластера, что в D10). Класс определяется **прошлым** onset'ом -
+    к моменту болезни он уже известен, утечки нет. Страта только оценочная,
+    в скоринге не участвует.
+    """
+    onsets = sorted({e.start for e in health_illness.episodes(conn)})
+    out: dict[str, str] = {}
+    previous: str | None = None
+    for onset in onsets:
+        if previous is not None and (
+                _date.fromisoformat(onset)
+                - _date.fromisoformat(previous)).days <= RELAPSE_GAP_DAYS:
+            out[onset] = "relapse"
+        else:
+            out[onset] = "de novo"
+        previous = onset
+    return out
+
+
+def stratified_recall(walk: dict, strata: dict[str, str],
+                      bootstrap: int = 500, seed: int = 23) -> list[dict]:
+    """Recall по стратам (relapse / de novo) для каждого бюджета.
+
+    Читает ``per_catchable`` из :func:`walk_forward`: знаменатель страты -
+    её уловимые эпизоды (как ``episode_recall_catchable``), чтобы страта с
+    геометрически неуловимыми эпизодами не занижала себя. Разница
+    «de novo − relapse» берётся двухвыборочным bootstrap по эпизодам внутри
+    страт: при 6-10 рецидивах интервал ожидаемо широкий - это часть ответа,
+    а не помеха. Страты меньше ``MIN_STRATUM`` уловимых эпизодов помечаются
+    ``"weak": True`` и выводом не считаются.
+    """
+    out = []
+    for row in walk["budgets"]:
+        per = row.get("per_catchable") or []
+        groups: dict[str, list[float]] = {}
+        for item in per:
+            groups.setdefault(strata.get(item["onset"], "de novo"), []).append(
+                float(item["caught"]))
+        strata_rows: dict[str, dict] = {}
+        for name, hits in groups.items():
+            strata_rows[name] = {
+                "episodes": len(hits),
+                "caught": int(sum(hits)),
+                "recall": sum(hits) / len(hits) if hits else None,
+                "weak": len(hits) < MIN_STRATUM,
+            }
+        new, rel = groups.get("de novo", []), groups.get("relapse", [])
+        out.append({
+            "budget": row["budget"],
+            "strata": strata_rows,
+            "delta": _strata_difference(new, rel, bootstrap, seed),
+        })
+    return out
+
+
+def _strata_difference(
+    new: list[float], rel: list[float], bootstrap: int, seed: int,
+) -> dict:
+    """Двухвыборочный bootstrap разницы долей «de novo − relapse»."""
+    if not new or not rel:
+        return {"delta": None, "low": None, "high": None, "bootstrap": 0}
+    delta = sum(new) / len(new) - sum(rel) / len(rel)
+    chooser = random.Random(seed)
+    sample: list[float] = []
+    for _ in range(max(1, bootstrap)):
+        resampled_new = [chooser.choice(new) for _ in new]
+        resampled_rel = [chooser.choice(rel) for _ in rel]
+        sample.append(sum(resampled_new) / len(resampled_new)
+                      - sum(resampled_rel) / len(resampled_rel))
+    return {
+        "delta": delta,
+        "low": _quantile(sample, 0.025) if sample else None,
+        "high": _quantile(sample, 0.975) if sample else None,
+        "bootstrap": len(sample),
     }
 
 
@@ -1610,10 +1797,13 @@ def report(
 ) -> dict:
     """Полный отчёт: признаки, лаги, CV-протоколы, красный флаг, бюджеты.
 
-    Помимо v1/v2-CV здесь считаются блоки честной оценки: ``walk_v2`` и
-    ``walk_baseline`` (recall@бюджет против случайного и сезонного нуля,
-    AUC с bootstrap-CI по эпизодам) и ``matched_v2``/``matched_baseline``
-    (AUC против далёкого контроля с тем же интервалом).
+    Помимо v1/v2-CV здесь считаются блоки оценки: ``walk_v2`` и
+    ``walk_baseline`` - **причинные** (правило ``causal-v1``, главная строка:
+    что показала бы развёрнутая система) плюс ``walk_v2_oracle`` /
+    ``walk_baseline_oracle`` - оракульный вариант той же истории как верхняя
+    граница (см. ``docs/causal-replay-spec.md``, правило заголовка), а также
+    ``matched_v2``/``matched_baseline`` (AUC против далёкого контроля с тем
+    же интервалом).
     """
     build_features(conn, window)
     positives = build_labels(conn, window)
@@ -1638,10 +1828,21 @@ def report(
             data["onset_v2"] = onset_cv(conn, V2_FEATURES, model="logreg")
             data["onset_baseline"] = onset_cv(
                 conn, V2_BASELINE_FEATURES, model="logreg")
-            # честная оценка: порог под бюджет и AUC с CI по эпизодам
-            data["walk_v2"] = walk_forward(conn, V2_FEATURES, model="logreg")
+            # главная строка - причинные числа (что показала бы система),
+            # оракул на той же истории - верхняя граница (правило заголовка:
+            # docs/causal-replay-spec.md)
+            data["walk_v2"] = walk_forward(conn, V2_FEATURES, model="logreg",
+                                           causal=True)
+            data["walk_v2_oracle"] = walk_forward(conn, V2_FEATURES,
+                                                  model="logreg")
             data["walk_baseline"] = walk_forward(
+                conn, V2_BASELINE_FEATURES, model="logreg", causal=True)
+            data["walk_baseline_oracle"] = walk_forward(
                 conn, V2_BASELINE_FEATURES, model="logreg")
+            # стратификация relapse/de novo - гипотеза спеки: ML ловит de
+            # novo, рецидивы закрывает гейт с окном тишины
+            data["walk_v2_strata"] = stratified_recall(
+                data["walk_v2"], relapse_strata(conn))
             data["matched_v2"] = matched_auc(conn, V2_FEATURES, model="logreg")
             data["matched_baseline"] = matched_auc(
                 conn, V2_BASELINE_FEATURES, model="logreg")
@@ -1668,6 +1869,19 @@ def format_lag(rows: list[dict], feature: str) -> str:
 def _rate(value) -> str:
     """Доля для отчёта - «—», когда считать не на чем (нет окон)."""
     return "—" if value is None else f"{value:.2f}"
+
+
+def _delta_parts(items: list[dict]) -> list[str]:
+    """Парная разница bootstrap: «+0.25 [+0.01, +0.49]» или «—»."""
+    parts = []
+    for item in items:
+        if item.get("delta") is None:
+            parts.append("—")
+            continue
+        parts.append(f"{item['delta']:+.2f}" + (
+            f" [{item['low']:+.2f}, {item['high']:+.2f}]"
+            if item.get("low") is not None else ""))
+    return parts
 
 
 def format_report(data: dict) -> str:
@@ -1710,16 +1924,19 @@ def format_report(data: dict) -> str:
                      "(см. recall@бюджет): порог 0.5 здесь не operating "
                      "point и цифру сравнивать не с чем")
 
-    # честная оценка: recall@бюджет против нулей + AUC с CI по эпизодам
-    for walk_key, walk_title in (("walk_v2", "все признаки"),
-                                 ("walk_baseline", "только физиология")):
+    # главная строка - причинные метки (что показала бы система); оракул на
+    # той же истории печатается рядом как верхняя граница (правило заголовка)
+    for walk_key, oracle_key, walk_title in (
+            ("walk_v2", "walk_v2_oracle", "все признаки"),
+            ("walk_baseline", "walk_baseline_oracle", "только физиология")):
         walk = data.get(walk_key)
         if not walk or not walk.get("budgets"):
             continue
         lines.append("")
         lines.append(
-            f"recall@бюджет ({walk_title}, день за днём, порог по прошлому, "
-            f"поимка при lead >= {walk.get('min_lead', H_MIN)})")
+            f"recall@бюджет ({walk_title}, причинные метки "
+            f"{walk.get('label_rule', CAUSAL_LABEL_RULE)}, день за днём, "
+            f"порог по прошлому, поимка при lead >= {walk.get('min_lead', H_MIN)})")
         unreachable = walk.get("episodes_unreachable") or {}
         geometry = unreachable.get("geometry", 0)
         history = unreachable.get("no_history", 0)
@@ -1739,13 +1956,22 @@ def format_report(data: dict) -> str:
                 f"{budget['budget']:.0f}",
                 f"{model_row['alerts_per_month']:.1f}",
                 _rate(model_row["episode_recall_catchable"]),
+                _rate(model_row.get("precision")),
                 f"{model_row['episodes_caught_catchable']}",
                 _rate(random_row["episode_recall_catchable"]),
             ))
         lines.append(table(
-            ("цель/мес", "факт/мес", "recall", "поймано", "случайный"),
+            ("цель/мес", "факт/мес", "recall", "precision", "поймано",
+             "случайный"),
             budget_rows,
         ))
+        # bootstrap по уловимым эпизодам: recall против случайного нуля
+        recall_deltas = [item.get("recall_delta") or {}
+                         for item in walk["budgets"]]
+        if any(item.get("delta") is not None for item in recall_deltas):
+            lines.append("  recall-разница против случайного "
+                         "(эпизодный bootstrap): "
+                         + " / ".join(_delta_parts(recall_deltas)))
         # nowcast: алерт в последние nowcast_lead дней до начала - триггер
         # «отменить тяжёлую сессию, измерить температуру», а не предсказание.
         # Узкие окна есть даже у эпизодов, чьё lead >= min_lead-окно целиком
@@ -1763,16 +1989,9 @@ def format_report(data: dict) -> str:
                 for item in walk["budgets"]))
         deltas = [item.get("nowcast_delta") or {} for item in walk["budgets"]]
         if any(item.get("delta") is not None for item in deltas):
-            parts = []
-            for item in deltas:
-                if item.get("delta") is None:
-                    parts.append("—")
-                    continue
-                parts.append(f"{item['delta']:+.2f}" + (
-                    f" [{item['low']:+.2f}, {item['high']:+.2f}]"
-                    if item.get("low") is not None else ""))
             lines.append("  nowcast-разница против случайного "
-                         "(эпизодный bootstrap): " + " / ".join(parts))
+                         "(эпизодный bootstrap): "
+                         + " / ".join(_delta_parts(deltas)))
         # есть ли у ложных алертов структура вне окна 7 дней?
         far = max(walk["budgets"], key=lambda item: item["budget"])
         zones = far["model"].get("fp_zones") or {}
@@ -1821,6 +2040,39 @@ def format_report(data: dict) -> str:
             lines.append(
                 f"  AUC по lead ({lead_title}): {lead_block['auc']:.3f} "
                 f"[{lead_block['low']:.3f}, {lead_block['high']:.3f}]")
+        # оракул на той же истории - верхняя граница, а не результат
+        oracle = data.get(oracle_key)
+        if oracle and oracle.get("budgets"):
+            lines.append(
+                "  оракул (верхняя граница, метки полные): recall "
+                + " / ".join(
+                    _rate(item["model"].get("episode_recall_catchable"))
+                    for item in oracle["budgets"])
+                + ", nowcast "
+                + " / ".join(
+                    _rate(item["model"].get("episode_recall_nowcast"))
+                    for item in oracle["budgets"])
+                + (f", AUC {oracle['auc']:.3f}"
+                   if oracle.get("auc") is not None else ""))
+        # страты: гипотеза «ML ловит de novo, рецидивы - забота гейта»
+        strata_rows = ((data.get("walk_v2_strata") or [])
+                       if walk_key == "walk_v2" else [])
+        for row in strata_rows:
+            parts = []
+            for name, group in sorted(row["strata"].items()):
+                if group["recall"] is None:
+                    continue
+                weak = " (мало)" if group["weak"] else ""
+                parts.append(f"{name} {group['recall']:.2f} "
+                             f"({group['caught']}/{group['episodes']}){weak}")
+            delta = row["delta"]
+            ci = (f" [{delta['low']:+.2f}, {delta['high']:+.2f}]"
+                  if delta.get("low") is not None else "")
+            tail = (f"; разница de novo минус relapse {delta['delta']:+.2f}{ci}"
+                    if delta.get("delta") is not None else "")
+            lines.append(
+                f"  страты при {row['budget']:.0f}/мес: " + ", ".join(parts)
+                + tail)
 
     for key, title in (("matched_v2", "все признаки"),
                        ("matched_baseline", "только физиология")):
