@@ -308,6 +308,111 @@ class BaselineGateTests(unittest.TestCase):
         self.assertFalse(gate.ready)
         self.assertTrue(any("эпизод" in reason for reason in gate.reasons))
 
+    # -- односторонний гейт: «плохо» только RHR вверх и ВСР вниз ------------
+
+    def test_high_hrv_does_not_block(self):
+        """Высокая ВСР - не повод держать (это «отдохнул», а не «заболевает»)."""
+        conn = _db()
+        self.addCleanup(conn.close)
+        days = _flat_physiology(conn, "2024-01-01", 30)
+        for day in days[-2:]:
+            conn.execute("UPDATE aw_daily SET hrv_sdnn = 74.0 WHERE date = ?",
+                         (day,))
+
+        gate = retrain.baseline_gate(conn, today=days[-1], silence_days=0)
+        self.assertTrue(gate.ready, gate.reasons)
+
+    def test_low_hrv_blocks(self):
+        conn = _db()
+        self.addCleanup(conn.close)
+        days = _flat_physiology(conn, "2024-01-01", 30)
+        for day in days[-2:]:
+            conn.execute("UPDATE aw_daily SET hrv_sdnn = 64.0 WHERE date = ?",
+                         (day,))
+
+        gate = retrain.baseline_gate(conn, today=days[-1], silence_days=0)
+        self.assertFalse(gate.ready)
+        self.assertTrue(any("ВСР" in reason for reason in gate.reasons))
+
+    def test_low_rhr_does_not_block(self):
+        conn = _db()
+        self.addCleanup(conn.close)
+        days = _flat_physiology(conn, "2024-01-01", 30)
+        for day in days[-2:]:
+            conn.execute("UPDATE aw_daily SET rhr = 57.0 WHERE date = ?", (day,))
+
+        gate = retrain.baseline_gate(conn, today=days[-1], silence_days=0)
+        self.assertTrue(gate.ready, gate.reasons)
+
+    def test_high_wrist_temp_blocks(self):
+        conn = _db()
+        self.addCleanup(conn.close)
+        days = _flat_physiology(conn, "2024-01-01", 30)
+        conn.execute("UPDATE aw_daily SET wrist_temp = 37.5 WHERE date = ?",
+                     (days[-1],))
+
+        gate = retrain.baseline_gate(conn, today=days[-1], silence_days=0)
+        self.assertFalse(gate.ready)
+        self.assertTrue(any("t запястья" in reason for reason in gate.reasons))
+
+    # -- окно тишины после эпизода (вариант B) ------------------------------
+
+    def test_silence_window_blocks_return_by_ramp(self):
+        conn = _db()
+        self.addCleanup(conn.close)
+        days = _flat_physiology(conn, "2024-01-01", 30)
+        _add_episode(conn, "2024-01-20", days[-3])   # конец за 2 дня до сегодня
+
+        gate = retrain.baseline_gate(conn, today=days[-1])  # дефолтное окно
+        self.assertFalse(gate.ready)
+        self.assertIsNotNone(gate.silence_until)
+        self.assertTrue(gate.window_only, gate.reasons)
+        self.assertTrue(all(r.startswith("окно тишины") for r in gate.reasons))
+
+    def test_silence_window_is_over_after_n_days(self):
+        conn = _db()
+        self.addCleanup(conn.close)
+        days = _flat_physiology(conn, "2024-01-01", 30)
+        _add_episode(conn, "2024-01-10", "2024-01-11")   # окно кончилось 25.01
+
+        gate = retrain.baseline_gate(conn, today=days[-1])  # 30.01
+        self.assertTrue(gate.ready, gate.reasons)
+        self.assertIsNone(gate.silence_until)
+
+    def test_window_is_not_only_when_channels_also_block(self):
+        conn = _db()
+        self.addCleanup(conn.close)
+        days = _flat_physiology(conn, "2024-01-01", 30)
+        _add_episode(conn, "2024-01-20", days[-3])
+        conn.execute("UPDATE aw_daily SET rhr = 100.0 WHERE date = ?",
+                     (days[-1],))   # плюс к окну ещё и RHR вверх
+
+        gate = retrain.baseline_gate(conn, today=days[-1])
+        self.assertFalse(gate.ready)
+        self.assertFalse(gate.window_only)
+        self.assertTrue(any("RHR" in r for r in gate.reasons))
+
+    def test_zero_silence_days_switches_window_off(self):
+        conn = _db()
+        self.addCleanup(conn.close)
+        days = _flat_physiology(conn, "2024-01-01", 30)
+        _add_episode(conn, "2024-01-20", days[-3])
+
+        gate = retrain.baseline_gate(conn, today=days[-1], silence_days=0)
+        self.assertTrue(gate.ready, gate.reasons)
+
+    def test_silence_window_takes_the_latest_episode_end(self):
+        """Если эпизоды идут близко, действует самое позднее окончание окна."""
+        conn = _db()
+        self.addCleanup(conn.close)
+        days = _flat_physiology(conn, "2024-01-01", 30)
+        _add_episode(conn, "2024-01-22", "2024-01-24")   # окно до 2024-02-07
+        _add_episode(conn, "2024-01-25", "2024-01-26")   # окно до 2024-02-09
+
+        gate = retrain.baseline_gate(conn, today=days[-1])   # 30.01
+        self.assertFalse(gate.ready)
+        self.assertEqual(gate.silence_until, "2024-02-09")
+
     def test_gate_serializes_to_dict(self):
         conn = _db()
         self.addCleanup(conn.close)

@@ -19,9 +19,11 @@ from koilog.health import digest
 class _Gate:
     """Минимальная заглушка :class:`retrain.BaselineGate` для правил."""
 
-    def __init__(self, ready: bool, reasons: tuple[str, ...] = ()) -> None:
+    def __init__(self, ready: bool, reasons: tuple[str, ...] = (),
+                 window_only: bool = False) -> None:
         self.ready = ready
         self.reasons = reasons
+        self.window_only = window_only
 
 
 def _channel(key: str, label: str, z: float | None, sign: int,
@@ -70,8 +72,17 @@ class RecommendTests(unittest.TestCase):
     def test_hold_when_gate_closed(self):
         load = _load()
         rec = digest.recommend(
-            _ok_channels(), load, _Gate(False, ("2026-10-17: RHR z +2.5 вне ±1",)))
+            _ok_channels(), load, _Gate(False, ("2026-10-17: RHR z +2.5 выше фона (>1)",)))
         self.assertEqual(rec["level"], "hold")
+
+    def test_silence_window_after_episode_is_ramp_not_hold(self):
+        """Каналы в фоне, но сразу после эпизода - рампа, не покой."""
+        rec = digest.recommend(
+            _ok_channels(), _load(),
+            _Gate(False, ("окно тишины после эпизода 2026-10-11…2026-10-13: "
+                          "возврат по рампе до 2026-10-27",), window_only=True))
+        self.assertEqual(rec["level"], "ramp")
+        self.assertIn("отскок", rec["text"])
 
     def test_hold_on_active_episode_without_watch(self):
         rec = digest.recommend(

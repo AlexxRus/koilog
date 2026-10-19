@@ -13,8 +13,10 @@
 
 - :func:`detraining_curve` - личная кривая «дней простоя → просадка e1RM» по
   истории тренировок, с биннингом и сверкой с литературными ориентирами.
-- :func:`baseline_gate` - можно ли вообще начинать: ВСР и RHR две ночи подряд
-  в личном фоне (Kiviniemi 2007; Vesterinen 2016; Buchheit/Plews).
+- :func:`baseline_gate` - можно ли вообще начинать: RHR выше фона и ВСР ниже
+  фона две ночи подряд держат возврат (проверка односторонняя - Kiviniemi 2007;
+  Vesterinen 2016; Buchheit/Plews), а сразу после эпизода действует окно тишины
+  (возврат по рампе, потому что высокая ВСР после болезни - отскок, а не допуск).
 - :func:`return_plan` - рампа возврата от **предболезненного** рабочего веса:
   верх 1-й недели и объём по длине простоя (таблица откалибрована по
   личному журналу: возврат сразу на >=100 % ассоциирован с рецидивом
@@ -43,6 +45,8 @@ from .text import table
 
 __all__ = [
     "DETRAIN_GAP_MIN",
+    "GATE_NIGHTS",
+    "GATE_SILENCE_DAYS",
     "GATE_Z",
     "RAMP_TABLE",
     "RETURN_REBOUND_DAYS",
@@ -68,11 +72,23 @@ __all__ = [
 #: Минимальный простой по упражнению, который считается «детрейном».
 DETRAIN_GAP_MIN = 7
 
-#: Порог z-скора для гейта: RHR и ВСР должны быть в личном фоне ±это.
+#: Порог z-скора для гейта. Проверка односторонняя: блокируют только
+#: отклонения в «плохую» сторону - RHR выше фона и ВСР ниже фона (гриппоподобная
+#: реакция). Низкий RHR и высокая ВСР - не повод держать: симметричный ``abs``
+#: путал «отдохнул» с «заболевает» и держал ~треть дней без причины.
 GATE_Z = 1.0
 
 #: Сколько ночей подряд должны быть в фоне, чтобы разрешить возврат.
 GATE_NIGHTS = 2
+
+#: Окно тишины после эпизода: столько дней возврат идёт только по рампе. Нужно,
+#: потому что после болезни высокая ВСР - это отскок (суперкомпенсация), а не
+#: «готов к нагрузке»; на живом кейсе 18.10.2026 каналы были в фоне, а через
+#: день начался рецидив внутри кластера. 14 дн выбрано ретро-тестом (D10) по
+#: заранее записанному правилу: A освобождает 292 дня, из них 28 pre-relapse
+#: (вред), поэтому A отклонён; окно 7 и 10 дн оставляют 2 pre-relapse дня
+#: (рецидивы с разрывом 17 дн), окно 14 дн - ноль при цене 47 дней (16% от 292).
+GATE_SILENCE_DAYS = 14
 
 #: Окно личного базлайна для гейта (как в :mod:`koilog.health.illness`).
 GATE_BASELINE_DAYS = health_illness.BASELINE_DAYS
@@ -414,6 +430,19 @@ class BaselineGate:
     nights: int
     reasons: tuple[str, ...] = ()
     rows: tuple[dict, ...] = ()
+    #: Дата, до которой (включительно) действует окно тишины после эпизода.
+    #: Заполнено, только если окно реально сработало.
+    silence_until: str | None = None
+
+    @property
+    def window_only(self) -> bool:
+        """Блокирует только окно тишины (каналы в фоне).
+
+        Тогда возврат идёт по рампе, но это не «покой» и не «рано по
+        самочувствию»: высокая ВСР после болезни - отскок, а не допуск.
+        """
+        return self.silence_until is not None and all(
+            reason.startswith("окно тишины") for reason in self.reasons)
 
     def to_dict(self) -> dict:
         return {
@@ -422,6 +451,7 @@ class BaselineGate:
             "nights": self.nights,
             "reasons": list(self.reasons),
             "rows": list(self.rows),
+            "silence_until": self.silence_until,
         }
 
 
@@ -429,13 +459,20 @@ def baseline_gate(
     conn: sqlite3.Connection,
     today: str | None = None,
     nights: int = GATE_NIGHTS,
+    silence_days: int = GATE_SILENCE_DAYS,
 ) -> BaselineGate:
     """Можно ли возвращаться к нагрузке: ВСР и RHR в фоне ``nights`` ночей.
 
     Берётся тот же личный 60-дневный базлайн, что и в :mod:`illness`, и
     смотрятся **две ночи подряд**: реагировать на одиночный провал - это
-    фоновый шум, а не сигнал (Kiviniemi 2007; Buchheit/Plews). Дополнительно
-    запрещает возврат активный эпизод и высокая температура запястья: с
+    фоновый шум, а не сигнал (Kiviniemi 2007; Buchheit/Plews). Проверка
+    **односторонняя**: держат высокий RHR и низкая ВСР (гриппоподобная
+    реакция), а низкий RHR и высокая ВСР - нет. Симметричный ``abs`` держал
+    «отдохнул» наравне с «заболевает»: ретро-тест D10 показал, что это
+    ~треть дней без причины, а после болезни высокая ВСР вообще ожидаема
+    (отскок) и не должна читаться как «готов». Дополнительно запрещает
+    возврат активный эпизод, окно тишины ``silence_days`` после эпизода
+    (возврат по рампе, не покой) и высокая температура запястья: с
     температурой тренироваться нельзя из-за риска вирусного миокардита.
     """
     try:
@@ -481,30 +518,56 @@ def baseline_gate(
             "wrist": wrist[i], "wrist_z": wrist_z[i],
         }
         detail.append(night)
+        # Односторонне: плохо, когда RHR выше фона или ВСР ниже фона.
         if rhr_z[i] is None:
             reasons.append(f"{dates[i]}: нет фона для RHR")
-        elif abs(rhr_z[i]) > GATE_Z:
-            reasons.append(f"{dates[i]}: RHR z {rhr_z[i]:+.1f} вне ±{GATE_Z:g}")
+        elif rhr_z[i] > GATE_Z:
+            reasons.append(f"{dates[i]}: RHR z {rhr_z[i]:+.1f} выше фона "
+                           f"(>{GATE_Z:g})")
         if hrv_z[i] is None:
             reasons.append(f"{dates[i]}: нет фона для ВСР")
-        elif abs(hrv_z[i]) > GATE_Z:
-            reasons.append(f"{dates[i]}: ВСР z {hrv_z[i]:+.1f} вне ±{GATE_Z:g}")
+        elif hrv_z[i] < -GATE_Z:
+            reasons.append(f"{dates[i]}: ВСР z {hrv_z[i]:+.1f} ниже фона "
+                           f"(<{-GATE_Z:g})")
         if wrist_z[i] is not None and wrist_z[i] > GATE_Z_TEMP:
             reasons.append(f"{dates[i]}: t запястья z {wrist_z[i]:+.1f}")
 
+    silence_until: str | None = None
     if _has_table(conn, "illness_episodes"):
-        for episode in health_illness.episodes(conn):
+        episodes = health_illness.episodes(conn)
+        for episode in episodes:
             if episode.start <= today <= episode.end:
                 reasons.append(
                     f"активный эпизод {episode.start}…{episode.end} "
                     f"({episode.level})")
                 break
+        else:
+            # Окно тишины: сразу после болезни возврат только по рампе. Высокая
+            # ВСР здесь - ожидаемый отскок, а не допуск к нагрузке. Если
+            # эпизоды идут близко, берём самое позднее окончание окна.
+            if silence_days > 0:
+                day = date_cls.fromisoformat(today)
+                best = None          # (start, end, until) самого позднего окна
+                for episode in episodes:
+                    if episode.level == "gap_only":
+                        continue
+                    end = date_cls.fromisoformat(episode.end)
+                    if end < day <= end + timedelta(days=silence_days):
+                        until = end + timedelta(days=silence_days)
+                        if best is None or until > best[2]:
+                            best = (episode.start, episode.end, until)
+                if best is not None:
+                    reasons.append(
+                        f"окно тишины после эпизода {best[0]}…{best[1]}: "
+                        f"возврат по рампе до {best[2].isoformat()}")
+                    silence_until = best[2].isoformat()
     return BaselineGate(
         ready=not reasons and checked >= nights,
         today=today,
         nights=checked,
         reasons=tuple(reasons),
         rows=tuple(detail),
+        silence_until=silence_until,
     )
 
 
