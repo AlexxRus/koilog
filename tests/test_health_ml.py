@@ -302,6 +302,12 @@ class ModelTests(unittest.TestCase):
         self.assertIn("day-классификация", text)
         self.assertIn("recall@бюджет", text)
         self.assertIn("случайный", text)
+        # знаменатель и nowcast видны читателю отдельно
+        self.assertIn("уловимых", text)
+        self.assertIn("nowcast", text)
+        self.assertIn("nowcast-разница", text)
+        # FP считаются только бюджетно - колонки «ложн./мес» убраны
+        self.assertNotIn("ложн./мес", text)
 
     def test_metrics_auc_and_pr_auc(self):
         """AUC/PR-AUC считаем сами - без sklearn, проверено на known cases."""
@@ -329,6 +335,23 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(ml._quantile([1, 2, 3, 4, 5], 0.0), 1)
         self.assertEqual(ml._quantile([1, 2, 3, 4, 5], 1.0), 5)
         self.assertEqual(ml._quantile([1, 2, 3, 4, 5], 0.5), 3)
+
+    def test_delta_bootstrap_on_constant_difference(self):
+        """Разница «модель - случайный» - парный ресемплинг по эпизодам."""
+        mixed = ml._episode_bootstrap_delta(
+            [1.0, 1.0, 0.0, 0.0], [0.5, 0.5, 0.5, 0.5], bootstrap=50)
+        self.assertAlmostEqual(mixed["delta"], 0.0)
+        self.assertIsNotNone(mixed["low"])
+        self.assertLessEqual(mixed["low"], mixed["high"])
+        # детерминированная разница: интервал вырождается в точку
+        flat = ml._episode_bootstrap_delta(
+            [1.0, 1.0], [0.0, 0.0], bootstrap=20)
+        self.assertAlmostEqual(flat["delta"], 1.0)
+        self.assertAlmostEqual(flat["low"], 1.0)
+        self.assertAlmostEqual(flat["high"], 1.0)
+        # не на чем считать
+        empty = ml._episode_bootstrap_delta([], [], bootstrap=10)
+        self.assertIsNone(empty["delta"])
 
     def test_walk_forward_recall_at_budget(self):
         """Порог под бюджет: модель и случайный ноль сравниваются одинаково."""
@@ -364,6 +387,33 @@ class ModelTests(unittest.TestCase):
         # окна алерты структуры не имеют
         self.assertIn("fp_zone_base", result)
         self.assertIn("fp_zones", result["budgets"][0]["model"])
+        # уловимость: неуловимые эпизоды не должны делиться на recall
+        self.assertIn("episodes_catchable", result)
+        self.assertIn("episodes_unreachable", result)
+        unreachable = result["episodes_unreachable"]
+        self.assertEqual(
+            result["episodes_catchable"] + unreachable["geometry"]
+            + unreachable["no_history"], result["episodes"])
+        self.assertIn("episodes_nowcastable", result)
+        for row in result["budgets"]:
+            self.assertIn("episode_recall_catchable", row["model"])
+            self.assertIn("episode_recall_catchable", row["random"])
+            self.assertIn("episode_recall_nowcast", row["model"])
+            self.assertIn("episode_recall_nowcast", row["random"])
+            # парный bootstrap: разница модели и нуля на одном наборе эпизодов
+            delta = row["nowcast_delta"]
+            self.assertIn("delta", delta)
+            if delta["delta"] is not None:
+                self.assertLessEqual(delta["low"], delta["high"])
+                self.assertGreaterEqual(delta["delta"], -1.0)
+                self.assertLessEqual(delta["delta"], 1.0)
+            for side in ("model", "random"):
+                self.assertLessEqual(
+                    row[side]["episodes_caught_catchable"],
+                    result["episodes_catchable"])
+                self.assertLessEqual(
+                    row[side]["episodes_caught_nowcast"],
+                    result["episodes_nowcastable"])
         self.assertIsNotNone(result["auc"])
         self.assertTrue(0.0 <= result["auc"] <= 1.0)
         self.assertLessEqual(result["auc_ci"]["low"], result["auc_ci"]["high"])

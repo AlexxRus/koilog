@@ -763,7 +763,7 @@ def cmd_illness(args: argparse.Namespace) -> int:
 
 
 def cmd_ml(args: argparse.Namespace) -> int:
-    """Отчёт ML: признаки, лаги, CV-протоколы, recall@бюджет, AUC, флаг."""
+    """Отчёт ML: признаки, лаги, CV-протоколы, recall@бюджет, nowcast, AUC."""
     from .health import ml as health_ml
 
     conn = _open(args)
@@ -1014,7 +1014,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_illness.set_defaults(func=cmd_illness)
 
     p_ml = sub.add_parser(
-        "ml", help="признаки, лаги, CV-протоколы v1/v2, recall@бюджет, AUC")
+        "ml", help="признаки, лаги, CV-протоколы v1/v2, recall@бюджет, nowcast, AUC")
     p_ml.add_argument("--window", default=health_load.DEFAULT_WINDOW,
                       help=f"первая дата включительно (по умолчанию "
                            f"{health_load.DEFAULT_WINDOW})")

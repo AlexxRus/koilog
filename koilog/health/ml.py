@@ -875,12 +875,44 @@ def _episode_bootstrap_auc(
     }
 
 
+def _episode_bootstrap_delta(
+    model_hits: list[float],
+    random_hits: list[float],
+    bootstrap: int,
+    seed: int = 17,
+) -> dict:
+    """Разница поимки «модель минус случайный» + CI, ресемплим эпизоды.
+
+    ``random_hits[i]`` - доля ресэмплов случайного алерта, поймавших эпизод
+    ``i`` (усреднение по повторам, а не 0/1). Парный ресемплинг: эпизод
+    берётся целиком со своими двумя значениями, поэтому интервал говорит
+    именно о разнице на одном и том же наборе эпизодов, а не о двух
+    раздельных интервалах.
+    """
+    if not model_hits or len(model_hits) != len(random_hits):
+        return {"delta": None, "low": None, "high": None, "bootstrap": 0}
+    deltas = [model - baseline
+              for model, baseline in zip(model_hits, random_hits)]
+    chooser = random.Random(seed)
+    sample: list[float] = []
+    for _ in range(max(1, bootstrap)):
+        chosen = [chooser.choice(deltas) for _ in deltas]
+        sample.append(sum(chosen) / len(chosen))
+    return {
+        "delta": sum(deltas) / len(deltas),
+        "low": _quantile(sample, 0.025) if sample else None,
+        "high": _quantile(sample, 0.975) if sample else None,
+        "bootstrap": len(sample),
+    }
+
+
 def walk_forward(
     conn: sqlite3.Connection,
     features: tuple[str, ...] = V2_FEATURES,
     model: str = "logreg",
     budgets: tuple[float, ...] = (2.0, 4.0, 8.0),
     min_lead: int = H_MIN,
+    nowcast_lead: int = 2,
     horizon: int = H_ONSET,
     season_months: tuple[int, ...] = (12, 1, 2),
     seed: int = 17,
@@ -903,6 +935,20 @@ def walk_forward(
 
     Поимка - та же, что в :func:`onset_cv` (``lead >= min_lead``), чтобы
     цифры стояли в одной таблице, а не в двух разных определениях.
+
+    Два способа не соврать про знаменатель:
+
+    - **Уловимость эпизода** (``episodes_catchable``, ``episodes_unreachable``):
+      часть эпизодов не поймана вовсе - их ``lead >= min_lead``-окно целиком
+      лежит внутри болезни соседа («геометрия»), либо история ещё не накоплена
+      («нет истории»). Делить recall на все эпизоды и приписывать это модели -
+      самообман; в отчёте знаменатель - уловимые, а число неуловимых
+      показывается отдельно.
+    - **Nowcast** (``episode_recall_nowcast``): алерт попал в последние
+      ``nowcast_lead`` дней до начала - триггер «отменить тяжёлую сессию,
+      измерить температуру», а не предсказание. Свой знаменатель
+      (``episodes_nowcastable``): узкие окна есть даже у эпизодов, чьё
+      ``lead >= min_lead``-окно целиком в болезни соседа.
     """
     _require_ml()
     data = _dataset(conn, features)
@@ -945,6 +991,28 @@ def walk_forward(
         if test_pos and onset is not None:
             windows[episode] = (test_pos, onset)
 
+    # Уловимость эпизода - иначе recall делится на 33 и провоцирует
+    # самообман «ловим только половину». Две причины, по которым эпизод не
+    # поймают вовсе, - геометрия кластера (всё lead>=min_lead-окно лежит
+    # внутри болезни соседнего эпизода: там нет at_risk-дней с таким lead,
+    # даже «алертить всегда» не поможет) и отсутствие истории (первые дни
+    # ряда: ни 30 дней прошлого, ни одного положительного дня - модель не
+    # оценивает их, значит не может и алертнуть).
+    catchable: dict[int, list[int]] = {}
+    nowcastable: dict[int, list[int]] = {}
+    unreachable = {"geometry": 0, "no_history": 0}
+    for episode, (test_pos, onset) in windows.items():
+        far = [i for i in test_pos if onset - i >= min_lead]
+        near = [i for i in test_pos if onset - i <= nowcast_lead]
+        if not far:
+            unreachable["geometry"] += 1
+        elif not any(probs[i] is not None for i in far):
+            unreachable["no_history"] += 1
+        else:
+            catchable[episode] = far
+        if near and any(probs[i] is not None for i in near):
+            nowcastable[episode] = near
+
     # зона дня до ближайшего будущего onset'а: если ложные алерты вне
     # 7-дневного окна распределены как календарь, у них нет структуры -
     # алерт «за 15-28 дней» ничего не знает про будущий эпизод
@@ -969,25 +1037,52 @@ def walk_forward(
                 out[zone_of[t]] = out.get(zone_of[t], 0) + 1
         return out
 
+    episode_order = list(windows)
+
+    def nowcast_hits(flags: list[bool]) -> list[float]:
+        """Поимка nowcast по каждому эпизоду в порядке ``windows``.
+
+        1.0 - алерт попал в последние ``nowcast_lead`` дней до начала.
+        Свой знаменатель (``nowcastable``): узкие окна есть даже у эпизодов,
+        у которых ``lead >= min_lead``-окна нет вовсе - та самая геометрия
+        кластеров.
+        """
+        hits = []
+        for episode in episode_order:
+            test_pos, onset = windows[episode]
+            alarms = [i for i in test_pos if flags[i]]
+            hits.append(1.0 if (episode in nowcastable and any(
+                onset - i <= nowcast_lead for i in alarms)) else 0.0)
+        return hits
+
     def episode_stats(flags: list[bool]) -> dict:
-        caught = late = missed = 0
+        caught = late = missed = caught_catchable = 0
         leads: list[int] = []
-        for test_pos, onset in windows.values():
+        for episode, (test_pos, onset) in windows.items():
             alarms = [i for i in test_pos if flags[i]]
             if not alarms:
                 missed += 1
-                continue
-            lead = onset - min(alarms)
-            if lead >= min_lead:
-                caught += 1
-                leads.append(lead)
             else:
-                late += 1
+                lead = onset - min(alarms)
+                if lead >= min_lead:
+                    caught += 1
+                    leads.append(lead)
+                    if episode in catchable:
+                        caught_catchable += 1
+                else:
+                    late += 1
+        caught_nowcast = int(sum(nowcast_hits(flags)))
         return {
             "episodes_caught": caught,
             "episodes_late": late,
             "episodes_missed": missed,
+            "episodes_caught_catchable": caught_catchable,
+            "episodes_caught_nowcast": caught_nowcast,
             "episode_recall": caught / len(windows) if windows else None,
+            "episode_recall_catchable": (
+                caught_catchable / len(catchable)) if catchable else None,
+            "episode_recall_nowcast": (
+                caught_nowcast / len(nowcastable)) if nowcastable else None,
             "median_lead": int(statistics.median(leads)) if leads else None,
         }
 
@@ -1041,7 +1136,9 @@ def walk_forward(
         keys = ("alert_days", "alerts_per_month", "false_alarm_days",
                 "false_alarms_per_month", "streaks", "longest_streak",
                 "episodes_caught", "episodes_late", "episodes_missed",
-                "episode_recall")
+                "episodes_caught_nowcast", "episodes_caught_catchable",
+                "episode_recall", "episode_recall_catchable",
+                "episode_recall_nowcast")
         out = {}
         for key in keys:
             values = [row[key] for row in rows if row[key] is not None]
@@ -1054,17 +1151,29 @@ def walk_forward(
     generator = random.Random(seed)
     by_budget = []
     for budget in budgets:
-        model_row = describe(budget_flags(budget))
+        model_flags = budget_flags(budget)
+        model_row = describe(model_flags)
         fraction = min(0.5, model_row["alert_days"] / len(scored)) if scored else 0.0
-        random_rows = [
-            describe([probs[t] is not None and generator.random() < fraction
-                      for t in range(n)])
-            for _ in range(max(1, random_repeats))
+        random_rows = []
+        random_hits: list[list[float]] = []
+        for _ in range(max(1, random_repeats)):
+            flags = [probs[t] is not None and generator.random() < fraction
+                     for t in range(n)]
+            random_rows.append(describe(flags))
+            random_hits.append(nowcast_hits(flags))
+        # ноль усредняется на уровне эпизода (доля повторов, поймавших
+        # эпизод), чтобы интервал разницы был парным и честным
+        baseline_hits = [
+            sum(hits[index] for hits in random_hits) / len(random_hits)
+            for index in range(len(episode_order))
         ]
         by_budget.append({
             "budget": budget,
             "model": model_row,
             "random": average_metrics(random_rows),
+            "nowcast_delta": _episode_bootstrap_delta(
+                nowcast_hits(model_flags), baseline_hits,
+                auc_bootstrap, seed + budget),
         })
 
     def collect(predicate) -> list[list[float]]:
@@ -1101,6 +1210,9 @@ def walk_forward(
         "auc_by_lead": auc_by_lead,
         "pr_auc": _average_precision(scores, labels),
         "episodes": len(windows),
+        "episodes_catchable": len(catchable),
+        "episodes_nowcastable": len(nowcastable),
+        "episodes_unreachable": unreachable,
         "budgets": by_budget,
         "fp_zone_base": zone_base,
         "season_months": list(season_months),
@@ -1108,6 +1220,7 @@ def walk_forward(
         "always": describe([bool(value) for value in at_risk]),
         "horizon": horizon,
         "min_lead": min_lead,
+        "nowcast_lead": nowcast_lead,
         "model": model,
     }
 
@@ -1389,7 +1502,6 @@ def format_report(data: dict) -> str:
             title, block["episodes"], block["episodes_caught"],
             block.get("episodes_late", 0),
             "—" if block.get("median_lead") is None else block["median_lead"],
-            f"{block['false_alarms_per_month']:.1f}",
         ))
     if onset_rows:
         lines.append("")
@@ -1399,9 +1511,12 @@ def format_report(data: dict) -> str:
                      f"{data.get('onset_v2', {}).get('min_lead', H_MIN)})")
         lines.append(table(
             ("модель", "эпизодов", "поймано", "опоздало",
-             "медианный lead", "ложн./мес"),
+             "медианный lead"),
             onset_rows,
         ))
+        lines.append("ложные срабатывания считаются только бюджетно "
+                     "(см. recall@бюджет): порог 0.5 здесь не operating "
+                     "point и цифру сравнивать не с чем")
 
     # честная оценка: recall@бюджет против нулей + AUC с CI по эпизодам
     for walk_key, walk_title in (("walk_v2", "все признаки"),
@@ -1412,8 +1527,18 @@ def format_report(data: dict) -> str:
         lines.append("")
         lines.append(
             f"recall@бюджет ({walk_title}, день за днём, порог по прошлому, "
-            f"поимка при lead >= {walk.get('min_lead', H_MIN)}, "
-            f"эпизодов {walk['episodes']})")
+            f"поимка при lead >= {walk.get('min_lead', H_MIN)})")
+        unreachable = walk.get("episodes_unreachable") or {}
+        geometry = unreachable.get("geometry", 0)
+        history = unreachable.get("no_history", 0)
+        lines.append(
+            f"эпизодов {walk['episodes']}, уловимых "
+            f"{walk.get('episodes_catchable', walk['episodes'])}"
+            + (f"; {geometry} неуловимы вовсе (lead>="
+               f"{walk.get('min_lead', H_MIN)}-окно целиком в болезни "
+               f"соседнего эпизода)" if geometry else "")
+            + (f"; {history} без истории (первые дни ряда)"
+               if history else ""))
         budget_rows = []
         for budget in walk["budgets"]:
             model_row = budget["model"]
@@ -1421,14 +1546,41 @@ def format_report(data: dict) -> str:
             budget_rows.append((
                 f"{budget['budget']:.0f}",
                 f"{model_row['alerts_per_month']:.1f}",
-                _rate(model_row["episode_recall"]),
-                f"{model_row['episodes_caught']}",
-                _rate(random_row["episode_recall"]),
+                _rate(model_row["episode_recall_catchable"]),
+                f"{model_row['episodes_caught_catchable']}",
+                _rate(random_row["episode_recall_catchable"]),
             ))
         lines.append(table(
             ("цель/мес", "факт/мес", "recall", "поймано", "случайный"),
             budget_rows,
         ))
+        # nowcast: алерт в последние nowcast_lead дней до начала - триггер
+        # «отменить тяжёлую сессию, измерить температуру», а не предсказание.
+        # Узкие окна есть даже у эпизодов, чьё lead >= min_lead-окно целиком
+        # лежит в болезни соседа, поэтому знаменатель тут свой.
+        near_lead = walk.get("nowcast_lead", 2)
+        lines.append(
+            f"nowcast (алерт за {near_lead} дн до начала, уловимых "
+            f"{walk.get('episodes_nowcastable', walk['episodes'])}): "
+            + " / ".join(
+                _rate(item["model"].get("episode_recall_nowcast"))
+                for item in walk["budgets"])
+            + "; случайный "
+            + " / ".join(
+                _rate(item["random"].get("episode_recall_nowcast"))
+                for item in walk["budgets"]))
+        deltas = [item.get("nowcast_delta") or {} for item in walk["budgets"]]
+        if any(item.get("delta") is not None for item in deltas):
+            parts = []
+            for item in deltas:
+                if item.get("delta") is None:
+                    parts.append("—")
+                    continue
+                parts.append(f"{item['delta']:+.2f}" + (
+                    f" [{item['low']:+.2f}, {item['high']:+.2f}]"
+                    if item.get("low") is not None else ""))
+            lines.append("  nowcast-разница против случайного "
+                         "(эпизодный bootstrap): " + " / ".join(parts))
         # есть ли у ложных алертов структура вне окна 7 дней?
         far = max(walk["budgets"], key=lambda item: item["budget"])
         zones = far["model"].get("fp_zones") or {}
@@ -1447,16 +1599,18 @@ def format_report(data: dict) -> str:
                     "ложные алерты (макс. бюджет), зона до следующего "
                     "onset'а: " + "; ".join(parts))
         seasonal = walk.get("seasonal") or {}
-        if seasonal.get("episode_recall") is not None:
+        if seasonal.get("episode_recall_catchable") is not None:
             lines.append(
                 f"сезонный календарь ({'-'.join(str(m) for m in walk['season_months'])}): "
-                f"recall {_rate(seasonal['episode_recall'])} при "
-                f"{seasonal['alerts_per_month']:.1f} алертов/мес")
+                f"recall {_rate(seasonal['episode_recall_catchable'])} по уловимым "
+                f"при {seasonal['alerts_per_month']:.1f} алертов/мес")
         always = walk.get("always") or {}
         if always.get("episode_recall") is not None:
             lines.append(
-                f"всегда алерт (потолок): recall "
-                f"{_rate(always['episode_recall'])} при "
+                f"всегда алерт (потолок): "
+                f"{_rate(always['episode_recall'])} по всем "
+                f"{walk['episodes']} эпизодам, "
+                f"{_rate(always.get('episode_recall_catchable'))} по уловимым, "
                 f"{always['alerts_per_month']:.1f} алертов/мес")
         if walk.get("auc") is not None:
             interval = walk.get("auc_ci") or {}
@@ -1500,11 +1654,10 @@ def format_report(data: dict) -> str:
             title, block["episodes"], block["episodes_caught"],
             f"{block['episode_recall']:.2f}", f"{block['day_precision']:.2f}",
             f"{block['day_recall']:.2f}",
-            f"{block['false_positives_per_month']:.1f}",
         ))
     body = table(
         ("модель", "эпизодов", "поймано", "recall эп.", "точность",
-         "полнота", "ложн./мес"),
+         "полнота"),
         rows,
     )
     if body:
