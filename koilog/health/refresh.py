@@ -17,6 +17,7 @@ from pathlib import Path
 
 from . import apple, illness
 from . import load as health_load
+from . import text as health_text
 
 __all__ = ["REFRESH_KEY", "Step", "run", "format_freshness"]
 
@@ -103,24 +104,33 @@ def run(
     требует numpy/scikit-learn (extra ``ml``), которых нет у ноутбука
     журнала, поэтому по умолчанию не пересобирается.
     """
-    resolved = apple.resolve_source(source)
-    step = Step(deep=deep, source=resolved.path)
+    resolved = None
+    try:
+        resolved = apple.resolve_source(source)
+    except FileNotFoundError:
+        resolved = None
 
-    if _need_parse(conn, resolved.path):
+    step = Step(deep=deep, source=resolved.path if resolved else None)
+
+    if resolved is None:
+        step.stages.append("выгрузка (нет файла — работаю от базы)")
+    elif _need_parse(conn, resolved.path):
         # парсим и пишем в одно соединение шага: иначе тесты на временной
         # базе молча переписывали бы боевую (apple.load открывает свою)
         data = apple.parse_apple(resolved)
         apple.write_apple(conn, data)
         conn.commit()
-        stamp = _source_stamp(resolved.path) # слепок - только после успеха
+        stamp = _source_stamp(resolved.path)  # слепок - только после успеха
         conn.execute(
             "INSERT OR REPLACE INTO aw_meta VALUES (?, ?)",
             (REFRESH_KEY, stamp),
         )
         conn.commit()
         step.parsed = True
-    step.stages.append("выгрузка" + (" (разобрана)" if step.parsed
-                                     else " (файл не менялся - скип)"))
+
+    if resolved is not None:
+        step.stages.append("выгрузка" + (" (разобрана)" if step.parsed
+                                         else " (файл не менялся - скип)"))
 
     step.export_date = _meta_get(conn, "export_date")
 
@@ -144,10 +154,12 @@ def run(
 
 
 def format_freshness(step: Step) -> str:
-    """Итог шага одной строкой на звено плюс даты таблиц."""
+    """Итог шага: звенья строкой и свежесть таблицей «таблица | дата»."""
     lines = [f"обновление: {', '.join(step.stages)}"]
     if step.export_date:
         lines.append(f"выгрузка от {step.export_date}")
-    lines.append("свежесть таблиц: " + ", ".join(
-        f"{table} {date or 'нет'}" for table, date in step.freshness))
+    body = health_text.table(("таблица", "дата"), list(step.freshness))
+    if body:
+        lines.append("")
+        lines.append(body)
     return "\n".join(lines)

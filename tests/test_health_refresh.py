@@ -100,6 +100,20 @@ class RefreshRunTests(unittest.TestCase):
         # попробует разобрать файл заново, а не сочтёт его обработанным
         self.assertTrue(refresh._need_parse(self.conn, self.xml))
 
+    # -- отсутствие файла экспорта (чистый клон) ----------------------------
+
+    def test_missing_explicit_source_works_from_base(self):
+        # первый прогон наполняет aw_* из выгрузки
+        self._run()
+        self.xml.unlink()
+        step = refresh.run(self.conn, source=self.xml)  # файла больше нет
+        self.assertFalse(step.parsed)
+        self.assertIn("нет файла", step.stages[0])
+        self.assertIsNone(step.source)
+        # данные прошлого разбора целы: шаг работает от базы
+        row = self.conn.execute("SELECT COUNT(*) FROM aw_daily").fetchone()
+        self.assertEqual(row[0], 1)
+
     # -- свежесть -----------------------------------------------------------
 
     def test_freshness_reports_max_dates(self):
@@ -118,7 +132,10 @@ class RefreshRunTests(unittest.TestCase):
     def test_format_freshness_shows_export_date_and_tables(self):
         text = refresh.format_freshness(self._run())
         self.assertIn("выгрузка от 2026-10-15 12:00:00 +0300", text)
-        self.assertIn("aw_daily 2024-01-17", text)
+        # свежесть - таблицей «таблица | дата», чтобы отставание было видно
+        self.assertIn("таблица", text)
+        self.assertIn("aw_daily", text)
+        self.assertIn("2024-01-17", text)
 
     # -- deep ---------------------------------------------------------------
 
