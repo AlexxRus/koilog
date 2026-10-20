@@ -146,8 +146,11 @@ class RecommendTests(unittest.TestCase):
         rec = digest.recommend(
             _ok_channels(), _load(),
             _Gate(False, ("2026-10-17: RHR z +1.2 выше фона (>1)",)), score)
-        self.assertIn("0.42", rec["text"])
-        self.assertIn("модель в фоне", rec["text"])
+        # Скор - тихий мониторинг: число не дублируется в тексте решения,
+        # но порог и «мониторинг» видны (в строке карточки число уже есть).
+        self.assertIn("мониторинг", rec["text"])
+        self.assertIn("0.60", rec["text"])
+        self.assertNotIn("0.42", rec["text"])
 
     def test_score_note_mentions_alert(self):
         score = {"score": 0.88, "threshold": 0.7, "alert": 1}
@@ -162,12 +165,12 @@ class RecommendTests(unittest.TestCase):
         rec = digest.recommend(
             _ok_channels(), _load(),
             _Gate(False, ("2026-10-17: RHR z +1.2 выше фона (>1)",)), score)
-        self.assertIn("0.42", rec["text"])
         self.assertIn("порог", rec["text"])
 
     def test_recommend_without_score_stays_short(self):
         rec = digest.recommend(_ok_channels(), _load(), _Gate(True))
         self.assertNotIn("Скор дня", rec["text"])
+        self.assertNotIn("мониторинг", rec["text"])
 
 
 class ChannelTests(unittest.TestCase):

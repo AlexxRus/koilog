@@ -589,6 +589,11 @@ class RampPlan:
     program: core.Progression | None
     full_return_step: int | None
     gate: BaselineGate
+    #: Правило округления стартового веса рампы (решение O2 = A): floor -
+    #: ближайший доступный вес **не тяжелее** целевого (``core.snap_to_ladder``),
+    #: а не ``next_weight`` (тот даёт вверх). Структурное поле, не текст:
+    #: дайджест рендерит его механически, тест прибивает (1RM => 42 => 40).
+    rule: str = "ramp_floor"
     warnings: tuple[str, ...] = ()
     reason: str | None = None
     #: КОИ КОИ упражнения за предболезненный день и за его неделю. Нужны, чтобы
@@ -625,6 +630,7 @@ class RampPlan:
             "start_reps": self.start_reps,
             "sets": self.sets,
             "full_return_step": self.full_return_step,
+            "rule": self.rule,
             "base_koi": self.base_koi,
             "base_week": self.base_week,
             "base_week_koi": self.base_week_koi,

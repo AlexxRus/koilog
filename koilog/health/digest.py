@@ -6,20 +6,23 @@ z-каналы часов против личного фона, состояни
 эпизодов единицы, поэтому дайджест читает известные красные флаги
 (Meeusen 2013), а не «предсказывает болезнь».
 
-Правила рекомендации, по приоритету:
+Правила решения живут **не здесь**, а в state-машине
+(:func:`koilog.health.state.decide`): дайджест только рендерит готовое
+состояние дня. Приоритет состояний ``sick > rest > ramp > normal``:
 
-1. **красный флаг** - регресс e1RM при высокой монотонности и падении
-   ВСР/сна: признаки недовосстановления, а не повод догружаться;
-2. **окно тишины после эпизода** - каналы в фоне, но возврат только по
-   рампе: высокая ВСР сразу после болезни - отскок, а не допуск
-   (:attr:`koilog.health.retrain.BaselineGate.window_only`);
-3. **покой** - активный эпизод или гейт ВСР/RHR не пройден
-   (:func:`koilog.health.retrain.baseline_gate`);
-4. **завтра легко** - ЧДД, RHR и ВСР отклонились в «плохую» сторону
-   одновременно (персональный прототип сигнатуры болезни);
-5. **рампа** - возврат после простоя, а обычный ACWR вздут из-за нулей
-   в окне: стартовать по рампе :mod:`koilog.health.retrain`;
-6. иначе - **можно по плану**.
+1. **sick** - красный флаг недовосстановления (регресс e1RM при высокой
+   монотонности и падении ВСР/сна; Meeusen 2013) или активный эпизод:
+   по плану не тренироваться;
+2. **rest** - гейт ВСР/RHR не пройден (:func:`...retrain.baseline_gate`):
+   покой, рампа приостановлена (счётчик сохраняется);
+3. **ramp** - окно тишины после эпизода
+   (:attr:`...retrain.BaselineGate.window_only`) или длинный простой:
+   возврат ступенями по :mod:`koilog.health.retrain`;
+4. **normal** - «завтра легко», если ЧДД, RHR и ВСР отклонились в «плохую»
+   сторону одновременно (прототип сигнатуры болезни), иначе «можно по плану».
+
+Канонический скор дня (:mod:`koilog.health.score`) решение **не
+переопределяет**, а объясняет: после causal replay он тихо мониторит.
 
 Модуль держится на стандартной библиотеке и ядре ``koilog``.
 """
@@ -32,6 +35,7 @@ from dataclasses import dataclass
 from datetime import date as date_cls
 
 from . import illness as health_illness
+from . import load as health_load
 from . import retrain as health_retrain
 from .text import table
 
@@ -59,8 +63,10 @@ Z_CHANNEL = 1.5
 #: ACWR, выше которого нагрузка считается вздутой.
 ACWR_ALERT = 1.5
 
-#: Монотонность Foster: выше - однообразная нагрузка.
-MONOTONY_ALERT = 2.0
+#: Монотонность Foster: выше - однообразная нагрузка (общий источник с
+#: :mod:`koilog.health.load`; решение по красному флагу - в
+#: :func:`koilog.health.state.decide`).
+MONOTONY_ALERT = health_load.MONOTONY_ALERT
 
 #: Сколько дней без тренировки считать «разрывом серии».
 GAP_DAYS = 14
@@ -185,89 +191,82 @@ def load_state(
     }
 
 
-def recommend(
-    channels_list: list[Channel], load: dict, gate, score: dict | None = None
-) -> dict:
-    """Одна рекомендация по правилам (см. модуль). Возвращает словарь.
+def _score_note(score: dict | None) -> str:
+    """Хвост про скор в тексте рекомендации - тихий мониторинг (спека §5.6).
 
-    ``score`` - канонический скор дня из ledger'а (``{"score", "threshold",
-    "alert"}``), если он уже записан. Он не переопределяет решение (это
-    по-прежнему правила по каналам и гейту), но объясняет его: без скора
-    карточка в дни, когда таблица каналов показывает «в фоне», а рекомендация
-    «покой», выглядела противоречивой.
+    После causal replay скор не решает: он не переопределяет состояние и не
+    меняет интонацию вердикта, только сообщает, что модель видит. Число скора
+    в тексте не дублируется - оно уже есть строкой ``скор (причинный)``.
     """
-    by_key = {c.key: c for c in channels_list}
+    if not score or score.get("score") is None:
+        return ""
+    if score.get("threshold") is None:
+        tail = "порог ещё не накоплен"
+    elif score.get("alert"):
+        tail = f"скор дня выше порога бюджета ({score['threshold']:.2f})"
+    else:
+        tail = f"скор дня в мониторинге (порог {score['threshold']:.2f})"
+    return f" {tail[0].upper()}{tail[1:]}."
 
-    def bad(key: str) -> bool:
-        channel = by_key.get(key)
-        return bool(channel and channel.bad)
 
-    def score_note() -> str:
-        if not score or score.get("score") is None:
-            return ""
-        if score.get("threshold") is None:
-            tail = "порог ещё не накоплен"
-        elif score.get("alert"):
-            tail = (f"выше порога бюджета "
-                    f"({score['threshold']:.2f}) - модель тоже сигналит")
-        else:
-            tail = f"ниже порога бюджета ({score['threshold']:.2f}) - модель в фоне"
-        return f" Скор дня {score['score']:.2f} - {tail}."
+def _recommend_from_state(state, score: dict | None = None) -> dict:
+    """Рендер рекомендации по готовому состоянию (:mod:`...state`).
 
-    monotony = load.get("monotony") or 0.0
-    acwr = load.get("acwr") or 0.0
-    days_since = load.get("days_since_training")
+    Решение принято :func:`koilog.health.state.decide`; здесь только текст.
+    Уровни карточки: ``sick`` - красный флаг даёт ``red``, эпизод - ``hold``;
+    ``rest`` - ``hold``; ``ramp`` - ``ramp``; ``normal`` - ``ok``.
+    """
+    from . import state as health_state
 
-    # 1. Красный флаг недовосстановления.
-    if (load.get("rm_regress") and bad("hrv_sdnn") and bad("sleep_hours")
-            and monotony > MONOTONY_ALERT):
-        return {
-            "level": "red",
-            "title": "красный флаг",
-            "text": "сила падает при однообразной нагрузке и просевших ВСР/сне - "
-                    "это признаки недовосстановления (Meeusen 2013): снизь "
-                    "нагрузку. При боли в груди, перебоях, несоразмерной "
-                    "одышке или пресинкопе - не тренируйся и обратись к врачу.",
-        }
-
-    # 2a. Окно тишины после эпизода: возврат по рампе, а не покой и не
-    # «можно по плану». Высокая ВСР здесь - ожидаемый отскок, а не допуск.
-    if gate is not None and getattr(gate, "window_only", False):
-        return {
-            "level": "ramp",
-            "title": "окно тишины после эпизода",
-            "text": "каналы в фоне, но сразу после болезни фона мало: высокая ВСР "
-                    "тут - отскок, а не «готов». Возврат по рампе: "
-                    "`python -m koilog return` ("
-                    + "; ".join(gate.reasons) + ")." + score_note(),
-        }
-
-    # 2. Покой: активный эпизод или гейт ВСР/RHR не пройден.
-    no_watch = not channels_list
-    if gate is not None and not gate.ready and not no_watch:
-        reasons = "; ".join(gate.reasons)
-        return {
-            "level": "hold",
-            "title": "покой",
-            "text": "возврат к нагрузке закрыт гейтом ВСР/RHR: "
-                    + (reasons or "фон вне нормы")
-                    + ". Гейт смотрит на две ночи подряд и с порогом ±1 "
-                      "(мягче, чем «откл.» в таблице каналов, там ±1.5), "
-                      "поэтому «в фоне» по каналам и «держит» по гейту - не "
-                      "противоречие. С симптомами (температура, миалгия) не "
-                      "тренируйся - риск вирусного миокардита." + score_note(),
-        }
-    if gate is not None and any("эпизод" in r for r in gate.reasons):
+    note = _score_note(score)
+    if state.state == health_state.STATE_SICK:
+        if "красный флаг" in state.reason:
+            return {
+                "level": "red",
+                "title": "красный флаг",
+                "text": "сила падает при однообразной нагрузке и просевших "
+                        "ВСР/сне - это признаки недовосстановления "
+                        "(Meeusen 2013): снизь нагрузку. При боли в груди, "
+                        "перебоях, несоразмерной одышке или пресинкопе - не "
+                        "тренируйся и обратись к врачу.",
+            }
         return {
             "level": "hold",
             "title": "покой",
             "text": "активный эпизод болезни: держи покой, вернись по рампе "
                     "(`python -m koilog return`) после 24 ч без симптомов."
-                    + score_note(),
+                    + note,
         }
-
-    # 3. Прототип алерта: ЧДД + RHR + ВСР ушли в «плохую» сторону вместе.
-    if bad("resp_rate") and bad("rhr") and bad("hrv_sdnn"):
+    if state.state == health_state.STATE_REST:
+        return {
+            "level": "hold",
+            "title": "покой",
+            "text": "возврат к нагрузке закрыт гейтом ВСР/RHR: "
+                    "фон вне нормы. Гейт смотрит на две ночи подряд и с "
+                    "порогом ±1 (мягче, чем «откл.» в таблице каналов, там "
+                    "±1.5), поэтому «в фоне» по каналам и «держит» по гейту - "
+                    "не противоречие. С симптомами (температура, миалгия) не "
+                    "тренируйся - риск вирусного миокардита." + note,
+        }
+    if state.state == health_state.STATE_RAMP:
+        if "окно тишины" in state.reason:
+            return {
+                "level": "ramp",
+                "title": "окно тишины после эпизода",
+                "text": "каналы в фоне, но сразу после болезни фона мало: "
+                        "высокая ВСР тут - отскок, а не «готов». Возврат по "
+                        "рампе: `python -m koilog return`."
+                        + _ramp_progress(state) + note,
+            }
+        return {
+            "level": "ramp",
+            "title": "после простоя",
+            "text": "ACWR вздулся в окне после разрыва - это не перегруз. "
+                    "Стартуй по рампе: `python -m koilog return`."
+                    + _ramp_progress(state),
+        }
+    # normal: «завтра легко» - прототип сигнатуры по каналам.
+    if getattr(state, "flag", None) == "easy":
         return {
             "level": "easy",
             "title": "завтра легко",
@@ -275,24 +274,43 @@ def recommend(
                     "отклонились - типичная сигнатура начинающейся инфекции. "
                     "Завтра лёгкая нагрузка, следи за температурой.",
         }
-
-    # 4. Возврат после простоя, а ACWR вздут из-за нулей в окне.
-    gap = load.get("gap_warmup") or (days_since is not None
-                                     and days_since >= GAP_DAYS)
-    if gap and acwr >= ACWR_ALERT:
-        return {
-            "level": "ramp",
-            "title": "после простоя",
-            "text": "ACWR вздулся в окне после разрыва - это не перегруз. "
-                    "Стартуй по рампе: `python -m koilog return`.",
-        }
-
     return {
         "level": "ok",
         "title": "можно по плану",
         "text": "каналы в личном фоне, нагрузка без резких скачков - "
                 "тренируйся по плану.",
     }
+
+
+def _ramp_progress(state) -> str:
+    """«день k из N» или «(рампа приостановлена)» - см. спека §5.3."""
+    if getattr(state, "ramp_paused", False):
+        return " (рампа приостановлена)"
+    k = getattr(state, "ramp_day", 0) or 0
+    n = getattr(state, "ramp_days", 0) or 0
+    return f" Рампа: день {k} из {n}." if k else ""
+
+
+def recommend(
+    channels_list: list[Channel], load: dict, gate, score: dict | None = None,
+    state=None,
+) -> dict:
+    """Одна рекомендация по правилам (см. модуль). Возвращает словарь.
+
+    Решение принимается **в одном месте** - :func:`koilog.health.state.decide`
+    (state-машина «перерыв → рампа → штатный»); здесь рендерится текст.
+    ``score`` - канонический скор дня из ledger'а (``{"score", "threshold",
+    "alert"}``): он не переопределяет решение, а **объясняет** его. ``state``
+    можно передать готовым (из :func:`day_state`), иначе он строится из
+    каналов/нагрузки/гейта - прямые вызовы остаются рабочими.
+    """
+    from . import state as health_state
+
+    if state is None:
+        state = health_state.decide(
+            day=load.get("date") or "?", channels_list=channels_list,
+            load=load, gate=gate)
+    return _recommend_from_state(state, score)
 
 
 def _score_row(conn: sqlite3.Connection, day: str | None) -> dict | None:
@@ -367,11 +385,15 @@ def spec_warning(conn: sqlite3.Connection, current: str | None = None) -> str | 
 
 def day_state(conn: sqlite3.Connection, today: str | None = None,
               spec: str | None = None) -> dict:
-    """Полное состояние дня: дата, каналы, нагрузка, гейт, скор, рекомендация.
+    """Полное состояние дня: дата, каналы, нагрузка, гейт, скор, состояние.
 
     ``spec`` - текущий ``spec_hash`` рецептуры (подставляет вызывающий,
     например CLI): без него видно только смешение винтов внутри ряда.
+    Состояние (``state``) приходит из :mod:`koilog.health.state` - это
+    единственный источник правды, а :func:`recommend` только рендерит текст.
     """
+    from . import state as health_state
+
     channels_list = channels(conn, today)
     load = load_state(conn, today)
     resolved = today
@@ -382,12 +404,14 @@ def day_state(conn: sqlite3.Connection, today: str | None = None,
             resolved = load["date"]
     gate = health_retrain.baseline_gate(conn, resolved)
     score = _score_row(conn, resolved)
-    recommendation = recommend(channels_list, load, gate, score=score)
+    day = health_state.state_day(conn, resolved)
+    recommendation = _recommend_from_state(day, score)
     return {
         "today": resolved,
         "channels": channels_list,
         "load": load,
         "gate": gate.to_dict(),
+        "state": day.to_dict(),
         "score": score,
         "spec_warning": spec_warning(conn, spec),
         "recommendation": recommendation,
@@ -439,16 +463,13 @@ def format_digest(state: dict) -> str:
     elif gate:
         lines.append("гейт возврата: готов (две ночи ВСР/RHR в фоне)")
 
+    day = state.get("state") or {}
+    if day:
+        lines.append("состояние: " + _state_line(day))
+
     score = state.get("score")
     if score is not None and score.get("score") is not None:
-        if score.get("threshold") is None:
-            tail = "порог ещё не накоплен"
-        elif score.get("alert"):
-            tail = f"выше порога {score['threshold']:.2f} (алерт)"
-        else:
-            # скор - тихий мониторинг: порог в строке нужен лишь для
-            # непрерывности ряда, поэтому без решающей интонации
-            tail = f"мониторинг (порог {score['threshold']:.2f})"
+        tail = _score_tail(score, day)
         when = ("" if score.get("day") in (None, state.get("today"))
                 else f" за {score['day']}")
         lines.append(f"скор (причинный{when}): {score['score']:.2f} — {tail}")
@@ -460,6 +481,47 @@ def format_digest(state: dict) -> str:
     lines.append(f"рекомендация: {rec['title']}")
     lines.append(f"  {rec['text']}")
     return "\n".join(lines)
+
+
+_STATE_TITLES = {
+    "sick": "эпизод/красный флаг",
+    "rest": "покой (гейт держит)",
+    "ramp": "рампа возврата",
+    "normal": "штатный план",
+}
+
+
+def _state_line(day: dict) -> str:
+    """Строка состояния по спеке §5.6 (с «день k из N» только на рампе)."""
+    label = _STATE_TITLES.get(day.get("state"), day.get("state") or "?")
+    if day.get("state") == "ramp":
+        if day.get("ramp_paused"):
+            return f"{label} (рампа приостановлена)"
+        k = day.get("ramp_day", 0)
+        n = day.get("ramp_days", 0)
+        # k = выполненные дни рампы; пока не выполнено ни дня - числа нет
+        return label if not k else f"{label}: день {k} из {n}"
+    if day.get("state") == "sick" and day.get("reason"):
+        return f"{label} — {day['reason']}"
+    return label
+
+
+def _score_tail(score: dict, day: dict) -> str:
+    """Хвост строки скора: тихий мониторинг, а не решение (после causal replay).
+
+    Скор не меняет состояние ни в одном случае - только поясняет (§5.6).
+    """
+    if score.get("threshold") is None:
+        return "порог ещё не накоплен"
+    if score.get("alert"):
+        return f"выше порога {score['threshold']:.2f} (алерт)"
+    state = day.get("state")
+    if state == "sick":
+        return "в эпизоде, скор не решает"
+    if state in ("ramp", "rest"):
+        decision = "рампа" if state == "ramp" else "покой"
+        return f"мониторинг (порог {score['threshold']:.2f}), решение — {decision}"
+    return f"мониторинг (порог {score['threshold']:.2f})"
 
 
 def _num(value: float | None, digits: int = 1) -> str:
