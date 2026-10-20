@@ -15,9 +15,12 @@ from datetime import date as date_cls, timedelta
 
 from . import illness as health_illness
 from . import load as health_load
+from .text import table
 
 __all__ = [
+    "episode_channels",
     "episodes_frame",
+    "format_episode_channels",
     "pre_episode_windows",
     "quantile_profile",
     "signature",
@@ -238,3 +241,119 @@ def quantile_profile(
             / (statistics.pstdev(after) or 1.0), 2)
         out.append(row)
     return out
+
+
+def episode_channels(
+    conn: sqlite3.Connection,
+    episode_id: int | None = None,
+    window: str | None = None,
+) -> list[dict]:
+    """Каналы по окну эпизода: min / mean / max и день экстремума.
+
+    Список каналов **фиксирован** (:data:`_CHANNELS`) и не подбирается под
+    результат - это одно окно на эпизод, без пост-хок лова. Эпизод берётся из
+    :func:`illness.episodes` (маркированный ``sick``; sick-tail живёт в
+    state-машине и здесь не учитывается). Фон - строка ``"обычные"`` из
+    :func:`signature` (дни вне эпизодов).
+
+    Зачем min/max, а не только среднее: «ВСР повышена» в среднем по эпизоду -
+    эффект **поздних** дней восстановления, а в день старта ВСР часто падает;
+    среднее маскирует провал. Поэтому для каждого канала - оба экстремума и
+    день пика, а для ВСР - признаки ``hrv_high`` / ``hrv_low`` против фона.
+    """
+    episodes = health_illness.episodes(conn)
+    if episode_id is not None:
+        episodes = [e for e in episodes if e.id == episode_id]
+    background = {row["start"]: row for row in signature(conn, window=window)}
+    bg_row = background.get("—", {})
+
+    where = "WHERE date >= ?" if window else ""
+    params = (window,) if window else ()
+    daily = _rows(
+        conn,
+        f"SELECT date, rhr, hrv_sdnn, resp_rate, wrist_temp, sleep_hours "
+        f"FROM aw_daily {where} ORDER BY date",
+        params,
+    )
+    by_date = {row["date"]: row for row in daily}
+
+    def days_between(start: str, end: str) -> list[str]:
+        current, stop = _d(start), _d(end)
+        out = []
+        while current <= stop:
+            out.append(current.isoformat())
+            current += timedelta(days=1)
+        return out
+
+    out: list[dict] = []
+    for episode in episodes:
+        dates = [d for d in days_between(episode.start, episode.end) if d in by_date]
+        row: dict = {
+            "id": episode.id,
+            "start": episode.start,
+            "end": episode.end,
+            "days": episode.days,
+            "level": episode.level,
+            "channels": [],
+        }
+        for channel, label in _CHANNELS:
+            pairs = [(d, by_date[d][channel]) for d in dates
+                     if by_date[d][channel] is not None]
+            if not pairs:
+                row["channels"].append({
+                    "key": channel, "label": label, "n": 0,
+                    "min": None, "mean": None, "max": None, "peak": None,
+                })
+                continue
+            values = [v for _, v in pairs]
+            peak_day, peak_value = max(pairs, key=lambda p: p[1])
+            entry = {
+                "key": channel, "label": label, "n": len(pairs),
+                "min": round(min(values), 2),
+                "mean": round(statistics.fmean(values), 2),
+                "max": round(max(values), 2),
+                "peak": peak_day,
+                "peak_value": round(peak_value, 2),
+            }
+            bg = bg_row.get(label)
+            if channel == "hrv_sdnn" and bg is not None:
+                entry["background"] = bg
+                entry["hrv_high"] = entry["mean"] > bg
+                entry["hrv_low"] = entry["mean"] < bg
+            row["channels"].append(entry)
+        out.append(row)
+    return out
+
+
+def format_episode_channels(rows: list[dict]) -> str:
+    """Готовая таблица каналов эпизода для CLI ``illness --detail``.
+
+    Числа и день пика, без порогов-стрелок и цветовых меток (урок E4). Строка
+    ВСР помечается «выше/ниже фона», если её среднее отличается от фона -
+    это **описание**, не решение. Пустой список (нет эпизодов/эпизод не найден)
+    даёт понятный текст, а не пустоту.
+    """
+    if not rows:
+        return "нет эпизодов (или эпизод с таким id не найден)"
+    blocks: list[str] = []
+    for row in rows:
+        head = (f"эпизод {row['id']}: {row['start']}…{row['end']} "
+                f"({row['days']} дн, {row['level']})")
+        body_rows = []
+        for ch in row["channels"]:
+            if ch["n"] == 0:
+                body_rows.append([ch["label"], "—", "—", "—", "—"])
+                continue
+            peak = f"{ch['peak']} ({ch['peak_value']})"
+            label = ch["label"]
+            if ch.get("hrv_high"):
+                label += " (выше фона)"
+            elif ch.get("hrv_low"):
+                label += " (ниже фона)"
+            body_rows.append([
+                label,
+                f"{ch['min']}", f"{ch['mean']}", f"{ch['max']}", peak,
+            ])
+        body = table(["канал", "min", "mean", "max", "пик (дата)"], body_rows)
+        blocks.append(f"{head}\n{body}")
+    return "\n\n".join(blocks)

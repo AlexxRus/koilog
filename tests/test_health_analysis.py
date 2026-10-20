@@ -172,5 +172,50 @@ class QuantileProfileTests(unittest.TestCase):
         self.assertIn("ВСР, мс", labels)
 
 
+class EpisodeChannelsTests(unittest.TestCase):
+    def test_channels_have_min_mean_max_peak(self):
+        rows = analysis.episode_channels(_synthetic_db(), window=None)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], 1)
+        # ровно пять фиксированных каналов, порядок из _CHANNELS
+        keys = [c["key"] for c in rows[0]["channels"]]
+        self.assertEqual(keys, ["rhr", "hrv_sdnn", "resp_rate", "wrist_temp",
+                                "sleep_hours"])
+        for ch in rows[0]["channels"]:
+            self.assertEqual(ch["n"], 3)
+            self.assertLessEqual(ch["min"], ch["mean"])
+            self.assertLessEqual(ch["mean"], ch["max"])
+            self.assertIsNotNone(ch["peak"])
+
+    def test_hrv_low_when_below_background(self):
+        """В синтетике болезнь роняет ВСР - метка «ниже фона»."""
+        rows = analysis.episode_channels(_synthetic_db(), window=None)
+        hrv = [c for c in rows[0]["channels"] if c["key"] == "hrv_sdnn"][0]
+        self.assertTrue(hrv["hrv_low"])
+        self.assertFalse(hrv["hrv_high"])
+        self.assertIn("background", hrv)
+
+    def test_detail_by_id_filters(self):
+        conn = _synthetic_db()
+        self.assertEqual(analysis.episode_channels(conn, episode_id=999,
+                                                   window=None), [])
+        self.assertEqual(len(analysis.episode_channels(conn, episode_id=1,
+                                                        window=None)), 1)
+
+    def test_format_lists_channels_and_peak(self):
+        rows = analysis.episode_channels(_synthetic_db(), window=None)
+        text = analysis.format_episode_channels(rows)
+        self.assertIn("эпизод 1", text)
+        self.assertIn("RHR, уд/мин", text)
+        self.assertIn("пик", text)
+        self.assertIn("ниже фона", text)
+        # урок E4: в рендере нет стрелок
+        for mark in ("↑", "↓", "→", "←"):
+            self.assertNotIn(mark, text)
+
+    def test_format_empty_gives_clear_text(self):
+        self.assertIn("не найден", analysis.format_episode_channels([]))
+
+
 if __name__ == "__main__":
     unittest.main()

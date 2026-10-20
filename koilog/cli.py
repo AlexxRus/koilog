@@ -766,11 +766,18 @@ def cmd_health_load(args: argparse.Namespace) -> int:
 
 
 def cmd_illness(args: argparse.Namespace) -> int:
-    """Пересобрать и показать эпизоды болезни."""
+    """Пересобрать и показать эпизоды болезни (``--detail`` — каналы эпизода)."""
     conn = _open(args)
     try:
         health_illness.build(conn, window=args.window)
-        text = health_illness.format_episodes(conn)
+        if args.detail is not None:
+            from .health import analysis as health_analysis
+
+            rows = health_analysis.episode_channels(
+                conn, episode_id=args.detail, window=args.window)
+            text = health_analysis.format_episode_channels(rows)
+        else:
+            text = health_illness.format_episodes(conn)
     finally:
         conn.close()
     print(text)
@@ -1114,6 +1121,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_illness.add_argument("--window", default=health_load.DEFAULT_WINDOW,
                            help=f"первая дата включительно (по умолчанию "
                                 f"{health_load.DEFAULT_WINDOW})")
+    p_illness.add_argument(
+        "--detail", type=int, default=None, metavar="ID",
+        help="показать каналы одного эпизода (min/mean/max, день пика)")
     p_illness.set_defaults(func=cmd_illness)
 
     p_ml = sub.add_parser(

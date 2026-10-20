@@ -151,6 +151,11 @@ class ParserTests(unittest.TestCase):
         self.assertTrue(args.replay)
         self.assertEqual(args.since, "2025-01-01")
 
+    def test_illness_detail_flag_parses(self):
+        args = self.parser.parse_args(["illness", "--detail", "41"])
+        self.assertEqual(args.detail, 41)
+        self.assertIsNone(self.parser.parse_args(["illness"]).detail)
+
 
 # --------------------------------------------------------------------------
 # Вспомогательные функции
@@ -683,6 +688,74 @@ class DigestCommandTests(CliFixture):
         payload = json.loads(out)
         self.assertIn("recommendation", payload)
         self.assertIn("gate", payload)
+
+
+class IllnessCommandTests(unittest.TestCase):
+    """``illness --detail`` на маленькой базе с часами и одним эпизодом."""
+
+    def setUp(self):
+        from datetime import date as date_cls, timedelta
+
+        from koilog.health import apple, illness
+
+        self._dir = tempfile.TemporaryDirectory()
+        self.db = Path(self._dir.name) / "h.db"
+        conn = sqlite3.connect(self.db)
+        conn.row_factory = sqlite3.Row
+        conn.executescript(etl.SCHEMA)
+        conn.executescript(apple._SCHEMA)
+        first = date_cls.fromisoformat("2024-01-01")
+        for i in range(40):
+            day = (first + timedelta(days=i)).isoformat()
+            sick = 20 <= i <= 22
+            conn.execute(
+                "INSERT INTO aw_daily (date, rhr, hrv_sdnn, resp_rate, wrist_temp, "
+                "spo2, sleep_hours, sleep_start) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (day, 60 + (30 if sick else 0), 70 - (40 if sick else 0),
+                 15 + (5 if sick else 0), 35.5 + (1.5 if sick else 0),
+                 96.0, 7.5, "23:30"),
+            )
+            # тренировки через день, чтобы не было gap-эпизодов
+            if i % 2 == 0:
+                conn.execute(
+                    "INSERT INTO sets (source, source_row, session_id, date, "
+                    "exercise, exercise_group, equipment, set_index, weight, reps) "
+                    "VALUES ('journal', ?, 's', ?, 'Жим', 'ЖИМ ЛЁЖА', 'гантели', 1, "
+                    "30.0, 8)",
+                    (i, day))
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        self._dir.cleanup()
+
+    def run_cli(self, *argv: str) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        argv = ("--db", str(self.db)) + argv
+        with redirect_stdout(out), redirect_stderr(err):
+            code = cli.main(list(argv))
+        return code, out.getvalue(), err.getvalue()
+
+    def test_plain_illness_lists_episodes(self):
+        code, out, _ = self.run_cli("illness", "--window", "2023-01-01")
+        self.assertEqual(code, 0)
+        self.assertIn("эпизодов", out)
+
+    def test_detail_shows_channels_for_episode(self):
+        code, out, _ = self.run_cli("illness", "--window", "2023-01-01")
+        self.assertEqual(code, 0)
+        code, out, _ = self.run_cli("illness", "--window", "2023-01-01",
+                                    "--detail", "1")
+        self.assertEqual(code, 0)
+        self.assertIn("эпизод 1", out)
+        self.assertIn("RHR, уд/мин", out)
+        self.assertIn("пик", out)
+
+    def test_detail_missing_id_gives_clear_text(self):
+        code, out, _ = self.run_cli("illness", "--window", "2023-01-01",
+                                    "--detail", "999")
+        self.assertEqual(code, 0)
+        self.assertIn("не найден", out)
 
 
 class ScoreCommandTests(CliFixture):
