@@ -495,6 +495,9 @@ def format_digest(state: dict) -> str:
         lines.append("гейт возврата: держит — " + "; ".join(gate["reasons"]))
     elif gate:
         lines.append("гейт возврата: готов (две ночи ВСР/RHR в фоне)")
+    band = _gate_band(gate)
+    if band:
+        lines.append(band)
 
     day = state.get("state") or {}
     if day:
@@ -526,6 +529,32 @@ _STATE_TITLES = {
     "ramp": "рампа возврата",
     "normal": "штатный план",
 }
+
+
+def _gate_band(gate: dict) -> str:
+    """Числовая «полоса гейта» — где порог гейта против порога колонки.
+
+    Render-only: читает **готовый** ``gate.to_dict()`` (``ready``/``reasons``/
+    ``rows``/``silence_until``), новых расчётов и решений нет. Смысл строки —
+    снять мнимое противоречие «канал „в фоне", а рекомендация „покой"»:
+    гейт возврата держит по порогу ``|z| > GATE_Z`` (±1), а колонка каналов
+    помечает «откл.» только при ``|z| > Z_CHANNEL`` (±1.5). Канал между этими
+    границами честно «в фоне» и одновременно держит гейт — это разные пороги,
+    а не спор. Урок E4: в строке **только числа**, без стрелок и цветов.
+    """
+    if not gate:
+        return ""
+    gate_z = health_retrain.GATE_Z
+    nights = gate.get("nights") or 0
+    if not nights:
+        # Нет ночей для проверки (пустой aw_daily) — полосе нечего показать.
+        return ""
+    window_only = gate.get("silence_until") is not None and all(
+        str(reason).startswith("окно тишины") for reason in gate.get("reasons", ()))
+    where = ("окно тишины — рампа, не покой" if window_only
+             else ("держит" if not gate.get("ready") else "готов"))
+    return (f"  полоса гейта: порог ±{gate_z:g} (каналы ±{Z_CHANNEL:g}); "
+            f"ночей {nights} — {where}")
 
 
 def _state_line(day: dict) -> str:

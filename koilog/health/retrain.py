@@ -314,30 +314,61 @@ class DetrainPoint:
 
 
 #: Границы бинов личной детрейн-кривой: ``(низ, верх, подпись)``.
+#: Интервалы полуоткрытые (``низ <= days_off < верх``). Длинный хвост разбит
+#: на ``28–60`` и ``>60``: у ``>28 дн`` слишком разный состав (28 дн и
+#: 106-дневный перерыв тянут среднее в разные стороны), а решений бин не
+#: принимает - это чисто описательная витрина (см. ``format_curve``).
 _BINS: tuple[tuple[int, int, str], ...] = (
     (0, 7, "<7 дн"),
     (7, 14, "7–14 дн"),
     (14, 28, "14–28 дн"),
-    (28, 10 ** 6, ">28 дн"),
+    (28, 60, "28–60 дн"),
+    (60, 10 ** 6, ">60 дн"),
 )
 
 
+def _quantile(values: list[float], q: float) -> float:
+    """Линейный квантиль (метод ``linear``) по отсортированному ряду.
+
+    Для размаха бина (``iqr``) достаточно линейной интерполяции между
+    соседними порядковыми значениями - не тянем ``statistics.quantiles``
+    (он требует n >= 2 и падает на коротких рядах).
+    """
+    if not values:
+        raise ValueError("пустой ряд")
+    pos = q * (len(values) - 1)
+    low = int(pos)
+    high = min(low + 1, len(values) - 1)
+    frac = pos - low
+    return values[low] * (1 - frac) + values[high] * frac
+
+
 def detraining_bins(points: list[DetrainPoint]) -> list[dict]:
-    """Свести точки в бины: n, средняя и медианная просадка (в %)."""
+    """Свести точки в бины: n, средняя, медианная просадка и размах (в %).
+
+    ``mean``/``median``/``iqr`` берутся по **совокупности точек бина** (не
+    скользящим окном). ``iqr`` - интерквартильный размах (``q75 - q25``): он
+    честно показывает разброс там, где малые ``n`` и 106-дневные перерывы
+    делают среднее обманчивым. При ``n == 0`` все три - ``None``.
+    """
     out = []
     for low, high, label in _BINS:
         bucket = [p for p in points if low <= p.days_off < high]
         drops = sorted(p.drop_pct for p in bucket)
         if not bucket:
-            out.append({"label": label, "n": 0, "mean": None, "median": None})
+            out.append({"label": label, "n": 0, "mean": None, "median": None,
+                        "iqr": None})
             continue
         middle = drops[len(drops) // 2] if len(drops) % 2 else \
             (drops[len(drops) // 2 - 1] + drops[len(drops) // 2]) / 2
+        spread = (_quantile(drops, 0.75) - _quantile(drops, 0.25)
+                  if len(drops) >= 2 else 0.0)
         out.append({
             "label": label,
             "n": len(bucket),
             "mean": sum(drops) / len(drops),
             "median": middle,
+            "iqr": spread,
         })
     return out
 
@@ -962,10 +993,11 @@ def format_curve(
     lines = [title]
     bins = detraining_bins(points)
     body = table(
-        ["простой", "n", "средняя просадка", "медиана"],
+        ["простой", "n", "средняя просадка", "медиана", "размах (IQR)"],
         [[b["label"], b["n"],
           "—" if b["mean"] is None else f"{b['mean'] * 100:+.1f} %",
-          "—" if b["median"] is None else f"{b['median'] * 100:+.1f} %"]
+          "—" if b["median"] is None else f"{b['median'] * 100:+.1f} %",
+          "—" if b["iqr"] is None else f"{b['iqr'] * 100:.1f} %"]
          for b in bins],
     )
     lines.append(body)

@@ -222,22 +222,47 @@ class DetrainBinsTests(unittest.TestCase):
             retrain.DetrainPoint("A", 3, 100.0, 95.0),    # <7
             retrain.DetrainPoint("A", 10, 100.0, 90.0),   # 7-14
             retrain.DetrainPoint("A", 20, 100.0, 80.0),   # 14-28
-            retrain.DetrainPoint("A", 40, 100.0, 70.0),   # >28
+            retrain.DetrainPoint("A", 40, 100.0, 70.0),   # 28-60
+            retrain.DetrainPoint("A", 90, 100.0, 75.0),   # >60
         ]
         bins = {b["label"]: b for b in retrain.detraining_bins(points)}
         self.assertEqual(bins["<7 дн"]["n"], 1)
         self.assertAlmostEqual(bins["<7 дн"]["mean"], 0.05)
         self.assertAlmostEqual(bins["7–14 дн"]["median"], 0.10)
         self.assertAlmostEqual(bins["14–28 дн"]["mean"], 0.20)
-        self.assertAlmostEqual(bins[">28 дн"]["mean"], 0.30)
+        self.assertAlmostEqual(bins["28–60 дн"]["mean"], 0.30)
+        self.assertAlmostEqual(bins[">60 дн"]["mean"], 0.25)
+
+    def test_long_tail_is_split_at_60(self):
+        """>28 дн разбит на 28–60 и >60 (границы полуоткрытые)."""
+        points = [
+            retrain.DetrainPoint("A", 28, 100.0, 70.0),   # ровно 28 -> 28-60
+            retrain.DetrainPoint("A", 59, 100.0, 70.0),   # 59 -> 28-60
+            retrain.DetrainPoint("A", 60, 100.0, 90.0),   # ровно 60 -> >60
+        ]
+        bins = {b["label"]: b for b in retrain.detraining_bins(points)}
+        self.assertEqual(bins["28–60 дн"]["n"], 2)
+        self.assertEqual(bins[">60 дн"]["n"], 1)
+
+    def test_iqr_reports_spread_of_the_bucket(self):
+        points = [
+            retrain.DetrainPoint("A", 10, 100.0, 100.0),  # 0 %
+            retrain.DetrainPoint("A", 11, 100.0, 90.0),   # 10 %
+            retrain.DetrainPoint("A", 12, 100.0, 80.0),   # 20 %
+            retrain.DetrainPoint("A", 13, 100.0, 70.0),   # 30 %
+        ]
+        bins = {b["label"]: b for b in retrain.detraining_bins(points)}
+        # q25 = 0.075, q75 = 0.225 (линейная интерполяция по 4 точкам).
+        self.assertAlmostEqual(bins["7–14 дн"]["iqr"], 0.15)
 
     def test_empty_bin_reports_none(self):
         bins = retrain.detraining_bins([])
-        self.assertEqual(len(bins), 4)
+        self.assertEqual(len(bins), len(retrain._BINS))
         for bucket in bins:
             self.assertEqual(bucket["n"], 0)
             self.assertIsNone(bucket["mean"])
             self.assertIsNone(bucket["median"])
+            self.assertIsNone(bucket["iqr"])
 
     def test_median_of_even_count(self):
         points = [
@@ -696,6 +721,18 @@ class FormatTests(unittest.TestCase):
         text = retrain.format_curve(points, "Жим")
         self.assertIn("литературные ориентиры", text)
         self.assertIn("Mujika", text)
+        self.assertIn("размах", text)
+
+    def test_format_curve_splits_long_tail(self):
+        points = [
+            retrain.DetrainPoint("Жим", 40, 100.0, 70.0),
+            retrain.DetrainPoint("Жим", 90, 100.0, 75.0),
+        ]
+        text = retrain.format_curve(points, "Жим")
+        self.assertIn("28–60 дн", text)
+        self.assertIn(">60 дн", text)
+        self.assertNotIn(">28 дн", text)
+        self.assertIn("размах", text)
 
     def test_format_gate_shows_verdict(self):
         conn = _db()

@@ -393,7 +393,6 @@ class DayStateTests(unittest.TestCase):
         self.assertIn("гейт возврата", text)
         self.assertIn("скор (причинный): 0.83", text)
         self.assertIn("выше порога 0.75", text)
-
     def test_card_falls_back_to_last_scored_day(self):
         """День эпизода модель не оценивает - показываем последний скор с датой."""
         conn = self._score_db()
@@ -462,6 +461,53 @@ class DayStateTests(unittest.TestCase):
             "'spec00000002', 40, 6, '2024-01-24', 0.75, 0)")
         conn.commit()
         self.assertIn("смешана", digest.spec_warning(conn, current="spec00000009"))
+
+
+class GateBandTests(unittest.TestCase):
+    """Полоса гейта — числовая строка-пояснение, render-only (4.6).
+
+    Полоса читает готовый ``gate.to_dict()``: новой логики гейта нет. Проверяем,
+    что в строке только числа (порог гейта ±1 против колонки ±1.5), нет стрелок и
+    что она честно различает «готов / держит / окно тишины».
+    """
+
+    def test_band_shows_both_thresholds(self):
+        gate = {"ready": True, "nights": 2, "reasons": [], "rows": [],
+                "silence_until": None}
+        text = digest._gate_band(gate)
+        self.assertIn("±1", text)
+        self.assertIn("±1.5", text)
+        self.assertIn("ночей 2", text)
+        self.assertIn("готов", text)
+
+    def test_band_says_gate_holds(self):
+        gate = {"ready": False, "nights": 2,
+                "reasons": ("2026-10-17: RHR z +1.2 выше фона (>1)",),
+                "rows": [], "silence_until": None}
+        self.assertIn("держит", digest._gate_band(gate))
+
+    def test_band_marks_silence_window_as_ramp(self):
+        gate = {"ready": False, "nights": 2,
+                "reasons": ("окно тишины: до 2026-10-27",),
+                "rows": [], "silence_until": "2026-10-27"}
+        text = digest._gate_band(gate)
+        self.assertIn("окно тишины", text)
+        self.assertIn("рампа", text)
+
+    def test_band_has_no_arrows_or_marks(self):
+        """Урок E4: в рендере — числа, без стрелок/цветовых меток."""
+        gate = {"ready": False, "nights": 2,
+                "reasons": ("2026-10-17: ВСР z -1.4 ниже фона (<-1)",),
+                "rows": [], "silence_until": None}
+        text = digest._gate_band(gate)
+        for mark in ("→", "←", "↑", "↓", "◀", "▶"):
+            self.assertNotIn(mark, text)
+
+    def test_band_empty_without_nights(self):
+        self.assertEqual(digest._gate_band({}), "")
+        self.assertEqual(
+            digest._gate_band({"ready": True, "nights": 0, "reasons": [],
+                               "rows": [], "silence_until": None}), "")
 
 
 if __name__ == "__main__":
