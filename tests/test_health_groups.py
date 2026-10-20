@@ -14,7 +14,9 @@
   медиана устойчива к сумасшедшей неделе; кросс-режимная сумма внутри группы
   запрещена (**№17**); кратность и округление 0.1;
 - **E4** (14–16): инвариант D11-b **двусторонний**; импорт-ассерт; E-строка
-  поверх ``state_day``, ``day_state`` не зависит от наличия E-модуля.
+  поверх ``state_day``, ``day_state`` не зависит от наличия E-модуля;
+- **интерфейс §2.5** (`InterfaceTests`): ``mode`` обязателен (``TypeError``);
+  смешанная группа — две явные подветки; ``RuntimeError`` только на баг-класс.
 
 Политика E1: неопознанное имя → ``None`` (не тихий дефолт), агрегат падает
 списком; упражнение → ровно один режим.
@@ -144,13 +146,22 @@ class ModeOfTests(unittest.TestCase):
         for name in ("Жим штанги лежа", "Бег", "Скручивания", "Планка"):
             _add(conn, name, "2024-01-01")
         conn.commit()
+
+        def backfill() -> dict[str, taxonomy.Mode | None]:
+            names = [
+                r["exercise"]
+                for r in conn.execute("SELECT DISTINCT exercise FROM sets")
+            ]
+            return {name: taxonomy.mode_of(name) for name in names}
+
+        first = backfill()
         # покрытие: ни одного имени без режима
-        names = [r["exercise"] for r in conn.execute("SELECT exercise FROM sets")]
-        self.assertEqual([n for n in names if taxonomy.mode_of(n) is None], [])
-        # идемпотентность: повторный проход — тот же результат
-        first = {n: taxonomy.mode_of(n) for n in names}
-        second = {n: taxonomy.mode_of(n) for n in names}
+        self.assertEqual([n for n, m in first.items() if m is None], [])
+        # идемпотентность: ПОВТОРНЫЙ проход бэкфилла даёт тот же результат
+        second = backfill()
         self.assertEqual(first, second)
+        # и контроль неопознанных стабилен между проходами
+        self.assertEqual(groups.unknown_groups(conn), groups.unknown_groups(conn))
 
     def test_5_default_exercise_resolves_to_sets(self):
         """(5) ``default_exercise`` «Подтягивания…» резолвится в подходы."""
@@ -225,9 +236,8 @@ class AggregateTests(unittest.TestCase):
 
     def test_9_window_orthogonal_to_branch(self):
         """(9) Окно одно для трёх метрик, но ветки не смешиваются."""
-        self.assertEqual(
-            groups.ROLLING_WINDOW, groups.ROLLING_WINDOW
-        )
+        # окно — константа модуля, не параметр ветки
+        self.assertEqual(groups.ROLLING_WINDOW, 7)
         conn = self._iron_conn()
         iron = groups.series(conn, "СТАНОВАЯ ТЯГА", taxonomy.Mode.IRON)
         self.assertEqual(iron.metric, "tonnage")
@@ -236,6 +246,67 @@ class AggregateTests(unittest.TestCase):
         conn.commit()
         bw = groups.series(conn, "ПРЕСС", taxonomy.Mode.BODYWEIGHT)
         self.assertEqual(bw.metric, "sets")
+
+
+# --------------------------------------------------------------------------
+# Интерфейс §2.5 — mode обязателен, RuntimeError только на баг-класс
+# --------------------------------------------------------------------------
+
+
+class InterfaceTests(unittest.TestCase):
+    """Пины §2.5: ``mode`` обязателен; ``RuntimeError`` — только баг-класс."""
+
+    def _mixed_conn(self) -> sqlite3.Connection:
+        conn = _db()
+        self.addCleanup(conn.close)
+        _schema(conn)
+        _add(conn, "Приседания со штангой", "2024-01-01", 120.0, 5)
+        _add(conn, "Приседания", "2024-01-02", 0.0, 20)
+        conn.commit()
+        return conn
+
+    def test_mode_is_mandatory(self):
+        """``series``/``balance`` без ``mode`` → ``TypeError`` (не тихий выбор)."""
+        conn = self._mixed_conn()
+        with self.assertRaises(TypeError):
+            groups.series(conn, "ПРИСЕДАНИЯ")               # без mode
+        with self.assertRaises(TypeError):
+            groups.balance(conn, "ЖИМ ЛЁЖА", "ЖИМ ЛЁЖА")    # без mode
+
+    def test_mixed_group_needs_two_explicit_calls(self):
+        """Смешанная группа даёт две подветки — без молчаливого выбора."""
+        conn = self._mixed_conn()
+        iron = groups.series(conn, "ПРИСЕДАНИЯ", taxonomy.Mode.IRON)
+        bw = groups.series(conn, "ПРИСЕДАНИЯ", taxonomy.Mode.BODYWEIGHT)
+        self.assertEqual(iron.metric, "tonnage")
+        self.assertEqual(bw.metric, "sets")
+        self.assertEqual(
+            set(groups.modes_in_group(conn, "ПРИСЕДАНИЯ")),
+            {taxonomy.Mode.IRON, taxonomy.Mode.BODYWEIGHT},
+        )
+
+    def test_runtime_error_only_for_bug_class(self):
+        """``RuntimeError`` — только на нарушение инварианта таксономии.
+
+        Штатные имена резолвятся молча; ``RuntimeError`` поднимается, когда имя
+        оказалось в группе, но ``mode_of`` для него не резолвится (баг
+        таксономии). Обе стороны: штатно — тишина, баг-класс — громко с именем.
+        """
+        conn = self._mixed_conn()
+        # штатно: оба режима смешанной группы строятся молча
+        groups.series(conn, "ПРИСЕДАНИЯ", taxonomy.Mode.IRON)
+        groups.series(conn, "ПРИСЕДАНИЯ", taxonomy.Mode.BODYWEIGHT)
+        # баг-класс: mode_of не резолвит имя группы → RuntimeError с именем
+        original = taxonomy.mode_of
+        try:
+            taxonomy.mode_of = lambda name: (
+                None if name == "Приседания со штангой" else original(name)
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                groups.series(conn, "ПРИСЕДАНИЯ", taxonomy.Mode.IRON)
+            self.assertIn("Приседания со штангой", str(ctx.exception))
+        finally:
+            taxonomy.mode_of = original
 
 
 # --------------------------------------------------------------------------
@@ -264,11 +335,15 @@ class BalanceTests(unittest.TestCase):
         self.assertTrue(base["ready"])
         self.assertEqual(base["values"], [1000.0, 1000.0, 1000.0])
         self.assertEqual(base["median"], 1000.0)
-        # только два значения сетки (< равенств назад)
+        # ровно 2 из 3 валидны (12-25 вне истории) → частичный базлайн = None
         sparse = groups.baseline(
             conn, "ЖИМ ЛЁЖА", taxonomy.Mode.IRON, "2024-01-15"
         )
         self.assertFalse(sparse["ready"])
+        self.assertIsNone(sparse["median"])
+        self.assertEqual(
+            [v for v in sparse["values"] if v is not None], [1000.0, 1000.0]
+        )   # именно 2 из 3, а не 0/1
 
     def test_10b_empty_window_none(self):
         """(10) Пустое окно → ``None``."""
