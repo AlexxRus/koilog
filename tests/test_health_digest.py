@@ -14,6 +14,7 @@ from datetime import date as date_cls
 from datetime import timedelta
 
 from koilog.health import digest
+from koilog.health import state as health_state
 
 
 class _Gate:
@@ -74,6 +75,31 @@ class RecommendTests(unittest.TestCase):
         rec = digest.recommend(
             _ok_channels(), load, _Gate(False, ("2026-10-17: RHR z +2.5 выше фона (>1)",)))
         self.assertEqual(rec["level"], "hold")
+
+    def test_rest_with_unfinished_ramp_shows_pause(self):
+        """``rest`` при незавершённой рампе видно как «рампа приостановлена».
+
+        Спека §5.3: покой не должен молча терять метку рампы - иначе
+        незавершённая рампа выглядит как безымянный покой.
+        """
+        day = health_state.StateDay(
+            day="2026-10-20", state=health_state.STATE_REST,
+            reason="гейт ВСР/RHR держит", ramp_day=1,
+            ramp_days=health_state.RAMP_DAYS, ramp_paused=True)
+        rec = digest._recommend_from_state(day, None)
+        self.assertEqual(rec["level"], "hold")
+        self.assertIn("рампа приостановлена", rec["text"])
+        self.assertIn("рампа приостановлена", digest._state_line(day.to_dict()))
+
+    def test_rest_without_ramp_has_no_pause_mark(self):
+        """Покой без начатой рампы - не «пауза»: метки нет (§5.3)."""
+        day = health_state.StateDay(
+            day="2026-10-20", state=health_state.STATE_REST,
+            reason="гейт ВСР/RHR держит", ramp_day=0, ramp_paused=True)
+        self.assertNotIn("рампа приостановлена",
+                         digest._state_line(day.to_dict()))
+        self.assertNotIn("рампа приостановлена",
+                         digest._recommend_from_state(day, None)["text"])
 
     def test_silence_window_after_episode_is_ramp_not_hold(self):
         """Каналы в фоне, но сразу после эпизода - рампа, не покой."""

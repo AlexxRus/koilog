@@ -246,7 +246,8 @@ def _recommend_from_state(state, score: dict | None = None) -> dict:
                     "порогом ±1 (мягче, чем «откл.» в таблице каналов, там "
                     "±1.5), поэтому «в фоне» по каналам и «держит» по гейту - "
                     "не противоречие. С симптомами (температура, миалгия) не "
-                    "тренируйся - риск вирусного миокардита." + note,
+                    "тренируйся - риск вирусного миокардита."
+                    + _ramp_progress(state) + note,
         }
     if state.state == health_state.STATE_RAMP:
         if "окно тишины" in state.reason:
@@ -284,9 +285,12 @@ def _recommend_from_state(state, score: dict | None = None) -> dict:
 
 def _ramp_progress(state) -> str:
     """«день k из N» или «(рампа приостановлена)» - см. спека §5.3."""
-    if getattr(state, "ramp_paused", False):
-        return " (рампа приостановлена)"
     k = getattr(state, "ramp_day", 0) or 0
+    is_ramp = getattr(state, "state", None) == "ramp"
+    if getattr(state, "ramp_paused", False):
+        # Пауза значима, только если рампа уже начата (иначе это покой без
+        # рампы - метка «приостановлена» вводила бы в заблуждение).
+        return " (рампа приостановлена)" if (k or is_ramp) else ""
     n = getattr(state, "ramp_days", 0) or 0
     return f" Рампа: день {k} из {n}." if k else ""
 
@@ -492,15 +496,21 @@ _STATE_TITLES = {
 
 
 def _state_line(day: dict) -> str:
-    """Строка состояния по спеке §5.6 (с «день k из N» только на рампе)."""
+    """Строка состояния по спеке §5.3/§5.6 (метка рампы видна и на паузе)."""
     label = _STATE_TITLES.get(day.get("state"), day.get("state") or "?")
-    if day.get("state") == "ramp":
-        if day.get("ramp_paused"):
+    if day.get("state") in ("ramp", "rest"):
+        # Пауза видна в обоих состояниях: `rest` при незавершённой рампе -
+        # это «покой (рампа приостановлена)», а не безымянный покой (§5.3).
+        # Метка требует начатой рампы (`ramp_day > 0`): покой без эпизода и
+        # без рампы - не «пауза», а просто покой.
+        k = day.get("ramp_day", 0) or 0
+        if day.get("ramp_paused") and (day.get("state") == "ramp" or k):
             return f"{label} (рампа приостановлена)"
-        k = day.get("ramp_day", 0)
-        n = day.get("ramp_days", 0)
-        # k = выполненные дни рампы; пока не выполнено ни дня - числа нет
-        return label if not k else f"{label}: день {k} из {n}"
+        if day.get("state") == "ramp":
+            n = day.get("ramp_days", 0)
+            # k = выполненные дни рампы; пока не выполнено ни дня - числа нет
+            return label if not k else f"{label}: день {k} из {n}"
+        return label
     if day.get("state") == "sick" and day.get("reason"):
         return f"{label} — {day['reason']}"
     return label

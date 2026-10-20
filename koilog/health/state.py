@@ -32,6 +32,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 from datetime import date as date_cls
+from datetime import timedelta
 
 from . import illness as health_illness
 from . import load as health_load
@@ -40,6 +41,7 @@ from . import retrain as health_retrain
 __all__ = [
     "RAMP_DAYS",
     "RAMP_GAP_DAYS",
+    "SICK_TAIL_MAX",
     "SPEC_VERSION",
     "STATE_SICK",
     "STATE_REST",
@@ -65,6 +67,11 @@ RAMP_DAYS = 5
 #: Простой (дней без тренировок), после которого штатный план уже не «штатный»
 #: (совпадает с горизонтом ``H_ONSET`` - тот же масштаб, что у ML-ламбды).
 RAMP_GAP_DAYS = 7
+
+#: Предохранитель обратного скана ``sick_tail`` (спека §5-бис, раунд 6). Тот же
+#: масштаб, что ``RAMP_GAP_DAYS``/``H_ONSET``: болезнь редко держится дольше
+#: недели, а неограниченный скан тянул бы историю без нужды.
+SICK_TAIL_MAX = 7
 
 STATE_SICK = "sick"
 STATE_REST = "rest"
@@ -219,6 +226,137 @@ def _last_training_before(conn: sqlite3.Connection, day: str) -> str | None:
         else:
             break
     return last
+
+
+# --------------------------------------------------------------------------
+# Sick-tail (раунд 6, спека §5-бис)
+# --------------------------------------------------------------------------
+
+#: Признаки канальной причины гейта: «держит» именно деривация, а не
+#: календарь окна тишины и не отсутствие данных. Строки совпадают с тем, что
+#: пишет :func:`koilog.health.retrain.baseline_gate`.
+_CHANNEL_MARKS = ("RHR z", "ВСР z", "t запястья z")
+#: Признаки «гейт неоцениваем»: фон не набран или ночей нет вовсе. Такая
+#: причина sick **не снимает** (спека п.1: «нет данных ≠ чисто»).
+_UNKNOWN_MARKS = ("нет фона", "не хватает ночей", "нет данных")
+
+
+def _gate_status(gate) -> str:
+    """Канальный статус гейта дня: ``"holds"``/``"unknown"``/``"clean"``.
+
+    - ``"holds"`` - есть канальная причина (RHR выше фона / ВСР ниже фона /
+      t запястья): односторонняя деривация держит, как и сам гейт;
+    - ``"unknown"`` - гейт **не оценён** (фон не набран, ночей нет): не
+      снимает болезнь и не является доказательством чистоты;
+    - ``"clean"`` - гейт готов **или** блокирует только окно тишины: каналы
+      за обе ночи чисты, это положительное свидетельство (спека п.2).
+    """
+    reasons = tuple(getattr(gate, "reasons", ()) or ())
+    if not reasons:
+        return "clean"          # ready (или данных достаточно и всё в фоне)
+    if any(any(mark in reason for mark in _CHANNEL_MARKS)
+           for reason in reasons):
+        return "holds"
+    if any(any(mark in reason for mark in _UNKNOWN_MARKS)
+           for reason in reasons):
+        return "unknown"
+    # Осталась только календарная привилегия (окно тишины) - каналы чисты.
+    return "clean"
+
+
+def _sick_tail(
+    conn: sqlite3.Connection,
+    day: str,
+    gate=None,
+) -> str | None:
+    """Дата ``sick``-якоря, если ``day`` - хвост болезни, иначе ``None``.
+
+    Реализует ``sick_tail`` из спеки §5-бис обратным сканом: идём от ``day``
+    назад, пока дни «держат по каналам» или «неоцениваемы», и смотрим, есть
+    ли в этом интервале день-якорь (активный эпизод или красный флаг). Скан
+    **stateless** (только данные) и ограничен ``SICK_TAIL_MAX`` днями.
+
+    Возвращает именно якорь, потому что он нужен отдельно: якорь рампы после
+    ``sick`` - это последний ``sick``-день (спека п.4).
+    """
+    from . import digest as health_digest   # локально: избегаем кольца
+
+    current = date_cls.fromisoformat(day)
+    checked = 0
+    cursor = current
+    while checked < SICK_TAIL_MAX:
+        if checked == 0 and gate is not None:
+            status = _gate_status(gate)
+        else:
+            status = _gate_status(health_retrain.baseline_gate(
+                conn, cursor.isoformat()))
+        if status == "clean":
+            return None                      # положительное свидетельство: стоп
+        # День держит или неоцениваем - проверяем, якорь ли он.
+        if _is_sick_anchor(conn, cursor.isoformat(), health_digest):
+            return cursor.isoformat()
+        cursor -= timedelta(days=1)
+        checked += 1
+    return None
+
+
+def _is_sick_anchor(
+    conn: sqlite3.Connection,
+    day: str,
+    health_digest,
+) -> bool:
+    """Якорь ``sick``: активный эпизод дня или красный флаг (спека §5-бис).
+
+    Красный флаг пересчитывается по каналам и нагрузке **того дня** - тем же
+    правилом, что :func:`decide` (общий источник ``_red_flag``), чтобы не
+    разойтись с решением дня.
+    """
+    if _active_episode(conn, day):
+        return True
+    channels_list = health_digest.channels(conn, day)
+    load = health_digest.load_state(conn, day)
+    by_key = {c.key: c for c in channels_list} if channels_list else {}
+
+    def bad(key: str) -> bool:
+        channel = by_key.get(key)
+        return bool(channel and channel.bad)
+
+    return _red_flag(load, bad)
+
+
+def _active_episode(conn: sqlite3.Connection, day: str) -> bool:
+    """Есть ли на ``day`` активный (не ``gap_only``) эпизод болезни."""
+    if not _has_table(conn, "illness_episodes"):
+        return False
+    for episode in health_illness.episodes(conn):
+        if episode.level == "gap_only":
+            continue
+        if episode.start <= day <= episode.end:
+            return True
+    return False
+
+
+def _last_sick_day(
+    conn: sqlite3.Connection,
+    day: str,
+    health_digest,
+) -> str | None:
+    """Последний ``sick``-день строго до ``day`` (спека §5-бис, п.4).
+
+    Нужен как якорь рампы: после болезни ``k = 0`` потому, что отсчёт идёт от
+    последнего дня болезни, а не от конца разметки (хвост может быть длиннее
+    эпизода). ``sick``-день - это якорь (эпизод/флаг) **или** день хвоста.
+    Скан ограничен ``SICK_TAIL_MAX`` днями - как и сам хвост.
+    """
+    cursor = date_cls.fromisoformat(day) - timedelta(days=1)
+    for _ in range(SICK_TAIL_MAX):
+        iso = cursor.isoformat()
+        if _is_sick_anchor(conn, iso, health_digest):
+            return iso
+        if _sick_tail(conn, iso) is not None:
+            return iso       # день хвоста - тоже ``sick`` (спека п.4)
+        cursor -= timedelta(days=1)
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -386,6 +524,17 @@ def state_day(
 
     base.since_training = _since_training(conn, resolved)
 
+    # 5-бис. Sick-tail: разметка короче деривации. Если день не ``sick`` по
+    # разметке/флагу, но каналы держат после недавнего якоря - это ещё болезнь
+    # (живой кейс: эп-34 размечен одним днём, хвост закрывает 20.10).
+    if base.state != STATE_SICK:
+        anchor = _sick_tail(conn, resolved, gate)
+        if anchor is not None:
+            return StateDay(
+                day=resolved, state=STATE_SICK,
+                reason=f"хвост болезни (якорь {anchor})",
+                since_training=base.since_training)
+
     if base.state == STATE_RAMP:
         # Отсчёт рампы зависит от причины (§5.2). Рампа после окна тишины
         # считается от конца эпизода: дни болезни в счёт не идут. Рампа из-за
@@ -393,7 +542,11 @@ def state_day(
         if "просто" in base.reason:
             anchor = _last_training_before(conn, resolved)
         else:
-            anchor = _last_episode_end(conn, resolved)
+            # §5-бис п.4: после болезни k = 0, а болезнь - это последний
+            # ``sick``-день (разметка **или** хвост), а не конец разметки.
+            anchor = _last_sick_day(conn, resolved, health_digest)
+            if anchor is None:
+                anchor = _last_episode_end(conn, resolved)
             if anchor is None:
                 anchor = _last_training_before(conn, resolved)
         base.ramp_day = _ramp_completed(conn, resolved, anchor)
@@ -410,7 +563,9 @@ def state_day(
         base.ramp_target = ramp_target(conn, resolved, exercise)
     elif base.state == STATE_REST:
         # Пауза: счётчик сохраняется (число не показываем), но рампа идёт.
-        anchor = _last_episode_end(conn, resolved)
+        anchor = _last_sick_day(conn, resolved, health_digest)
+        if anchor is None:
+            anchor = _last_episode_end(conn, resolved)
         if anchor is not None:
             base.ramp_day = _ramp_completed(conn, resolved, anchor)
             base.ramp_days = RAMP_DAYS

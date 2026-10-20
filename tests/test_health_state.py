@@ -24,6 +24,7 @@ from datetime import date as date_cls
 from datetime import timedelta
 
 from koilog import core
+from koilog.health import digest
 from koilog.health import state
 
 
@@ -116,6 +117,25 @@ def _ready_nights(conn, days: list[str]) -> None:
     """Сделать указанные ночи «готовыми»: RHR и ВСР ровно на фоне (z ~ 0)."""
     for day in days:
         _night(conn, day, rhr=_RHR, hrv=_HRV)
+
+
+def _flat_night(conn, day: str) -> None:
+    """Ночь ровно на фоне по **всем** каналам (для тестов sick-tail).
+
+    ``_ready_nights`` трогает только RHR/ВСР, а экскурсии
+    ``_flat_physiology`` сдвигают ещё ``resp_rate`` и ``wrist_temp`` - это
+    дало бы лишнюю канальную причину и сломало бы «чистый» день.
+    """
+    conn.execute(
+        "UPDATE aw_daily SET rhr = ?, hrv_sdnn = ?, resp_rate = ?, "
+        "wrist_temp = ? WHERE date = ?",
+        (_RHR, _HRV, _RESP, _TEMP, day),
+    )
+
+
+def _flat_nights(conn, days: list[str]) -> None:
+    for day in days:
+        _flat_night(conn, day)
 
 
 def _spike(conn, days: list[str]) -> None:
@@ -298,6 +318,191 @@ class TransitionTests(unittest.TestCase):
         self.assertEqual(day.ramp_day, 0)
 
 
+class SickTailTests(unittest.TestCase):
+    """Хвост ``sick``: снятие только чистым гейтом (спека §5-бис, раунд 6).
+
+    Класс отказа: **разметка короче деривации**. Эпизод размечен одним днём,
+    физиология держится дольше, а проверка «активный эпизод» точная по дате.
+    Хвост продлевает ``sick``, пока каналы держат, и снимается **только**
+    положительным чистым свидетельством (две чистые ночи - гистерезис гейта).
+    """
+
+    def _setup(self) -> sqlite3.Connection:
+        conn = _db()
+        _flat_physiology(conn, "2023-12-01", 120)
+        conn.commit()
+        return conn
+
+    def test_tail_holds_after_one_day_episode(self):
+        """Эпизод один день + держащая ночь → следующий день ещё ``sick``."""
+        conn = self._setup()
+        self.addCleanup(conn.close)
+        _episode(conn, "2024-01-10", "2024-01-10", level="probable")
+        _night(conn, "2024-01-10", rhr=83.0, hrv=98.0)
+        conn.commit()
+        sick = state.state_day(conn, "2024-01-10")
+        self.assertEqual(sick.state, state.STATE_SICK)      # разметка
+        tail = state.state_day(conn, "2024-01-11")
+        self.assertEqual(tail.state, state.STATE_SICK)      # хвост
+        self.assertIn("хвост", tail.reason)
+
+    def test_tail_cleared_by_two_clean_nights(self):
+        """Две чистые ночи подряд - положительное свидетельство: хвост снят."""
+        conn = self._setup()
+        self.addCleanup(conn.close)
+        _episode(conn, "2024-01-10", "2024-01-10", level="probable")
+        _night(conn, "2024-01-10", rhr=83.0, hrv=98.0)
+        _flat_nights(conn, ["2024-01-11", "2024-01-12"])
+        conn.commit()
+        self.assertEqual(state.state_day(conn, "2024-01-10").state,
+                         state.STATE_SICK)
+        # 11.01: гейт ещё смотрит на держащую ночь 10.01 - держит.
+        self.assertEqual(state.state_day(conn, "2024-01-11").state,
+                         state.STATE_SICK)
+        # 13.01: обе ночи (11-12.01) чисты - гейт чист, хвост оборван.
+        after = state.state_day(conn, "2024-01-13")
+        self.assertEqual(after.state, state.STATE_RAMP)     # окно тишины
+        self.assertIn("окно тишины", after.reason)
+
+    def test_unanchored_derivation_is_rest_not_sick(self):
+        """Гейт держит, но якоря (эпизода/флага) до дня не было → ``rest``."""
+        conn = self._setup()
+        self.addCleanup(conn.close)
+        # Никакого эпизода: просто две ночи с высоким RHR.
+        _spike(conn, ["2024-01-10", "2024-01-11"])
+        conn.commit()
+        day = state.state_day(conn, "2024-01-11")
+        self.assertEqual(day.state, state.STATE_REST)
+        self.assertNotEqual(day.state, state.STATE_SICK)
+
+    def test_silence_window_does_not_extend_tail(self):
+        """Окно тишины (каналы чисты) хвост не продлевает (спека п.2)."""
+        conn = self._setup()
+        self.addCleanup(conn.close)
+        _episode(conn, "2024-01-10", "2024-01-10", level="probable")
+        # Обе ночи после эпизода чисты: каналы в фоне.
+        _flat_nights(conn, ["2024-01-11", "2024-01-12"])
+        conn.commit()
+        day = state.state_day(conn, "2024-01-13")
+        # Каналы чисты → не sick (хвост), а рампа по окну тишины.
+        self.assertEqual(day.state, state.STATE_RAMP)
+        self.assertIn("окно тишины", day.reason)
+
+    def test_ramp_anchor_is_last_sick_day(self):
+        """Якорь рампы после хвоста = последний ``sick``-день (спека п.4)."""
+        conn = self._setup()
+        self.addCleanup(conn.close)
+        _episode(conn, "2024-01-10", "2024-01-10", level="probable")
+        _night(conn, "2024-01-10", rhr=83.0, hrv=98.0)
+        # Хвост держится 11.01, чистится 12-13.01.
+        _flat_nights(conn, ["2024-01-12", "2024-01-13"])
+        # Тренировка **внутри** хвоста (11.01) не должна засчитываться в рампа:
+        # отсчёт идёт от последнего sick-дня, а не от конца разметки.
+        _train(conn, "2024-01-11")
+        conn.commit()
+        day = state.state_day(conn, "2024-01-14")
+        self.assertEqual(day.state, state.STATE_RAMP)
+        self.assertIn("окно тишины", day.reason)
+        self.assertEqual(day.ramp_day, 0)   # тренировка 11.01 - в sick-дне
+
+    def test_tail_scan_is_bounded(self):
+        """Скан ограничен ``SICK_TAIL_MAX``: демоция дня 8+ → ``rest`` (§5-бис).
+
+        ``SICK_TAIL_MAX`` — **глубина скана**, а не «время жизни хвоста»: на
+        ``MAX + 1``-й день непрерывной деривации якорь выходит за горизонт,
+        скан его не видит, и день становится ``rest`` (незаякоренный дериваж,
+        правило 3) — **не** ``normal``, пока гейт держит.
+        """
+        conn = self._setup()
+        self.addCleanup(conn.close)
+        _episode(conn, "2024-01-10", "2024-01-10", level="probable")
+        # Непрерывный дериваж: RHR высокий каждый день.
+        _spike(conn, _calendar("2024-01-10", 10))
+        conn.commit()
+        # Хвост держится до MAX - 1 дней включительно.
+        last_tail = date_cls.fromisoformat("2024-01-10") \
+            + timedelta(days=state.SICK_TAIL_MAX - 1)
+        self.assertEqual(state.state_day(conn, last_tail.isoformat()).state,
+                         state.STATE_SICK)
+        # День MAX + 1: якорь вне скана → rest (гейт держит), не normal.
+        beyond = date_cls.fromisoformat("2024-01-10") \
+            + timedelta(days=state.SICK_TAIL_MAX)
+        demoted = state.state_day(conn, beyond.isoformat())
+        self.assertEqual(demoted.state, state.STATE_REST)
+        self.assertNotEqual(demoted.state, state.STATE_NORMAL)
+
+    def test_unknown_gate_keeps_sick(self):
+        """«Нет данных ≠ чисто»: неоцениваемая ночь хвост **не** снимает."""
+        conn = self._setup()
+        self.addCleanup(conn.close)
+        _episode(conn, "2024-01-10", "2024-01-10", level="probable")
+        _night(conn, "2024-01-10", rhr=83.0, hrv=98.0)
+        # Убираем ночь 11.01 целиком: гейт неоцениваем (нет данных/фона).
+        conn.execute("DELETE FROM aw_daily WHERE date = '2024-01-11'")
+        conn.commit()
+        # Неоцениваемая ночь не является чистым свидетельством: 11.01 sick.
+        self.assertEqual(state.state_day(conn, "2024-01-11").state,
+                         state.STATE_SICK)
+
+    def test_day_after_sick_is_never_normal(self):
+        """Инвариант: сразу после ``sick`` не бывает ``normal`` (§5-бис).
+
+        Выход из болезни всегда через гейт: либо ``sick`` (хвост), либо
+        ``rest``/``ramp``, но не «можно по плану» на следующий день.
+        """
+        conn = self._setup()
+        self.addCleanup(conn.close)
+        _episode(conn, "2024-01-10", "2024-01-10", level="probable")
+        _night(conn, "2024-01-10", rhr=83.0, hrv=98.0)
+        conn.commit()
+        self.assertEqual(state.state_day(conn, "2024-01-10").state,
+                         state.STATE_SICK)
+        after = state.state_day(conn, "2024-01-11")
+        self.assertNotEqual(after.state, state.STATE_NORMAL)
+
+    def test_ep34_replica_stale_numbers(self):
+        """Реплика эп-34 с числами момента фиксации (RHR 83 / ВСР 98).
+
+        В базе кейса больше нет: выгрузка 20.10 задним числом уточнила ночь
+        19.10 (RHR 73, ВСР 65) и разметка честно сняла эпизод. Синтетика
+        сохраняет кейс воспроизводимым (дополнение к §5-бис от 20.10.2026).
+        z-ассерт ≈ +4.4 прибивает именно ту «деривацию при ВСР в фоне»,
+        которая маскировала болезнь.
+        """
+        conn = self._setup()
+        self.addCleanup(conn.close)
+        _episode(conn, "2024-01-10", "2024-01-10", level="probable")
+        _night(conn, "2024-01-10", rhr=83.0, hrv=98.0)
+        _flat_nights(conn, ["2024-01-11", "2024-01-12"])
+        conn.commit()
+        # Ночь фиксации: RHR высоко над фоном (z ≈ +4.4 на синтетике).
+        chans = {c.key: c for c in digest.channels(conn, "2024-01-10")}
+        self.assertGreater(chans["rhr"].z, 4.0)
+        self.assertEqual(state.state_day(conn, "2024-01-10").state,
+                         state.STATE_SICK)
+        self.assertEqual(state.state_day(conn, "2024-01-11").state,
+                         state.STATE_SICK)
+        self.assertEqual(state.state_day(conn, "2024-01-13").state,
+                         state.STATE_RAMP)
+
+    def test_revision_dissolves_episode_snapshot(self):
+        """Второй снапшот: уточнённая ночь растворяет эпизод (Что стало).
+
+        Числа момента ревизии (RHR 73 при ВСР 65): якоря нет, каналы держат
+        слабо → незаякоренный дериваж = ``rest``, не ``sick``. Это ровно
+        живая картина 19–20.10.2026 после выгрузки 20.10.
+        """
+        conn = self._setup()
+        self.addCleanup(conn.close)
+        # Уточнённые данные: RHR уже не «одиночный сильный сигнал»; эпизода
+        # нет вовсе (разметка сняла его), проверяем именно поведение машины.
+        _night(conn, "2024-01-11", rhr=73.0, hrv=65.0)
+        conn.commit()
+        day = state.state_day(conn, "2024-01-11")
+        self.assertEqual(day.state, state.STATE_REST)
+        self.assertNotEqual(day.state, state.STATE_SICK)
+
+
 class RampTargetTests(unittest.TestCase):
     """5a: целевой вес рампы - floor от 1RM (O2 = A)."""
 
@@ -310,6 +515,17 @@ class RampTargetTests(unittest.TestCase):
         """1RM ⇒ 42 ⇒ 40: ближайший доступный вес **не тяжелее**."""
         ladder = (20.0, 30.0, 40.0, 45.0, 50.0)
         self.assertEqual(core.snap_to_ladder(42.0, ladder), 40.0)
+
+    def test_snap_to_ladder_below_min_is_none(self):
+        """Краевой (§6): запись ниже минимума стека → ``None``, не минимум."""
+        ladder = (20.0, 30.0, 40.0)
+        self.assertIsNone(core.snap_to_ladder(10.0, ladder))
+        self.assertIsNone(core.snap_to_ladder(42.0, ()))   # пустой инвентарь
+
+    def test_snap_to_ladder_all_lighter_takes_heaviest(self):
+        """Обратный край: весь инвентарь легче записи → самый тяжёлый, не None."""
+        ladder = (20.0, 30.0, 40.0)
+        self.assertEqual(core.snap_to_ladder(100.0, ladder), 40.0)
 
     def test_ramp_target_rule_is_ramp_floor(self):
         conn = self._setup()
