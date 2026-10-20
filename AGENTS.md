@@ -56,7 +56,8 @@
 - `_SCHEMA` для `illness_episodes`, `illness_day`.
 
 ### `koilog/health/refresh.py` — единый шаг (ноутбуки + CLI)
-- `run(conn, deep=False, source=None)` — конвейер: **выгрузка → нагрузка → календарь → эпизоды → (ML при deep)**.
+- `run(conn, deep=False, source=None, journal=_DEFAULT_JOURNAL)` — конвейер: **журнал → выгрузка → нагрузка → календарь → эпизоды → (ML при deep)**.
+- **Журнал (`sets`)** — новая первая стадия: `journal.csv` грузится отдельным файлом от выгрузки часов, и без этой стадии свежая тренировка **молча не появлялась** в `sets` (ноутбук зовёт только `refresh`). Слепок `JOURNAL_KEY = "refresh_journal"` (`mtime:size`) в `aw_meta`; `_need_load_journal` скипает неизменённый файл. **Слепок пишется ПОСЛЕ часовой стадии** — `apple.write_apple` чистит `aw_meta`, слепок, поставленный первым, был бы стёрт. `journal=None`/`False` — журнала нет (чистый клон, тесты); sentinel `_DEFAULT_JOURNAL` → `etl.DEFAULT_JOURNAL`. В CLI: `refresh --journal PATH` / `refresh --no-journal`.
 - Парсинг XML (~45с) **скипается** по слепку: `_need_parse` сравнивает `mtime:size` источника с `aw_meta.refresh_source` (`REFRESH_KEY`). **Слепок пишется ТОЛЬКО после успешной записи** `aw_*` (если разбор упал — следующий прогон попробует снова).
 - **Guard (реализован в текущем раунде):** при `FileNotFoundError` от `resolve_source` — тихо работаем от БД без парсинга, стадия `выгрузка (нет файла — работаю от базы)`. Не ломает чистый клон.
 - `deep=True` — вызывает `ml.build_features`, `ml.build_labels` (стандартная библиотека), затем — если есть sklearn — стадию **`скор`**: `score.sync` — сев при пустом ledger'е (`score.replay`), иначе запись последнего дня (`score.record`). Стадия нужна именно в daily-шаге: запись в тот же день, когда исход ещё не известен (см. `score.py`).
@@ -128,7 +129,7 @@
 - `koilog/health/*` — свои `_SCHEMA` (aw_*, load_daily/health_days/test_days, illness_*, ml_*).
 
 ## 4. CLI
-- `koilog/cli.py` — команды: `load`, `apple-load`, `health-load`, `illness`, `ml`, `report`, `refresh` (флаги `--deep`, `--xml`), `digest` (`--date`, `--json`), `score` (`--date`, `--replay`, `--since`, `--last`, `--prospective`, `--model`, `--budget`, `--json`). `cmd_refresh` вызывает `health_refresh.run`. `--xml` задаёт источник; слепок (`refresh_source`) действует и для него (разбор только при изменении файла).
+- `koilog/cli.py` — команды: `load`, `apple-load`, `health-load`, `illness`, `ml`, `report`, `refresh` (флаги `--deep`, `--xml`, `--journal`, `--no-journal`), `digest` (`--date`, `--json`), `score` (`--date`, `--replay`, `--since`, `--last`, `--prospective`, `--model`, `--budget`, `--json`). `cmd_refresh` вызывает `health_refresh.run`. `--xml` задаёт источник часов, `--journal` — путь к журналу (`--no-journal` — не грузить); слепки (`refresh_source`, `refresh_journal`) действуют и для них (загрузка/разбор только при изменении файла).
 - `cmd_score`: без флагов — `sync` (сев при пустом ledger'е, иначе запись дня), печатает последние дни; `--replay` — сев истории; `--date` — `audit` (пересчёт без записи). `RuntimeError`/`sqlite3.OperationalError` (нет ML-таблиц / нет extra ml) ловятся → сообщение в stderr, код 1 (без трассировки).
 
 ## 5. Ноутбуки

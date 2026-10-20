@@ -316,8 +316,8 @@ class ReportParserTests(unittest.TestCase):
 class JournalParserTests(unittest.TestCase):
     def test_counts_match_db(self):
         rows = list(etl.load_journal(JOURNAL_CSV))
-        self.assertEqual(len(rows), 15415)
-        self.assertEqual(len({r.date for r in rows}), 942)
+        self.assertEqual(len(rows), 15428)
+        self.assertEqual(len({r.date for r in rows}), 943)
 
     def test_no_null_exercises(self):
         rows = list(etl.load_journal(JOURNAL_CSV))
@@ -924,9 +924,9 @@ class RealDataTests(unittest.TestCase):
         cls._dir.cleanup()
 
     def test_row_counts(self):
-        self.assertEqual(self.report.journal, 15415)
+        self.assertEqual(self.report.journal, 15428)
         self.assertEqual(self.report.report, 5544)
-        self.assertEqual(self.report.total, 20959)
+        self.assertEqual(self.report.total, 20972)
 
     def test_eleven_overlapping_dates_skipped(self):
         self.assertEqual(len(self.report.skipped_dates), 11)
@@ -936,9 +936,9 @@ class RealDataTests(unittest.TestCase):
     def test_history_is_contiguous(self):
         total = etl.summary(self.conn)["total"]
         self.assertEqual(total["first_day"], "2015-06-21")
-        self.assertEqual(total["last_day"], "2026-10-08")
-        self.assertEqual(total["days"], 1396)
-        self.assertEqual(total["sessions"], 2039)
+        self.assertEqual(total["last_day"], "2026-10-19")
+        self.assertEqual(total["days"], 1397)
+        self.assertEqual(total["sessions"], 2041)
 
     def test_every_exercise_mapped(self):
         self.assertEqual(etl.unmapped_exercises(self.conn), [])
@@ -994,7 +994,7 @@ class RealDataTests(unittest.TestCase):
     def test_export(self):
         target = Path(self._dir.name) / "out.csv"
         written = etl.export_csv(self.conn, target)
-        self.assertEqual(written, 20959)
+        self.assertEqual(written, 20972)
         text = target.read_text(encoding="utf-8-sig")
         self.assertIn("exercise_group", text.splitlines()[0])
         self.assertIn("ЖИМ ЛЁЖА", text)

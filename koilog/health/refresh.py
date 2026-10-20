@@ -19,14 +19,23 @@ from . import apple, illness
 from . import load as health_load
 from . import text as health_text
 
-__all__ = ["REFRESH_KEY", "Step", "run", "format_freshness"]
+#: Загружать журнал (``sets``) из файла по умолчанию; ``False`` / явный
+#: ``None`` - не грузить (чистый клон без ``data/journal.csv``, тесты).
+_DEFAULT_JOURNAL = object()
+
+__all__ = ["REFRESH_KEY", "JOURNAL_KEY", "Step", "run", "format_freshness"]
 
 #: Ключ слепка источника в ``aw_meta``: mtime + размер разобранного файла.
 #: Хранится там же, где ``export_date`` из самой выгрузки.
 REFRESH_KEY = "refresh_source"
 
+#: Ключ слепка загруженного журнала: mtime + размер ``journal.csv``. Отдельный
+#: от :data:`REFRESH_KEY`, потому что это другой источник и другой слепок.
+JOURNAL_KEY = "refresh_journal"
+
 #: Таблицы, по которым видна свежесть ряда, и колонка даты в каждой.
 _FRESHNESS: tuple[tuple[str, str], ...] = (
+    ("sets", "date"),
     ("aw_daily", "date"),
     ("load_daily", "date"),
     ("health_days", "date"),
@@ -42,6 +51,7 @@ class Step:
 
     deep: bool = False
     parsed: bool = False                     # разбирали ли выгрузку целиком
+    journal_loaded: bool = False             # грузили ли журнал (sets)
     source: Path | None = None               # откуда читали
     export_date: str | None = None           # export_date из выгрузки
     stages: list[str] = field(default_factory=list)
@@ -81,6 +91,18 @@ def _need_parse(conn: sqlite3.Connection, source: Path) -> bool:
     return _source_stamp(source) != _meta_get(conn, REFRESH_KEY)
 
 
+def _need_load_journal(conn: sqlite3.Connection, journal: Path) -> bool:
+    """Загружать ли журнал: если ``journal.csv`` изменился с прошлого шага.
+
+    Тот же принцип, что у :func:`_need_parse`, и та же дыра, которую он
+    закрывает: журнал (``sets``) приезжает **отдельным файлом** от выгрузки
+    часов, и без этой стадии свежая тренировка молча не появляется -
+    ноутбук печатает старую дату без ошибок. Слепок пишется только после
+    успешной загрузки.
+    """
+    return _source_stamp(journal) != _meta_get(conn, JOURNAL_KEY)
+
+
 def _freshness(conn: sqlite3.Connection) -> list[tuple[str, str | None]]:
     """Максимальная дата каждой таблицы - чтобы отставание было видно."""
     out = []
@@ -94,12 +116,65 @@ def _freshness(conn: sqlite3.Connection) -> list[tuple[str, str | None]]:
     return out
 
 
+def _load_journal(
+    conn: sqlite3.Connection,
+    journal: str | Path | None | object,
+    step: Step,
+) -> Path | None:
+    """Загрузить журнал (``sets``) в конвейер, если файл изменился.
+
+    Стадия **не добавляется**, если журнала нет или файл не менялся: иначе
+    чистый клон (и тест на выгрузке без журнала) получал бы звено, которого
+    не было. Порядок внутри конвейера - **первым**: ``load_daily`` и
+    ``illness`` читают ``sets``, и грузить журнал после них значило бы
+    пересобирать производные по старым данным.
+
+    ``journal`` = sentinel :data:`_DEFAULT_JOURNAL` → путь по умолчанию;
+    ``None``/``False`` → журнала нет.
+
+    **Слепок здесь не пишется.** ``aw_meta`` чистится при разборе выгрузки
+    часов (:func:`koilog.health.apple.write_apple`), а журнал идёт первым -
+    слепок, поставленный тут, был бы стёрт. Возвращаем путь, и :func:`run`
+    ставит слепок в конце, вместе с часовым.
+    """
+    if journal is _DEFAULT_JOURNAL:
+        from koilog import etl
+        path: Path | None = etl.DEFAULT_JOURNAL
+    elif not journal:
+        path = None
+    else:
+        path = Path(journal)
+
+    if path is None or not path.exists():
+        return None
+    if not _need_load_journal(conn, path):
+        step.stages.append("журнал (файл не менялся - скип)")
+        return None
+
+    from koilog import etl
+    report = etl.load_all(conn, journal=path, report=None)
+    etl.bodyweight_map(conn, None, fallback=etl.BODY_WEIGHT)
+    conn.commit()
+    step.journal_loaded = True
+    step.stages.append(f"журнал ({report.journal} подходов)")
+    return path
+
+
 def run(
     conn: sqlite3.Connection,
     deep: bool = False,
     source: str | Path | None = None,
+    journal: str | Path | None | object = _DEFAULT_JOURNAL,
 ) -> Step:
-    """Прогнать конвейер целиком: часы -> нагрузка -> эпизоды -> (-> ML).
+    """Прогнать конвейер целиком: журнал -> часы -> нагрузка -> эпизоды -> (-> ML).
+
+    ``journal`` - путь к ``journal.csv``; по умолчанию берётся
+    :data:`koilog.etl.DEFAULT_JOURNAL`, если файл есть. Явный ``None``
+    означает «журнала нет» (чистый клон, тесты) - стадия пропускается.
+    Загрузка скипается по слепку ``mtime:size``: как и разбор выгрузки часов,
+    она нужна только когда файл изменился. Без неё свежая тренировка молча
+    не появляется в ``sets`` - ровно то отставание, против которого написан
+    этот шаг.
 
     ``deep`` - пересобрать ML-блок: ``ml_features``/``ml_labels`` (чистая
     стандартная библиотека) и, если есть sklearn, **ledger дневного скора**
@@ -113,13 +188,16 @@ def run(
     базе засевает историю причинным воспроизведением, дальше добавляется
     только последний день.
     """
+    step = Step(deep=deep)
+    journal_path = _load_journal(conn, journal, step)
+
     resolved = None
     try:
         resolved = apple.resolve_source(source)
     except FileNotFoundError:
         resolved = None
 
-    step = Step(deep=deep, source=resolved.path if resolved else None)
+    step.source = resolved.path if resolved else None
 
     if resolved is None:
         step.stages.append("выгрузка (нет файла — работаю от базы)")
@@ -140,6 +218,13 @@ def run(
     if resolved is not None:
         step.stages.append("выгрузка" + (" (разобрана)" if step.parsed
                                          else " (файл не менялся - скип)"))
+
+    # Слепок журнала ставим теперь: `aw_meta` могла быть пересоздана разбором
+    # часов (`write_apple` чистит таблицу). К этому месту она уже на диске.
+    if journal_path is not None:
+        conn.execute("INSERT OR REPLACE INTO aw_meta VALUES (?, ?)",
+                     (JOURNAL_KEY, _source_stamp(journal_path)))
+        conn.commit()
 
     step.export_date = _meta_get(conn, "export_date")
 

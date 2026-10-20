@@ -724,10 +724,13 @@ def cmd_export(args: argparse.Namespace) -> int:
 
 
 def cmd_refresh(args: argparse.Namespace) -> int:
-    """Единый шаг конвейера: выгрузка -> нагрузка -> эпизоды -> (-> ML)."""
+    """Единый шаг конвейера: журнал -> выгрузка -> нагрузка -> эпизоды (-> ML)."""
     conn = _open(args)
+    journal = None if getattr(args, "no_journal", False) else (
+        getattr(args, "journal", None) or health_refresh._DEFAULT_JOURNAL)
     try:
-        step = health_refresh.run(conn, deep=args.deep, source=args.xml)
+        step = health_refresh.run(conn, deep=args.deep, source=args.xml,
+                                  journal=journal)
     finally:
         conn.close()
     print(health_refresh.format_freshness(step))
@@ -1072,14 +1075,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_export.set_defaults(func=cmd_export)
 
     p_refresh = sub.add_parser(
-        "refresh", help="весь конвейер разом: выгрузка -> нагрузка -> "
-                        "эпизоды (и ML-блок с --deep), с пропуском "
-                        "неизменённого архива")
+        "refresh", help="весь конвейер разом: журнал -> выгрузка -> нагрузка "
+                        "-> эпизоды (и ML-блок с --deep), с пропуском "
+                        "неизменённых файлов")
     p_refresh.add_argument("--deep", action="store_true",
                            help="пересобрать и ML-блок (ml_features, ml_labels)")
     p_refresh.add_argument("--xml", default=None,
                            help="путь к выгрузке (по умолчанию самый свежий "
                                 "архив в data/)")
+    p_refresh.add_argument("--journal", default=None,
+                           help="путь к журналу (по умолчанию data/journal.csv)")
+    p_refresh.add_argument("--no-journal", action="store_true",
+                           help="не грузить журнал вовсе (только часы)")
     p_refresh.set_defaults(func=cmd_refresh)
 
     p_apple = sub.add_parser(
