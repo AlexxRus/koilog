@@ -37,11 +37,13 @@ __all__ = [
     "TIMED_EXERCISES",
     "UNKNOWN",
     "Group",
+    "Mode",
     "WeightMode",
     "counts_rm_of",
     "group_of",
     "is_bodyweight_based",
     "lookup",
+    "mode_of",
     "normalize",
     "unmapped",
     "weight_mode_of",
@@ -51,6 +53,28 @@ __all__ = [
 # --------------------------------------------------------------------------
 # Режим записи веса
 # --------------------------------------------------------------------------
+
+
+class Mode(StrEnum):
+    """Режим нагрузки группы: какая метрика у неё каноническая (E1, D11-a=E).
+
+    Режим — это **не** способ записи веса (:class:`WeightMode`) и не
+    ``equipment``: это ответ на вопрос «чем измеряется нагрузка». Задан
+    **явно** на каждой группе, а не выведен из флагов, чтобы новую группу
+    нельзя было завести, забыв режим (``Group`` требует его).
+
+    ``IRON``
+        Железо: есть вес, каноническая метрика — тоннаж (``weight*reps``).
+    ``BODYWEIGHT``
+        Своё тело: вес тела/жилет, метрика — **подходы** (тоннаж
+        систематически обнуляется: ``weight`` пуст или телесный).
+    ``CARDIO``
+        Кардио: метрика — **время** и дистанция, тоннаж 0 по построению.
+    """
+
+    IRON = "iron"
+    BODYWEIGHT = "bodyweight"
+    CARDIO = "cardio"
 
 
 class WeightMode(StrEnum):
@@ -95,6 +119,7 @@ class Group:
     weight_mode: WeightMode = WeightMode.ABSOLUTE
     timed: bool = False
     counts_rm: bool = True
+    mode: Mode = Mode.IRON
 
 
 # --------------------------------------------------------------------------
@@ -115,18 +140,20 @@ GROUPS: Mapping[str, Group] = {
         Group("ТРИЦЕПС", "штанга / гантели / своё тело"),
         Group("ДЕЛЬТЫ", "гантели / тренажёр"),
         Group("СВЕДЕНИЕ", "тренажёр"),
-        Group("ОТЖИМАНИЯ", "своё тело", WeightMode.VEST_ONLY),
+        Group("ОТЖИМАНИЯ", "своё тело", WeightMode.VEST_ONLY,
+              mode=Mode.BODYWEIGHT),
         Group("ПЛЕЧИ И ТРАПЕЦИЯ", "гантели"),
         Group("ПРЕСС", "своё тело / тренажёр", WeightMode.VEST_ONLY,
-              counts_rm=False),
+              counts_rm=False, mode=Mode.BODYWEIGHT),
         Group("ПОДЪЁМ НОГ", "своё тело", WeightMode.VEST_ONLY,
-              counts_rm=False),
+              counts_rm=False, mode=Mode.BODYWEIGHT),
         Group("ПЛАНКА", "своё тело", WeightMode.VEST_ONLY, timed=True,
-              counts_rm=False),
+              counts_rm=False, mode=Mode.BODYWEIGHT),
         Group("БЁДРА И ЗАДНЯЯ ЦЕПЬ", "тренажёр / гантели / своё тело"),
         Group("ИКРЫ", "гантели"),
         Group("КИСТИ", "штанга"),
-        Group("КАРДИО", "—", WeightMode.ABSOLUTE, timed=True, counts_rm=False),
+        Group("КАРДИО", "—", WeightMode.ABSOLUTE, timed=True,
+              counts_rm=False, mode=Mode.CARDIO),
     )
 }
 
@@ -472,6 +499,31 @@ def _canonical_name(key: str) -> str:
 def is_bodyweight_based(name: str | None) -> bool:
     """Упражнение выполняется на собственном теле (с жилетом или без)."""
     return weight_mode_of(name) is not WeightMode.ABSOLUTE
+
+
+def mode_of(name: str | None) -> Mode | None:
+    """Режим нагрузки упражнения (E1, D11-a=E): железо / своё тело / кардио.
+
+    Единственная точка ветвления для погрупповой аналитики (``health.groups``).
+    Режим выводится **кодом** из таксономии, а не хранится ручной колонкой:
+
+    * имя не в словаре → ``None`` (**не** тихий дефолт «железо»): агрегат
+      обязан упасть со списком имён, а не отнести неизвестное к ветке;
+    * запись веса конкретного имени не ``ABSOLUTE`` (переопределение или
+      группа) → ``BODYWEIGHT``. Это держит смешанные группы честными:
+      ``Приседания`` (жилет) и ``Подтягивания`` (суммарный вес тела) уходят в
+      «своё тело», хотя их группы — железо;
+    * иначе берётся ``Group.mode`` (кардио помечено на группе явно).
+
+    Ровно один режим на упражнение: функция детерминирована, а двухрежимность
+    (напр. и железо, и своё тело) — отдельная развилка, а не молчаливый выбор.
+    """
+    group = group_of(name)
+    if group is UNKNOWN:
+        return None
+    if weight_mode_of(name) is not WeightMode.ABSOLUTE:
+        return Mode.BODYWEIGHT
+    return group.mode
 
 
 def counts_rm_of(name: str | None) -> bool:

@@ -34,6 +34,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import date as date_cls
 
+from . import groups as health_groups
 from . import illness as health_illness
 from . import load as health_load
 from . import retrain as health_retrain
@@ -418,8 +419,36 @@ def day_state(conn: sqlite3.Connection, today: str | None = None,
         "state": day.to_dict(),
         "score": score,
         "spec_warning": spec_warning(conn, spec),
+        "groups": groups_state(conn, resolved),
         "recommendation": recommendation,
     }
+
+
+def groups_state(conn: sqlite3.Connection, day: str | None = None) -> dict:
+    """Погрупповая нагрузка для E-строки (E2/E4) — **только описательная**.
+
+    Считает rolling-7 по каждой подветке **(группа × режим)** с ``n_days``.
+    Решение дня это не меняет (D11-b=A): дайджест рендерит строку поверх
+    состояния, а не через него. Неопознанные имена не роняют дайджест — они
+    возвращаются отдельно для честного предупреждения (гейт-стоп E1 — на уровне
+    агрегата). Мёртвая подветка смешанной группы видна (пустой ряд → «—»), но
+    не прячется.
+    """
+    unknown = health_groups.unknown_groups(conn)
+    from .. import taxonomy
+
+    rows = []
+    for group in taxonomy.GROUPS:
+        if group == taxonomy.UNKNOWN.name:
+            continue
+        modes = health_groups.modes_in_group(conn, group)
+        if not modes:
+            # Группы нет в текущей истории вовсе — не засоряем строку.
+            continue
+        for mode in modes:
+            agg = health_groups.aggregate(conn, group, mode, day)
+            rows.append(agg)
+    return {"rows": rows, "unknown": unknown}
 
 
 def format_digest(state: dict) -> str:
@@ -471,6 +500,10 @@ def format_digest(state: dict) -> str:
     if day:
         lines.append("состояние: " + _state_line(day))
 
+    groups = state.get("groups") or {}
+    if groups:
+        lines.append(_groups_line(groups))
+
     score = state.get("score")
     if score is not None and score.get("score") is not None:
         tail = _score_tail(score, day)
@@ -514,6 +547,37 @@ def _state_line(day: dict) -> str:
     if day.get("state") == "sick" and day.get("reason"):
         return f"{label} — {day['reason']}"
     return label
+
+
+def _groups_line(groups: dict) -> str:
+    """Описательная E-строка (E4 v1): числа и ``n_days``, без порогов/стрелок.
+
+    Никаких интерпретационных меток: порог в рендере — контрабанда решения,
+    прямо против E4 «решение не меняет». Метрика даётся по ветке (тоннаж /
+    подходы / время), единица — как в базе.
+    """
+    rows = groups.get("rows") or []
+    if not rows:
+        return "по группам: нет данных"
+    units = {"tonnage": "кг", "sets": "подх.", "seconds": "с"}
+    parts = []
+    for row in rows:
+        metric = row["metric"]
+        value = row["value"]
+        mode = row["mode"]
+        if value is None:
+            # Мёртвая/тонкая подветка: «—», одно правило для обеих (§2.5).
+            shown = "—"
+        else:
+            shown = f"{value:.0f} {units.get(metric, metric)}"
+        parts.append(
+            f"{row['group'].lower()}/{mode.value} {shown} (n={row['n_days']})"
+        )
+    line = "по группам: " + "; ".join(parts)
+    unknown = groups.get("unknown") or []
+    if unknown:
+        line += f"; не опознано: {', '.join(unknown)}"
+    return line
 
 
 def _score_tail(score: dict, day: dict) -> str:
