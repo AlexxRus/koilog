@@ -39,11 +39,16 @@ from .text import table
 __all__ = [
     "CONFIRMED_TEMP",
     "GAP_MIN_DAYS",
+    "GATE_Z_TAIL",
+    "SPAN_MIN_DAYS",
+    "TAIL_LEVEL",
+    "TAIL_MAX",
     "Episode",
     "breach_matrix",
     "build",
     "core_strong",
     "episodes",
+    "extend_tails",
     "find_gaps",
     "merge_episodes",
     "summarize",
@@ -56,6 +61,24 @@ CONFIRMED_TEMP = 37.5
 
 #: Минимальная длина перерыва в журнале, чтобы он считался «перерывом».
 GAP_MIN_DAYS = 14
+
+#: Порог z-скора «держащего» канала для хвоста разметки (4.1). Совпадает с
+#: гейтом возврата (``retrain.GATE_Z``): односторонне держат RHR выше фона,
+#: ВСР ниже фона и высокая t запястья. Хвост - это **разметка**, а не решение.
+GATE_Z_TAIL = 1.0
+
+#: Минимальная длина серии «держащих» ночей сразу за ``end``, чтобы продлить
+#: эпизод (4.1). Равна порогу гейта ``retrain.GATE_NIGHTS = 2``: одиночная
+#: ночь - фоновый шум, не сигнал.
+SPAN_MIN_DAYS = 2
+
+#: Предохранитель обратного/прямого скана хвоста (4.1). Равен
+#: ``state.SICK_TAIL_MAX`` (7). Держится в тестах ``test_health_illness``
+#: дрифт-гардом, чтобы label-хвост и state-хвост не расползались.
+TAIL_MAX = 7
+
+#: Метка дня-хвоста: разметки нет, поэтому уровень эпизода не повышается.
+TAIL_LEVEL = "watch_tail"
 
 #: z-пороги сигнатуры часов (подтверждённый уровень).
 Z_RHR = 2.0
@@ -279,6 +302,93 @@ def _max_level(left: str, right: str) -> str:
     return left if _LEVEL_ORDER[left] >= _LEVEL_ORDER[right] else right
 
 
+def _holding_day(
+    rhr_z: float | None,
+    hrv_z: float | None,
+    temp_z: float | None,
+) -> bool:
+    """Держит ли ночь один из каналов гейта (односторонне, 4.1).
+
+    Совпадает с правилом ``retrain.baseline_gate``: RHR z > +1, ВСР z < −1
+    или t запястья z > 2.5. Низкий RHR и высокая ВСР **не** держат.
+    """
+    if rhr_z is not None and rhr_z > GATE_Z_TAIL:
+        return True
+    if hrv_z is not None and hrv_z < -GATE_Z_TAIL:
+        return True
+    if temp_z is not None and temp_z > Z_TEMP:
+        return True
+    return False
+
+
+def holding_days(conn: sqlite3.Connection, window: str | None) -> set[str]:
+    """Дни, где канал гейта «держит» (для хвоста разметки, 4.1).
+
+    Читает те же ``aw_daily`` и те же личные z-скоры, что и ``baseline_gate``
+    (общий :func:`zscore`), поэтому «держит» здесь = «держит» в гейте.
+    """
+    rows = _daily_rows(conn, window)
+    z_rhr = zscore([r["rhr"] for r in rows])
+    z_hrv = zscore([r["hrv_sdnn"] for r in rows])
+    z_temp = zscore([r["wrist_temp"] for r in rows])
+    out: set[str] = set()
+    for index, row in enumerate(rows):
+        if _holding_day(z_rhr[index], z_hrv[index], z_temp[index]):
+            out.add(row["date"])
+    return out
+
+
+def extend_tails(
+    episodes: list["Episode"],
+    holding: set[str],
+    span_min: int = SPAN_MIN_DAYS,
+    tail_max: int = TAIL_MAX,
+) -> list[dict]:
+    """Продлить эпизоды «держащим» хвостом сразу за ``end`` (4.1, чистая).
+
+    Класс отказа «разметка короче деривации»: за маркированным ``end`` может
+    идти серия ночей, где канал гейта держит, но разметки нет. Хвост
+    **продлевает** эпизод, но не повышает его уровень (дни получают
+    ``TAIL_LEVEL``, см. :data:`TAIL_LEVEL`).
+
+    Правила (зафиксированы в пререге §9.3):
+    - берётся **непрерывная** серия ``end+1 …`` из дней ``holding``;
+    - длина серии усекается до ``tail_max``;
+    - **предохранитель слияния:** хвост режется до ``разрыв − 1`` (не имеет
+      права достигнуть ``start`` следующего эпизода); если усечённый остаток
+      ``< span_min`` — хвост отбрасывается **целиком**;
+    - если серия короче ``span_min`` — хвоста нет.
+
+    Возвращает список ``{"index", "id", "end", "days"}`` по фактически
+    продлённым эпизодам (``days`` — список добавленных дней-хвостов).
+    """
+    order = sorted(range(len(episodes)), key=lambda i: episodes[i].start)
+    extended: list[dict] = []
+    for pos, i in enumerate(order):
+        episode = episodes[i]
+        # «разрыв − 1»: сколько дней до start следующего эпизода допустимо.
+        limit = tail_max
+        if pos + 1 < len(order):
+            nxt = episodes[order[pos + 1]]
+            gap = (date_cls.fromisoformat(nxt.start)
+                   - date_cls.fromisoformat(episode.end)).days
+            limit = min(limit, gap - 1)
+        if limit < span_min:
+            continue
+        days: list[str] = []
+        current = date_cls.fromisoformat(episode.end)
+        for _ in range(limit):
+            current = current + timedelta(days=1)
+            if current.isoformat() not in holding:
+                break
+            days.append(current.isoformat())
+        if len(days) < span_min:
+            continue
+        extended.append({"index": i, "id": episode.id,
+                         "end": episode.end, "days": days})
+    return extended
+
+
 @dataclass(slots=True)
 class Episode:
     """Эпизод болезни: интервал, уровень, источник, тип."""
@@ -427,6 +537,15 @@ def build(conn: sqlite3.Connection, window: str | None = health_load.DEFAULT_WIN
     gap_levels = _gap_levels(gaps, levels, deviations)
     episodes = merge_episodes(levels, gaps, gap_levels)
 
+    # 4.1: продлить эпизоды «держащим» хвостом сразу за end (класс отказа
+    # «разметка короче деривации»). Уровень эпизода не повышается; дни-хвост
+    # идут в illness_day с TAIL_LEVEL и тем же episode_id. end сдвигается -
+    # от него зависит окно тишины в state.py (без правки state.py).
+    holding = holding_days(conn, window)
+    tails = {item["index"]: item["days"] for item in extend_tails(episodes, holding)}
+    for index, days in tails.items():
+        episodes[index].end = days[-1]
+
     manual = _manual(conn)
     conn.execute("DELETE FROM illness_day")
     conn.execute("DELETE FROM illness_episodes")
@@ -444,10 +563,11 @@ def build(conn: sqlite3.Connection, window: str | None = health_load.DEFAULT_WIN
         current = date_cls.fromisoformat(episode.start)
         stop = date_cls.fromisoformat(episode.end)
         while current <= stop:
+            tail = (index - 1) in tails and current.isoformat() in tails[index - 1]
             conn.execute(
                 "INSERT OR REPLACE INTO illness_day (date, level, episode_id) "
                 "VALUES (?, ?, ?)",
-                (current.isoformat(), episode.level, index),
+                (current.isoformat(), TAIL_LEVEL if tail else episode.level, index),
             )
             current += timedelta(days=1)
     conn.commit()
