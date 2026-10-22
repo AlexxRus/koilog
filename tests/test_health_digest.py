@@ -425,18 +425,28 @@ class DayStateTests(unittest.TestCase):
         self.assertNotIn("внимание:", digest.format_digest(state))
 
     def test_spec_warning_when_history_not_reseeded(self):
-        """Рецептура сменилась, а история ещё старого винта - карточка скажет."""
+        """Рецептура сменилась, а история старого винта - карточка скажет.
+
+        Контракт формулировки (N-2, вариант B): сообщение информационное -
+        хэши спек, числа дней, причина отсутствия канона; совета
+        «нужен полный replay» в нём нет.
+        """
         conn = self._score_db()
         self.addCleanup(conn.close)
         state = digest.day_state(conn, "2024-01-30", spec="spec00000009")
-        self.assertIn("не пересеяна", state["spec_warning"])
+        note = state["spec_warning"]
+        self.assertIn("spec00000009", note)
+        self.assertIn("spec00000001", note)
+        self.assertIn("1 дн без канона", note)
+        self.assertNotIn("нужен", note)
+        self.assertNotIn("не пересеяна", note)
         self.assertIn("внимание:", digest.format_digest(state))
-        # без текущей спеки видно только смешение винтов, а о пока одной строке
-        # сообщать не о чем
+        # без текущей спеки канон - самая свежая запись ledger'а: смешать тут
+        # нечего, и сообщать не о чем
         self.assertIsNone(digest.spec_warning(conn))
 
     def test_spec_warning_mixed_vintages_in_canonical_series(self):
-        """Смесь винтов в каноническом ряду ловится и без текущей спеки."""
+        """Смесь винтов в ledger'е ловится и без текущей спеки."""
         conn = self._score_db()
         self.addCleanup(conn.close)
         conn.execute(
@@ -446,12 +456,13 @@ class DayStateTests(unittest.TestCase):
             "'spec00000002', 40, 6, '2024-01-24', 0.75, 0)")
         conn.commit()
         note = digest.spec_warning(conn)
-        self.assertIn("смешана", note)
         self.assertIn("spec00000001", note)
         self.assertIn("spec00000002", note)
+        self.assertIn("винтаж", note)
+        self.assertIn("1 дн без канона", note)
 
     def test_spec_warning_mixed_vintages_wins_over_current(self):
-        """При смешанных винтах важнее сказать про смесь, чем про current."""
+        """При смешанных винтах названы все рецептуры, а не только текущая."""
         conn = self._score_db()
         self.addCleanup(conn.close)
         conn.execute(
@@ -460,7 +471,11 @@ class DayStateTests(unittest.TestCase):
             "VALUES ('2024-01-25', '2024-01-25', '2024-01-25T20:00:00', 0.4, "
             "'spec00000002', 40, 6, '2024-01-24', 0.75, 0)")
         conn.commit()
-        self.assertIn("смешана", digest.spec_warning(conn, current="spec00000009"))
+        note = digest.spec_warning(conn, current="spec00000009")
+        self.assertIn("spec00000001", note)
+        self.assertIn("spec00000002", note)
+        self.assertIn("spec00000009", note)
+        self.assertIn("2 дн без канона", note)
 
 
 class GateBandTests(unittest.TestCase):

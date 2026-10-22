@@ -341,12 +341,16 @@ class LedgerTests(unittest.TestCase):
         self.assertIsNone(score.threshold(conn, "deadbeef", "2024-03-10"))
 
     def test_spec_warning_clean_after_replay_then_on_vintage_mix(self):
-        """Сев даёт один винт под текущей спекой; подмешанный винт виден."""
+        """Сев даёт один винт под текущей спекой; подмешанный винт виден.
+
+        Важное следствие решения N-2 (вариант B): чужой винт **не становится**
+        каноном, даже если записан позже (append-only побеждал по ``MAX(id)``) -
+        канон определяется спекой, а не порядком записи.
+        """
         conn = _prepared()
         self.assertIsNone(score.spec_warning(conn))    # таблицы ещё нет
         score.replay(conn)
         self.assertIsNone(score.spec_warning(conn))    # ряд = текущая рецептура
-        # чужой винт становится каноническим (append-only: побеждает MAX(id))
         day = conn.execute("SELECT MAX(day) FROM ml_score").fetchone()[0]
         conn.execute(
             "INSERT INTO ml_score (day, as_of, computed_at, score, spec_hash, "
@@ -355,7 +359,21 @@ class LedgerTests(unittest.TestCase):
             "'2024-02-09', 0.7, 0)",
             (day, day))
         conn.commit()
-        self.assertIn("смешана", score.spec_warning(conn))
+        note = score.spec_warning(conn)
+        self.assertIn("deadbeef", note)
+        self.assertIn("винтаж", note)
+        current = score.spec_hash()
+        self.assertIn(current, note)
+        # канон дня остался под текущей спекой
+        rows = conn.execute(
+            "SELECT spec_hash FROM ml_score WHERE day = ? ORDER BY id DESC LIMIT 1",
+            (day,)).fetchone()[0]
+        self.assertEqual(rows, "deadbeef")     # по порядку записи - винт
+        canonical = score.rows(conn, spec=current)
+        self.assertTrue(canonical)
+        for item in canonical:
+            self.assertEqual(item["spec_hash"], current)
+            self.assertFalse(item["vintage"])
 
     def test_prospective_uses_computed_at(self):
         conn = _prepared()

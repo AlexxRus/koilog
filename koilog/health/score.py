@@ -416,18 +416,22 @@ def audit(
     return payload
 
 
-def prospective(conn: sqlite3.Connection, spec: str | None = None) -> list[str]:
-    """Дни, записанные до того, как исход стал известен.
+def _prospective_pairs(
+    conn: sqlite3.Connection,
+    spec: str | None = None,
+) -> list[tuple[str, str]]:
+    """Проспективные строки ledger'а как пары (день, спека).
 
-    Строка проспективна, если она записана раньше, чем определился исход дня:
-    раньше onset'а, если эпизод попал в окно ``(день, день + H_ONSET]``, иначе
-    раньше закрытия окна (``день + H_ONSET``). Первый сев (:func:`replay`)
-    пишет всю историю **после** исходов, поэтому канонические строки сева
-    проспективными не считаются - и это правило, а не совпадение.
+    Пара нужна, потому что одна и та же дата может лежать под двумя
+    спеками, и «проспективность» - свойство строки, а не дня.
     """
     if not _has_table(conn, "ml_score"):
         return []
-    starts = sorted(episode.start for episode in health_illness.episodes(conn)
+    try:
+        episodes = health_illness.episodes(conn)
+    except sqlite3.OperationalError:      # эпизодов ещё нет (чистый клон)
+        episodes = []
+    starts = sorted(episode.start for episode in episodes
                     if episode.level != "gap_only")
     out = []
     for row in _canonical(conn, spec=spec):
@@ -438,8 +442,20 @@ def prospective(conn: sqlite3.Connection, spec: str | None = None) -> list[str]:
         deadline = onset if (onset is not None and onset <= edge) else edge
         stamp = (row["computed_at"] or "")[:10]
         if stamp and stamp < deadline:
-            out.append(day)
+            out.append((day, row["spec_hash"]))
     return out
+
+
+def prospective(conn: sqlite3.Connection, spec: str | None = None) -> list[str]:
+    """Дни, записанные до того, как исход стал известен.
+
+    Строка проспективна, если она записана раньше, чем определился исход дня:
+    раньше onset'а, если эпизод попал в окно ``(день, день + H_ONSET]``, иначе
+    раньше закрытия окна (``день + H_ONSET``). Первый сев (:func:`replay`)
+    пишет всю историю **после** исходов, поэтому канонические строки сева
+    проспективными не считаются - и это правило, а не совпадение.
+    """
+    return [day for day, _ in _prospective_pairs(conn, spec=spec)]
 
 
 def rows(
@@ -447,17 +463,26 @@ def rows(
     limit: int | None = None,
     prospective_only: bool = False,
     spec: str | None = None,
+    current: str | None = None,
 ) -> list[dict]:
-    """Канонические строки ledger'а (последние ``limit``) плюс ``prospective``."""
+    """Строки ledger'а: последняя на каждый (день, спека), с пометкой винтажа.
+
+    Канон - строки **текущей** спеки (``current``; по умолчанию - рецептура
+    :func:`spec_hash`). Строки других рецептур остаются читаемыми, но
+    помечены ``vintage``: ни в канон, ни в порог они не входят (N-2,
+    вариант B). Поэтому в выводе винтаж виден, но не выдаётся за число дня.
+    """
     if not _has_table(conn, "ml_score"):
         return []
     try:
         items = _canonical(conn, spec=spec)
     except sqlite3.OperationalError:      # дорелизная схема до миграции
         return []
-    mark = set(prospective(conn, spec=spec))
+    canon = current or spec_hash()
+    mark = set(_prospective_pairs(conn, spec=spec))
     for item in items:
-        item["prospective"] = item["day"] in mark
+        item["prospective"] = (item["day"], item["spec_hash"]) in mark
+        item["vintage"] = item["spec_hash"] != canon
     if prospective_only:
         items = [item for item in items if item["prospective"]]
     if limit is not None:
@@ -471,12 +496,14 @@ def spec_warning(
     model: str = "logreg",
     min_history: int = health_ml.MIN_HISTORY,
 ) -> str | None:
-    """Канонический ряд записан не по текущей спеке (или смешан по винтам).
+    """Состав ledger'а по спекам: канон, винтаж, дни без канона (N-2, B).
 
     Тонкость вызывающего слоя над :func:`koilog.health.digest.spec_warning`:
-    здесь считается **текущий** ``spec_hash``, а сравнение уже SQL по ledger'у.
-    Печатается в ``score`` и в карточке дайджеста, чтобы винты не смешались
-    незаметно - см. :func:`rows`.
+    здесь считается **текущий** ``spec_hash``, а разбор ledger'а - SQL.
+    Сообщение информационное (хэши, числа дней, причина отсутствия канона);
+    совета «нужен полный replay» в нём нет - для хвостов эпизодов он
+    невыполним. Печатается в ``score`` и в карточке дайджеста, чтобы винты
+    не смешались незаметно - см. :func:`rows`.
     """
     return health_digest.spec_warning(
         conn, current=spec_hash(features, model, min_history))
@@ -538,10 +565,15 @@ def format_scores(items: list[dict], empty: str | None = None) -> str:
             "—" if item.get("n_train") is None
             else f"{item['n_train']}/{item.get('n_pos')}",
             (item.get("computed_at") or "")[:10],
+            "винтаж" if item.get("vintage") else "—",
         ])
-    text = table(("дата", "скор", "порог", "решение", "трейн", "записано"), body)
+    text = table(("дата", "скор", "порог", "решение", "трейн", "записано",
+                  "винтаж"), body)
     if any(item.get("prospective") for item in items):
         text += "\n* проспективная запись (исход ещё не был известен)"
+    if any(item.get("vintage") for item in items):
+        text += ("\n«винтаж» - строка записана по другой спецификации скора: "
+                 "в канон и порог не входит")
     return text
 
 

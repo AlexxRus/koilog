@@ -939,7 +939,9 @@ def cmd_score(args: argparse.Namespace) -> int:
                              else None)
                     print(health_score.format_scores(
                         health_score.rows(conn, limit=args.last,
-                                          prospective_only=args.prospective),
+                                          prospective_only=args.prospective,
+                                          current=health_score.spec_hash(
+                                              model=args.model)),
                         empty=empty))
                 return 0
 
@@ -956,7 +958,9 @@ def cmd_score(args: argparse.Namespace) -> int:
             return 1
 
         items = health_score.rows(conn, limit=args.last,
-                                  prospective_only=args.prospective)
+                                  prospective_only=args.prospective,
+                                  current=health_score.spec_hash(
+                                      model=args.model))
         if args.json:
             print(health_score.dumps({"summary": summary, "rows": items}))
             return 0

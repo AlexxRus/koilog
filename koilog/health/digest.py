@@ -318,26 +318,43 @@ def recommend(
     return _recommend_from_state(state, score)
 
 
-def _score_row(conn: sqlite3.Connection, day: str | None) -> dict | None:
+def _newest_spec(conn: sqlite3.Connection) -> str | None:
+    """Спека самой свежей строки ledger'а: текущая рецептура по факту записи."""
+    rows = _query(conn, "SELECT spec_hash FROM ml_score ORDER BY id DESC LIMIT 1")
+    return rows[0][0] if rows else None
+
+
+def _score_row(conn: sqlite3.Connection, day: str | None,
+               spec: str | None = None) -> dict | None:
     """Канонический скор дня из ledger'а ``ml_score`` (:mod:`...score`).
 
-    Читается **последняя** строка дня (ledger append-only), а если
-    строки за сам день нет (день внутри эпизода модель не оценивает) - берётся
-    ближайшая прошлая: карточка тогда показывает последний честный скор с
-    датой, а не пустоту. Здесь намеренно нет импорта ``score`` - иначе
+    Канон - последняя строка дня **под текущей спекой** (N-2, вариант B).
+    Строка, записанная по другой рецептуре, - винтаж: она невоспроизводима
+    (счёт по другому рецепту) и ни в канон, ни в порог не входит. Поэтому
+    день, у которого нет строки под текущей спекой, показывает ближайший
+    **каноничный** день с его датой, а не число винтажа.
+
+    Если строки за сам день нет (день внутри эпизода модель не оценивает) -
+    берётся ближайшая прошлая: карточка тогда показывает последний честный
+    скор с датой, а не пустоту. Здесь намеренно нет импорта ``score`` - иначе
     получилось бы кольцо (``score`` зовёт :func:`recommend`), а вся нужная
     информация лежит в таблице.
     """
     if day is None:
         return None
+    canon = spec or _newest_spec(conn)
+    if canon is None:
+        return None
     rows = _query(
         conn,
         "SELECT s.day, s.score, s.threshold, s.alert, s.as_of, s.computed_at, "
         "s.spec_hash "
-        "FROM ml_score s WHERE s.day <= ? AND s.score IS NOT NULL "
-        "AND s.id = (SELECT MAX(id) FROM ml_score WHERE day = s.day) "
+        "FROM ml_score s WHERE s.spec_hash = ? AND s.day <= ? "
+        "AND s.score IS NOT NULL "
+        "AND s.id = (SELECT MAX(id) FROM ml_score x WHERE x.day = s.day "
+        "AND x.spec_hash = s.spec_hash) "
         "ORDER BY s.day DESC LIMIT 1",
-        (day,),
+        (canon, day),
     )
     if not rows:
         return None
@@ -353,39 +370,86 @@ def _score_row(conn: sqlite3.Connection, day: str | None) -> dict | None:
     }
 
 
-def spec_warning(conn: sqlite3.Connection, current: str | None = None) -> str | None:
-    """Предупреждение, если канонический ряд ``ml_score`` не по одной спеке.
+def _ledger_specs(conn: sqlite3.Connection) -> list[tuple[str, int]]:
+    """Дни под каждой спекой ledger'а (последняя строка на день+спека)."""
+    return _query(
+        conn,
+        "SELECT spec_hash, COUNT(DISTINCT day) FROM ml_score s "
+        "WHERE s.id = (SELECT MAX(id) FROM ml_score x WHERE x.day = s.day "
+        "AND x.spec_hash = s.spec_hash) "
+        "GROUP BY spec_hash ORDER BY 2 DESC, 1",
+    )
 
-    Смена рецепта (признаки / модель / правило меток) даёт новый
-    ``spec_hash``, а ledger append-only - старые строки не уходят. Если
-    историю под новой спекой не пересеяли (частичный ``replay``,
-    прямой ``record``), канонический ряд складывается из винтов разных
-    рецептов, и сравнение дней между собой (порог, тренд, recall) уже не
-    легитимно. Отдельный случай - ``current``: строка дня записана по
-    другой спеке, чем текущая рецептура, то есть показывается число,
-    посчитанное другой моделью.
+
+def _orphan_days(conn: sqlite3.Connection, canon: str) -> int:
+    """Дни ledger'а, для которых нет строки под канонической спекой."""
+    rows = _query(
+        conn,
+        "SELECT COUNT(*) FROM (SELECT DISTINCT day FROM ml_score "
+        "EXCEPT SELECT DISTINCT day FROM ml_score WHERE spec_hash = ?)",
+        (canon,),
+    )
+    return rows[0][0] if rows else 0
+
+
+def _orphan_reason(conn: sqlite3.Connection, canon: str) -> str:
+    """Почему у этих дней нет канона: хвосты эпизодов или что-то другое.
+
+    Дни внутри эпизода помечены ``at_risk = 0``, и текущий рецепт их не
+    оценивает вовсе - ни одна пересевка их не накроет. Если все «без канона»
+    именно такие, причина названа прямо; иначе - общая формулировка.
+    """
+    total = _orphan_days(conn, canon)
+    if not total:
+        return ""
+    rows = _query(
+        conn,
+        "SELECT COUNT(*) FROM ml_features WHERE at_risk = 0 AND date IN ("
+        "SELECT DISTINCT day FROM ml_score "
+        "EXCEPT SELECT DISTINCT day FROM ml_score WHERE spec_hash = ?)",
+        (canon,),
+    )
+    zero = rows[0][0] if rows else 0
+    if zero == total:
+        return ("хвосты эпизодов: at_risk = 0 - рецепт их не оценивает, "
+                "replay неприменим")
+    return "дни вне текущего рецепта"
+
+
+def spec_warning(conn: sqlite3.Connection, current: str | None = None) -> str | None:
+    """Состав ledger'а скора: канон, винтаж и дни без канона (N-2, вариант B).
+
+    Канон - строки **текущей** спеки; строки других рецептур остаются
+    читаемыми, но помечены винтаж и в канон и порог не входят. Сообщение
+    информационное: факты (хэши спек, числа дней, причина отсутствия канона)
+    и никакого совета «нужен полный replay» - для хвостов эпизодов он
+    невыполним, их не оценивает ни одна рецептура.
 
     Проверка - чистым SQL, без импорта ``score``/``ml`` (иначе кольцо:
     ``score`` зовёт :func:`recommend`); ``current`` подставляет вызывающий.
     """
-    rows = _query(
-        conn,
-        "SELECT spec_hash, COUNT(DISTINCT day) FROM ml_score s "
-        "WHERE s.id = (SELECT MAX(id) FROM ml_score WHERE day = s.day) "
-        "GROUP BY spec_hash ORDER BY 2 DESC, 1",
-    )
-    if not rows:
+    specs = _ledger_specs(conn)
+    if not specs:
         return None
-    if len(rows) > 1:
-        mix = ", ".join(f"{count} дн по {spec}" for spec, count in rows)
-        return (f"спека скора смешана: {len(rows)} винта ({mix}) - "
-                f"цифры разных дней несопоставимы, нужен полный "
-                f"replay под новой спекой")
-    stored = rows[0][0]
-    if current is not None and stored != current:
-        return (f"спека скора: история записана по {stored}, а текущая "
-                f"рецептура {current} - история ещё не пересеяна")
-    return None
+    canon = current or _newest_spec(conn)
+    if canon is None:
+        return None
+    days = dict(specs)
+    canon_days = days.get(canon, 0)
+    vintage = [(spec, count) for spec, count in specs if spec != canon]
+    orphans = _orphan_days(conn, canon)
+    if not vintage and not orphans:
+        return None
+    parts = [f"канон скора — спека {canon}"
+             + (f" ({canon_days} дн)" if canon_days else " (строк нет)")]
+    if vintage:
+        parts.append("винтаж: " + ", ".join(f"{spec} ({count} дн)"
+                                            for spec, count in vintage))
+    if orphans:
+        reason = _orphan_reason(conn, canon)
+        parts.append(f"{orphans} дн без канона"
+                     + (f" ({reason})" if reason else ""))
+    return "; ".join(parts)
 
 
 def day_state(conn: sqlite3.Connection, today: str | None = None,
@@ -408,7 +472,7 @@ def day_state(conn: sqlite3.Connection, today: str | None = None,
         elif load.get("available"):
             resolved = load["date"]
     gate = health_retrain.baseline_gate(conn, resolved)
-    score = _score_row(conn, resolved)
+    score = _score_row(conn, resolved, spec)
     day = health_state.state_day(conn, resolved)
     recommendation = _recommend_from_state(day, score)
     return {
