@@ -287,6 +287,7 @@ class LoadReport:
     report: int
     skipped_dates: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    overrides: list[str] = field(default_factory=list)
 
     @property
     def total(self) -> int:
@@ -836,6 +837,107 @@ class FeedShapeError(ValueError):
     """
 
 
+class FeedShrinkError(RuntimeError):
+    """Фид короче уже загруженного: загрузка останавливается до ``DELETE``.
+
+    Инвариант роста (W7 §1): полный экспорт может только расти. Легитимное
+    падение (вендорская ревизия, ручная чистка) требует явного
+    ``--allow-incomplete-feed`` - громко, с записью в отчёт и в ``aw_meta``.
+    """
+
+
+@dataclass(slots=True)
+class FeedCoverage:
+    """Сколько строк и какой диапазон дат занимает источник."""
+
+    source: str
+    rows: int
+    first_day: str | None = None
+    last_day: str | None = None
+
+    def describe(self) -> str:
+        count = self.rows
+        if count % 10 == 1 and count % 100 != 11:
+            word = "строка"
+        elif count % 10 in (2, 3, 4) and count % 100 not in (12, 13, 14):
+            word = "строки"
+        else:
+            word = "строк"
+        return f"{count} {word} ({self.first_day}..{self.last_day})"
+
+
+def db_coverage(conn: sqlite3.Connection, source: str) -> FeedCoverage:
+    """Покрытие источника уже лежащими в базе строками."""
+    row = conn.execute(
+        "SELECT COUNT(*), MIN(date), MAX(date) FROM sets WHERE source = ?",
+        (source,),
+    ).fetchone()
+    return FeedCoverage(
+        source=source, rows=row[0] or 0, first_day=row[1], last_day=row[2]
+    )
+
+
+def rows_coverage(rows: list["SetRow"], source: str) -> FeedCoverage:
+    """Покрытие по уже разобранным строкам (без обращения к базе)."""
+    return FeedCoverage(
+        source=source,
+        rows=len(rows),
+        first_day=min((r.date for r in rows), default=None),
+        last_day=max((r.date for r in rows), default=None),
+    )
+
+
+def guard_completeness(
+    conn: sqlite3.Connection,
+    source: str,
+    rows: list["SetRow"],
+    allow_incomplete: bool = False,
+) -> list[str]:
+    """Проверить инвариант роста фида; вернуть записи об обходе.
+
+    Фид может только расти: ``n_new >= n_old``, начало истории не двигается
+    вперёд, хвост - назад. Иначе :class:`FeedShrinkError` **до** ``DELETE``.
+    Пустая база (первая загрузка) не проверяется: сравнивать не с чем.
+
+    ``allow_incomplete=True`` не отменяет проверку, а пропускает её громко:
+    возвращает строку-запись об обходе, которую вызывающий печатает и
+    сохраняет.
+    """
+    before = db_coverage(conn, source)
+    if not before.rows:
+        return []
+
+    after = rows_coverage(rows, source)
+    problems: list[str] = []
+    if after.rows < before.rows:
+        problems.append(f"строк стало меньше: {before.rows} -> {after.rows}")
+    if before.first_day and after.first_day and after.first_day > before.first_day:
+        problems.append(
+            "начало истории отъехало вперёд: "
+            f"{before.first_day} -> {after.first_day}"
+        )
+    if before.last_day and after.last_day and after.last_day < before.last_day:
+        problems.append(
+            "хвост истории отъехал назад: "
+            f"{before.last_day} -> {after.last_day}"
+        )
+    if not problems:
+        return []
+
+    message = (
+        f"фид источника {source!r} короче уже загруженного "
+        f"({before.describe()} -> {after.describe()}): "
+        + "; ".join(problems)
+    )
+    if not allow_incomplete:
+        raise FeedShrinkError(
+            message
+            + ". Если усечение осознанное (вендорская ревизия), перезапустите "
+            "с --allow-incomplete-feed"
+        )
+    return [message + " (обойдено: --allow-incomplete-feed)"]
+
+
 @dataclass(slots=True)
 class FeedShape:
     """Что показала проверка формы фида (W7-(d))."""
@@ -851,6 +953,7 @@ class FeedShape:
     bad_dates: int = 0            # записей с нечитаемой датой
     note_rows: int = 0            # строки-заметки: нет упражнения
     warnings: list[str] = field(default_factory=list)
+    overrides: list[str] = field(default_factory=list)  # обход через флаг
 
     @property
     def blank_share(self) -> float:
@@ -859,7 +962,11 @@ class FeedShape:
         return self.blank_records / self.physical_lines
 
 
-def check_feed(path: str | os.PathLike, source: str = SOURCE_JOURNAL) -> FeedShape:
+def check_feed(
+    path: str | os.PathLike,
+    source: str = SOURCE_JOURNAL,
+    allow_incomplete: bool = False,
+) -> FeedShape:
     """Проверить форму фида журнала; вернуть предупреждения.
 
     Четыре яруса заголовка (``docs/feed-contract-spec.md`` §7-бис, решение 4):
@@ -875,6 +982,11 @@ def check_feed(path: str | os.PathLike, source: str = SOURCE_JOURNAL) -> FeedSha
     монотонность дат, плотность пустых записей, нечитаемые даты в середине,
     строки-заметки (у них нет упражнения - это штатная форма канона).
 
+    ``allow_incomplete=True`` (``--allow-incomplete-feed``) снимает abort-
+    проверки формы, записывая каждую в ``overrides``: вызывающий обязан
+    показать её громко. Warn флагом не управляются. Флаг не делает файл
+    разбираемым: ``load_journal`` всё равно потребует читаемый заголовок.
+
     Проверка читает файл целиком: 1.4 МБ канона - это единицы миллисекунд,
     а ``load_journal`` и так разбирает его построчно.
     """
@@ -888,26 +1000,41 @@ def check_feed(path: str | os.PathLike, source: str = SOURCE_JOURNAL) -> FeedSha
     reader = csv.reader(io.StringIO(text), delimiter=";")
     header = next(reader, None)
     if header is None or not any(field.strip() for field in header):
-        raise FeedShapeError(
-            f"фид {path} пуст: нет ни заголовка, ни строк данных"
+        if not allow_incomplete:
+            raise FeedShapeError(
+                f"фид {path} пуст: нет ни заголовка, ни строк данных"
+            )
+        shape = FeedShape(
+            source=source, path=str(path), header=(),
+            physical_lines=physical_lines,
         )
+        shape.overrides.append(
+            f"фид {path} пуст: нет ни заголовка, ни строк данных "
+            "(обойдено: --allow-incomplete-feed)"
+        )
+        return shape
 
     names = tuple(field.strip() for field in header)
     upper = tuple(field.upper() for field in names)
-    if len(names) != len(JOURNAL_COLUMNS):
-        raise FeedShapeError(
-            f"у фида {path} {len(names)} колонок вместо {len(JOURNAL_COLUMNS)}: "
-            f"{names!r}"
-        )
-    if upper[:4] != JOURNAL_COLUMNS[:4]:
-        raise FeedShapeError(f"неожиданный заголовок журнала: {header!r}")
-
     shape = FeedShape(
         source=source,
         path=str(path),
         header=names,
         physical_lines=physical_lines,
     )
+    if len(names) != len(JOURNAL_COLUMNS):
+        message = (
+            f"у фида {path} {len(names)} колонок вместо "
+            f"{len(JOURNAL_COLUMNS)}: {names!r}"
+        )
+        if not allow_incomplete:
+            raise FeedShapeError(message)
+        shape.overrides.append(message + " (обойдено: --allow-incomplete-feed)")
+    if upper[:4] != JOURNAL_COLUMNS[:4]:
+        message = f"неожиданный заголовок журнала: {header!r}"
+        if not allow_incomplete:
+            raise FeedShapeError(message)
+        shape.overrides.append(message + " (обойдено: --allow-incomplete-feed)")
 
     if upper != JOURNAL_COLUMNS:
         differ = [
@@ -939,9 +1066,14 @@ def check_feed(path: str | os.PathLike, source: str = SOURCE_JOURNAL) -> FeedSha
         if not anchored:
             # Якорь семантики: первая запись данных обязана читаться.
             if day is None:
-                raise FeedShapeError(
+                message = (
                     f"первая строка данных фида {path} не даёт дату: "
                     f"{raw_date!r}"
+                )
+                if not allow_incomplete:
+                    raise FeedShapeError(message)
+                shape.overrides.append(
+                    message + " (обойдено: --allow-incomplete-feed)"
                 )
             anchored = True
 
@@ -1242,6 +1374,7 @@ def load_all(
     body_weight: float = BODY_WEIGHT,
     journal_wins: bool = True,
     bodyweight_by_year: dict[int, float] | None = None,
+    allow_incomplete_feed: bool = False,
 ) -> LoadReport:
     """Загрузить обе выгрузки в ``sets`` и пересчитать метрики.
 
@@ -1253,6 +1386,14 @@ def load_all(
     у меня нет». А вот указанный путь, которого нет на диске, - это ошибка,
     и она поднимается: молча пропустить его значило бы пересобрать базу
     в пустую и отчитаться об успехе.
+
+    **Контракт фида (W7).** До первой записи в базу проверяются форма журнала
+    (:func:`check_feed`, warn/abort) и полнота обоих источников
+    (:func:`guard_completeness`: фид может только расти). Нарушение полноты -
+    :class:`FeedShrinkError` до ``DELETE``: усечённый фид не должен молча
+    стирать историю. ``allow_incomplete_feed=True`` (флаг CLI
+    ``--allow-incomplete-feed``) не отменяет проверку, а пропускает её громко:
+    каждая поблажка попадает в ``LoadReport.overrides``.
 
     **Два прохода по весу тела.** Первый проход кладёт строки с константой
     ``body_weight``, чтобы получить в базе вообще всё, включая записи
@@ -1275,13 +1416,18 @@ def load_all(
 
     fit_rows: list[SetRow] = []
     warnings: list[str] = []
+    feed_overrides: list[str] = []
     if journal is not None:
-        # Порядок W7: форма и разбор - ДО первой записи в базу. Прежний код
-        # удалял источник, а уже потом разбирал файл: любая ошибка разбора
-        # (заголовок, дата) оставляла базу без этого источника.
-        shape = check_feed(journal, SOURCE_JOURNAL)
+        # Порядок W7: форма, разбор и гард полноты - ДО первой записи в базу.
+        # Прежний код удалял источник, а уже потом разбирал файл: любая ошибка
+        # разбора (заголовок, дата) оставляла базу без этого источника.
+        shape = check_feed(journal, SOURCE_JOURNAL, allow_incomplete_feed)
         warnings.extend(shape.warnings)
+        feed_overrides.extend(shape.overrides)
         fit_rows = list(load_journal(journal, body_weight))
+        feed_overrides.extend(
+            guard_completeness(conn, SOURCE_JOURNAL, fit_rows, allow_incomplete_feed)
+        )
 
     report_rows: list[SetRow] = []
     skipped: list[str] = []
@@ -1293,6 +1439,9 @@ def load_all(
         skipped = overlap
         report_rows = list(
             load_workoutreport(report, body_weight, skip_dates=overlap)
+        )
+        feed_overrides.extend(
+            guard_completeness(conn, SOURCE_REPORT, report_rows, allow_incomplete_feed)
         )
 
     # Полная перезагрузка источника, а не дозапись. Ключ строки -
@@ -1316,6 +1465,7 @@ def load_all(
         report=len(report_rows),
         skipped_dates=skipped,
         warnings=warnings,
+        overrides=feed_overrides,
     )
 
 

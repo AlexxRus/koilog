@@ -167,19 +167,31 @@ class OrderTests(unittest.TestCase):
         self.assertEqual(self._journal_rows(), before)
 
     def test_warnings_reach_the_report(self):
+        # Флаг: фид-реверс меньше прежнего, и это не суть теста - проверяются
+        # предупреждения формы. Гард полноты проверяется в test_etl_feed_guard.
         report = etl.load_all(self.conn, journal=FEEDS / "journal_reversed.csv",
-                              report=None)
+                              report=None, allow_incomplete_feed=True)
         self.assertTrue(any("не по возрастанию" in w for w in report.warnings))
 
     def test_clean_feed_reports_no_warnings(self):
         self.assertEqual(self.report.warnings, [])
 
-    def test_a_smaller_feed_replaces_the_source(self):
-        """Полная замена: строк стало меньше - и это видно в отчёте."""
-        report = etl.load_all(self.conn, journal=FEEDS / "journal_truncated.csv",
-                              report=None)
-        self.assertEqual(report.journal, 2)
-        self.assertEqual(len(self._journal_rows()), 2)
+    def test_a_different_feed_replaces_the_source(self):
+        """Замена, а не дозапись: прежних строк источника не остаётся."""
+        path = write_tmp(
+            HEADER + "\n"
+            "01.01.20;10:00;Тренировка;Жим гантелей;0;20;x;;8;90;;\n"
+            "01.01.20;10:00;Тренировка;Жим гантелей;0;20;x;;8;90;;\n"
+            "01.01.20;10:00;Тренировка;Тяга верхнего блока;0;50;x;;8;90;;\n"
+            "03.01.20;10:00;Тренировка;Жим гантелей;0;20;x;;8;90;;\n"
+        )
+        try:
+            report = etl.load_all(self.conn, journal=path, report=None)
+        finally:
+            path.unlink()
+        self.assertEqual(report.journal, 4)
+        exercises = {row[2] for row in self._journal_rows()}
+        self.assertEqual(exercises, {"Жим гантелей", "Тяга верхнего блока"})
 
 
 @unittest.skipUnless((ROOT / "data" / "journal.csv").exists(),

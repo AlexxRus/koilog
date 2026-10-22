@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import apple, illness
@@ -23,7 +24,8 @@ from . import text as health_text
 #: ``None`` - не грузить (чистый клон без ``data/journal.csv``, тесты).
 _DEFAULT_JOURNAL = object()
 
-__all__ = ["REFRESH_KEY", "JOURNAL_KEY", "Step", "run", "format_freshness"]
+__all__ = ["REFRESH_KEY", "JOURNAL_KEY", "FEED_OVERRIDE_KEY", "Step", "run",
+           "format_freshness"]
 
 #: Ключ слепка источника в ``aw_meta``: mtime + размер разобранного файла.
 #: Хранится там же, где ``export_date`` из самой выгрузки.
@@ -32,6 +34,11 @@ REFRESH_KEY = "refresh_source"
 #: Ключ слепка загруженного журнала: mtime + размер ``journal.csv``. Отдельный
 #: от :data:`REFRESH_KEY`, потому что это другой источник и другой слепок.
 JOURNAL_KEY = "refresh_journal"
+
+#: Ключ маркера обхода контракта фида (``--allow-incomplete-feed``): время
+#: обхода, слепок файла и что именно обойдено. Пишется рядом со слепком
+#: журнала, потому что обход - свойство того же файла и того же прогона.
+FEED_OVERRIDE_KEY = "feed_override"
 
 #: Таблицы, по которым видна свежесть ряда, и колонка даты в каждой.
 _FRESHNESS: tuple[tuple[str, str], ...] = (
@@ -57,6 +64,7 @@ class Step:
     stages: list[str] = field(default_factory=list)
     freshness: list[tuple[str, str | None]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    overrides: list[str] = field(default_factory=list)
 
 
 def _source_stamp(path: Path | None) -> str | None:
@@ -121,6 +129,7 @@ def _load_journal(
     conn: sqlite3.Connection,
     journal: str | Path | None | object,
     step: Step,
+    allow_incomplete_feed: bool = False,
 ) -> Path | None:
     """Загрузить журнал (``sets``) в конвейер, если файл изменился.
 
@@ -131,7 +140,9 @@ def _load_journal(
     пересобирать производные по старым данным.
 
     ``journal`` = sentinel :data:`_DEFAULT_JOURNAL` → путь по умолчанию;
-    ``None``/``False`` → журнала нет.
+    ``None``/``False`` → журнала нет. ``allow_incomplete_feed`` уходит в
+    :func:`koilog.etl.load_all` и снимает abort-проверки контракта фида;
+    каждый обход попадает в :attr:`Step.overrides` и в маркер ``aw_meta``.
 
     **Слепок здесь не пишется.** ``aw_meta`` чистится при разборе выгрузки
     часов (:func:`koilog.health.apple.write_apple`), а журнал идёт первым -
@@ -153,11 +164,15 @@ def _load_journal(
         return None
 
     from koilog import etl
-    report = etl.load_all(conn, journal=path, report=None)
+    report = etl.load_all(
+        conn, journal=path, report=None,
+        allow_incomplete_feed=allow_incomplete_feed,
+    )
     etl.bodyweight_map(conn, None, fallback=etl.BODY_WEIGHT)
     conn.commit()
     step.journal_loaded = True
     step.warnings.extend(report.warnings)
+    step.overrides.extend(report.overrides)
     step.stages.append(f"журнал ({report.journal} подходов)")
     return path
 
@@ -167,6 +182,7 @@ def run(
     deep: bool = False,
     source: str | Path | None = None,
     journal: str | Path | None | object = _DEFAULT_JOURNAL,
+    allow_incomplete_feed: bool = False,
 ) -> Step:
     """Прогнать конвейер целиком: журнал -> часы -> нагрузка -> эпизоды -> (-> ML).
 
@@ -189,9 +205,16 @@ def run(
     перезаписи - см. :mod:`koilog.health.score`). Первый прогон на чистой
     базе засевает историю причинным воспроизведением, дальше добавляется
     только последний день.
+
+    ``allow_incomplete_feed`` - осознанный обход контракта фида журнала
+    (``--allow-incomplete-feed``): снимает abort-проверки полноты и формы.
+    Обход громкий: строка в :func:`format_freshness` и маркер
+    :data:`FEED_OVERRIDE_KEY` в ``aw_meta`` рядом со слепком файла.
     """
     step = Step(deep=deep)
-    journal_path = _load_journal(conn, journal, step)
+    journal_path = _load_journal(
+        conn, journal, step, allow_incomplete_feed=allow_incomplete_feed
+    )
 
     resolved = None
     try:
@@ -226,6 +249,21 @@ def run(
     if journal_path is not None:
         conn.execute("INSERT OR REPLACE INTO aw_meta VALUES (?, ?)",
                      (JOURNAL_KEY, _source_stamp(journal_path)))
+        if step.overrides:
+            # Обход контракта фида - отдельный маркер рядом со слепком: по
+            # нему потом видно, что ряд в этом месте собран поверх усечения,
+            # и когда это было. Слепок тот же, что у журнала, - файл один.
+            stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            conn.execute(
+                "INSERT OR REPLACE INTO aw_meta VALUES (?, ?)",
+                (FEED_OVERRIDE_KEY,
+                 f"{stamp} | {_source_stamp(journal_path)} | "
+                 + " ; ".join(step.overrides)),
+            )
+        else:
+            # Журнал перечитан без обхода: прежний маркер описывает уже не
+            # то, что лежит в базе, и жить дальше не должен.
+            conn.execute("DELETE FROM aw_meta WHERE key = ?", (FEED_OVERRIDE_KEY,))
         conn.commit()
 
     step.export_date = _meta_get(conn, "export_date")
@@ -267,6 +305,8 @@ def format_freshness(step: Step) -> str:
     lines = [f"обновление: {', '.join(step.stages)}"]
     for warning in step.warnings:
         lines.append(f"внимание: {warning}")
+    for line in step.overrides:
+        lines.append(f"обход контракта фида: {line}")
     if step.export_date:
         lines.append(f"выгрузка от {step.export_date}")
     body = health_text.table(("таблица", "дата"), list(step.freshness))

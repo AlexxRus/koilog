@@ -216,8 +216,15 @@ def cmd_load(args: argparse.Namespace) -> int:
             body_weight=fallback,
             journal_wins=not args.report_wins,
             bodyweight_by_year=overrides or None,
+            allow_incomplete_feed=args.allow_incomplete_feed,
         )
         applied = etl.bodyweight_map(conn, overrides or None, fallback=fallback)
+        # Громкие строки - до ``--quiet``: тихий режим гасит отчёт, но не
+        # предупреждения и уж точно не обход контракта фида.
+        for warning in report.warnings:
+            print(f"внимание: {warning}", file=sys.stderr)
+        for line in report.overrides:
+            print(f"обход контракта фида: {line}", file=sys.stderr)
         if args.quiet:
             print(f"{report.total}")
             return 0
@@ -227,8 +234,6 @@ def cmd_load(args: argparse.Namespace) -> int:
         if report.skipped_dates:
             print(f"пропущено дат из отчёта: {len(report.skipped_dates)} "
                   f"(есть в журнале): {', '.join(report.skipped_dates)}")
-        for warning in report.warnings:
-            print(f"внимание: {warning}", file=sys.stderr)
         print()
         _print_bodyweight(applied)
         _print_summary(conn)
@@ -732,7 +737,8 @@ def cmd_refresh(args: argparse.Namespace) -> int:
         getattr(args, "journal", None) or health_refresh._DEFAULT_JOURNAL)
     try:
         step = health_refresh.run(conn, deep=args.deep, source=args.xml,
-                                  journal=journal)
+                                  journal=journal,
+                                  allow_incomplete_feed=args.allow_incomplete_feed)
     finally:
         conn.close()
     print(health_refresh.format_freshness(step))
@@ -973,6 +979,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="при совпадении дат брать отчёт, а не журнал (по умолчанию "
              "журнал)",
     )
+    p_load.add_argument(
+        "--allow-incomplete-feed", action="store_true",
+        help="разрешить усечённый фид: снять abort-проверки контракта "
+             "(полнота и семантика заголовка). Каждый обход печатается и "
+             "попадает в отчёт; только для осознанной вендорской ревизии",
+    )
     p_load.add_argument("--quiet", action="store_true",
                         help="вывести только количество подходов")
     p_load.set_defaults(func=cmd_load)
@@ -1096,6 +1108,12 @@ def build_parser() -> argparse.ArgumentParser:
                            help="путь к журналу (по умолчанию data/journal.csv)")
     p_refresh.add_argument("--no-journal", action="store_true",
                            help="не грузить журнал вовсе (только часы)")
+    p_refresh.add_argument(
+        "--allow-incomplete-feed", action="store_true",
+        help="разрешить усечённый фид журнала: снять abort-проверки "
+             "контракта (полнота и семантика заголовка). Каждый обход "
+             "печатается, попадает в отчёт и в маркер aw_meta",
+    )
     p_refresh.set_defaults(func=cmd_refresh)
 
     p_apple = sub.add_parser(

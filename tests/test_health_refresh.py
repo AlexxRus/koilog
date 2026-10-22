@@ -245,6 +245,34 @@ class RefreshJournalTests(unittest.TestCase):
         step = self._run()  # второй прогон: журнал не перезагружается
         self.assertIn("скип", step.stages[0])
 
+    def test_override_marker_records_the_bypass(self):
+        """Обход контракта фида виден дважды: в шаге и в ``aw_meta``."""
+        self.journal.write_text(_JOURNAL_NEXT_DAY, encoding="utf-8")
+        self._run()                                    # 2 подхода в базе
+        self.journal.write_text(_JOURNAL, encoding="utf-8")  # усечённый фид
+        step = self._run(allow_incomplete_feed=True)
+
+        self.assertTrue(step.overrides)
+        self.assertIn("обход контракта фида", refresh.format_freshness(step))
+        marker = refresh._meta_get(self.conn, refresh.FEED_OVERRIDE_KEY)
+        self.assertIsNotNone(marker)
+        self.assertIn("--allow-incomplete-feed", marker)
+        rows = self.conn.execute("SELECT COUNT(*) FROM sets").fetchone()[0]
+        self.assertEqual(rows, 1)
+
+    def test_clean_reload_clears_the_override_marker(self):
+        self.journal.write_text(_JOURNAL_NEXT_DAY, encoding="utf-8")
+        self._run()
+        self.journal.write_text(_JOURNAL, encoding="utf-8")
+        self._run(allow_incomplete_feed=True)
+        self.assertIsNotNone(
+            refresh._meta_get(self.conn, refresh.FEED_OVERRIDE_KEY))
+
+        self.journal.write_text(_JOURNAL_NEXT_DAY, encoding="utf-8")
+        self._run()        # рост, без флага: гард молчит
+        self.assertIsNone(
+            refresh._meta_get(self.conn, refresh.FEED_OVERRIDE_KEY))
+
     def test_missing_journal_adds_no_stage(self):
         self.journal.unlink()
         step = self._run()
