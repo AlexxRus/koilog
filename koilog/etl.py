@@ -286,6 +286,7 @@ class LoadReport:
     journal: int
     report: int
     skipped_dates: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def total(self) -> int:
@@ -813,6 +814,165 @@ def _journal_session_id(day: str, clock: str | None, index: int) -> str:
     return f"{day}#{index}"
 
 
+#: Канонический заголовок журнала: 12 колонок. Первые четыре - структурные
+#: (без них разбор невозможен), остальные - именами, потому что парсинг
+#: позиционный (W7 §7-бис, решение 4).
+JOURNAL_COLUMNS = (
+    "ДАТА", "ВРЕМЯ", "ТРЕНИРОВКА", "УПРАЖНЕНИЕ", "ДИСТАНЦИЯ КМ", "ВЕС",
+    "МНОЖИТЕЛЬ", "ВРЕМЯ", "ПОВТОРЫ", "ОТДЫХ", "ПРОПУЩЕН", "ПРИМЕЧАНИЯ",
+)
+
+#: Порог предупреждения о пустых записях: доля физических строк. Канон - 0%,
+#: улика ``broken-reversed`` - 9.1%; порыв 1% даёт запас на разовые пустые.
+BLANK_RECORD_WARN_SHARE = 0.01
+
+
+class FeedShapeError(ValueError):
+    """Фид не той формы: загрузка останавливается **до** ``DELETE``.
+
+    Наследуется от :class:`ValueError`, потому что прежний контракт
+    ``load_journal`` поднимал именно его на неожиданном заголовке: внешний
+    код, ловивший ``ValueError``, продолжает работать.
+    """
+
+
+@dataclass(slots=True)
+class FeedShape:
+    """Что показала проверка формы фида (W7-(d))."""
+
+    source: str
+    path: str
+    header: tuple[str, ...]
+    records: int = 0              # все записи после заголовка (с пустыми)
+    data_records: int = 0         # непустые записи
+    blank_records: int = 0        # пустые записи-разделители
+    physical_lines: int = 0
+    inversions: int = 0           # дат, идущих назад
+    bad_dates: int = 0            # записей с нечитаемой датой
+    note_rows: int = 0            # строки-заметки: нет упражнения
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def blank_share(self) -> float:
+        if not self.physical_lines:
+            return 0.0
+        return self.blank_records / self.physical_lines
+
+
+def check_feed(path: str | os.PathLike, source: str = SOURCE_JOURNAL) -> FeedShape:
+    """Проверить форму фида журнала; вернуть предупреждения.
+
+    Четыре яруса заголовка (``docs/feed-contract-spec.md`` §7-бис, решение 4):
+
+    i.   заголовка нет (пустой файл или первая строка - уже данные) - **abort**;
+    ii.  число колонок не равно каноническому - **abort**;
+    iii. имена колонок другие при том же числе - **warn** (парсинг
+         позиционный, буквальное совпадение имён не требуется);
+    iv.  дата первой строки данных не парсится - **abort** (чужой экспорт с
+         тем же числом колонок, но другим порядком).
+
+    Остальное - **warn**, потому что семантику загрузки не меняет:
+    монотонность дат, плотность пустых записей, нечитаемые даты в середине,
+    строки-заметки (у них нет упражнения - это штатная форма канона).
+
+    Проверка читает файл целиком: 1.4 МБ канона - это единицы миллисекунд,
+    а ``load_journal`` и так разбирает его построчно.
+    """
+    path = Path(path)
+    with io.open(path, encoding="utf-8-sig", newline="") as handle:
+        text = handle.read()
+    physical_lines = text.count("\n") + (0 if text.endswith("\n") else 1)
+    if not text:
+        physical_lines = 0
+
+    reader = csv.reader(io.StringIO(text), delimiter=";")
+    header = next(reader, None)
+    if header is None or not any(field.strip() for field in header):
+        raise FeedShapeError(
+            f"фид {path} пуст: нет ни заголовка, ни строк данных"
+        )
+
+    names = tuple(field.strip() for field in header)
+    upper = tuple(field.upper() for field in names)
+    if len(names) != len(JOURNAL_COLUMNS):
+        raise FeedShapeError(
+            f"у фида {path} {len(names)} колонок вместо {len(JOURNAL_COLUMNS)}: "
+            f"{names!r}"
+        )
+    if upper[:4] != JOURNAL_COLUMNS[:4]:
+        raise FeedShapeError(f"неожиданный заголовок журнала: {header!r}")
+
+    shape = FeedShape(
+        source=source,
+        path=str(path),
+        header=names,
+        physical_lines=physical_lines,
+    )
+
+    if upper != JOURNAL_COLUMNS:
+        differ = [
+            f"{canon} -> {name!r}"
+            for canon, name, norm in zip(JOURNAL_COLUMNS, names, upper)
+            if canon != norm
+        ]
+        shape.warnings.append(
+            "имена колонок отличаются от канонических (парсинг позиционный): "
+            + "; ".join(differ[:4])
+            + ("; ..." if len(differ) > 4 else "")
+        )
+
+    anchored = False
+    previous: str | None = None
+    for fields in reader:
+        shape.records += 1
+        if not fields or not any(field.strip() for field in fields):
+            shape.blank_records += 1
+            continue
+        shape.data_records += 1
+
+        raw_date = fields[0].strip() if fields else ""
+        try:
+            day = parse_journal_date(raw_date) if raw_date else None
+        except ValueError:
+            day = None
+
+        if not anchored:
+            # Якорь семантики: первая запись данных обязана читаться.
+            if day is None:
+                raise FeedShapeError(
+                    f"первая строка данных фида {path} не даёт дату: "
+                    f"{raw_date!r}"
+                )
+            anchored = True
+
+        if day is None:
+            shape.bad_dates += 1
+        else:
+            if previous is not None and day < previous:
+                shape.inversions += 1
+            previous = day
+
+        exercise = fields[3].strip() if len(fields) > 3 else ""
+        if not exercise:
+            shape.note_rows += 1
+
+    if shape.inversions:
+        shape.warnings.append(
+            f"даты идут не по возрастанию: {shape.inversions} инверсий "
+            f"(обратный порядок экспорта?)"
+        )
+    if shape.blank_share >= BLANK_RECORD_WARN_SHARE:
+        shape.warnings.append(
+            f"пустых записей {shape.blank_records} из {shape.physical_lines} "
+            f"строк ({shape.blank_share:.1%}) - многополосная выгрузка?"
+        )
+    if shape.bad_dates:
+        shape.warnings.append(
+            f"записей с нечитаемой датой: {shape.bad_dates}"
+        )
+    return shape
+
+
 def load_journal(
     path: str | os.PathLike = DEFAULT_JOURNAL,
     body_weight: float = BODY_WEIGHT,
@@ -1114,28 +1274,39 @@ def load_all(
     _require_file(report, "отчёт")
 
     fit_rows: list[SetRow] = []
+    warnings: list[str] = []
     if journal is not None:
-        # Полная перезагрузка источника, а не дозапись. Ключ строки -
-        # ``(source, source_row)``: если выгрузку переэкспортировали и
-        # нумерация строк сдвинулась, прежние строки этого источника остались
-        # бы в базе висеть рядом с новыми, и статистика считалась бы по
-        # задвоенным подходам. Пока файл передан, он - единственная правда об
-        # источнике, поэтому старые строки удаляются. Источник, равный
-        # ``None``, не трогается: его данных у нас нет.
-        conn.execute("DELETE FROM sets WHERE source = ?", (SOURCE_JOURNAL,))
+        # Порядок W7: форма и разбор - ДО первой записи в базу. Прежний код
+        # удалял источник, а уже потом разбирал файл: любая ошибка разбора
+        # (заголовок, дата) оставляла базу без этого источника.
+        shape = check_feed(journal, SOURCE_JOURNAL)
+        warnings.extend(shape.warnings)
         fit_rows = list(load_journal(journal, body_weight))
-        upsert(conn, fit_rows)
 
     report_rows: list[SetRow] = []
     skipped: list[str] = []
     if report is not None:
-        conn.execute("DELETE FROM sets WHERE source = ?", (SOURCE_REPORT,))
         known = {r.date for r in fit_rows}
         if not journal_wins:
             known = set()
         overlap = sorted(known & report_dates(report)) if known else []
         skipped = overlap
-        report_rows = list(load_workoutreport(report, body_weight, skip_dates=overlap))
+        report_rows = list(
+            load_workoutreport(report, body_weight, skip_dates=overlap)
+        )
+
+    # Полная перезагрузка источника, а не дозапись. Ключ строки -
+    # ``(source, source_row)``: если выгрузку переэкспортировали и
+    # нумерация строк сдвинулась, прежние строки этого источника остались
+    # бы в базе висеть рядом с новыми, и статистика считалась бы по
+    # задвоенным подходам. Пока файл передан, он - единственная правда об
+    # источнике, поэтому старые строки удаляются. Источник, равный
+    # ``None``, не трогается: его данных у нас нет.
+    if journal is not None:
+        conn.execute("DELETE FROM sets WHERE source = ?", (SOURCE_JOURNAL,))
+        upsert(conn, fit_rows)
+    if report is not None:
+        conn.execute("DELETE FROM sets WHERE source = ?", (SOURCE_REPORT,))
         upsert(conn, report_rows)
 
     _refill_bodyweight(conn, bodyweight_by_year, fallback=body_weight)
@@ -1144,6 +1315,7 @@ def load_all(
         journal=len(fit_rows),
         report=len(report_rows),
         skipped_dates=skipped,
+        warnings=warnings,
     )
 
 

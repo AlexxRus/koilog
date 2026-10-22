@@ -56,6 +56,7 @@ class Step:
     export_date: str | None = None           # export_date из выгрузки
     stages: list[str] = field(default_factory=list)
     freshness: list[tuple[str, str | None]] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
 def _source_stamp(path: Path | None) -> str | None:
@@ -156,6 +157,7 @@ def _load_journal(
     etl.bodyweight_map(conn, None, fallback=etl.BODY_WEIGHT)
     conn.commit()
     step.journal_loaded = True
+    step.warnings.extend(report.warnings)
     step.stages.append(f"журнал ({report.journal} подходов)")
     return path
 
@@ -263,6 +265,8 @@ def run(
 def format_freshness(step: Step) -> str:
     """Итог шага: звенья строкой и свежесть таблицей «таблица | дата»."""
     lines = [f"обновление: {', '.join(step.stages)}"]
+    for warning in step.warnings:
+        lines.append(f"внимание: {warning}")
     if step.export_date:
         lines.append(f"выгрузка от {step.export_date}")
     body = health_text.table(("таблица", "дата"), list(step.freshness))

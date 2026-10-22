@@ -227,6 +227,8 @@ def cmd_load(args: argparse.Namespace) -> int:
         if report.skipped_dates:
             print(f"пропущено дат из отчёта: {len(report.skipped_dates)} "
                   f"(есть в журнале): {', '.join(report.skipped_dates)}")
+        for warning in report.warnings:
+            print(f"внимание: {warning}", file=sys.stderr)
         print()
         _print_bodyweight(applied)
         _print_summary(conn)
