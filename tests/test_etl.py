@@ -312,8 +312,62 @@ class ReportParserTests(unittest.TestCase):
         self.assertEqual({r.date for r in rows}, {"2021-09-25"})
 
 
+class SourceRowSemanticsTests(unittest.TestCase):
+    """``source_row`` - номер CSV-записи, а не номер подхода (W7-(e)).
+
+    Ключ ``(source, source_row)`` - ключ идемпотентности, а не семантический
+    идентификатор подхода: пустые записи, строки-заметки и строки без
+    упражнения съедают номера, потому что ``continue`` идёт после ``enumerate``.
+    """
+
+    HEADER = (
+        "ДАТА;ВРЕМЯ;ТРЕНИРОВКА;УПРАЖНЕНИЕ;ДИСТАНЦИЯ КМ;ВЕС;МНОЖИТЕЛЬ;"
+        "ВРЕМЯ;ПОВТОРЫ;ОТДЫХ;ПРОПУСК;ЗАМЕТКА"
+    )
+
+    def _rows(self, body: str) -> list[etl.SetRow]:
+        path = write_tmp(self.HEADER + "\n" + body)
+        try:
+            return list(etl.load_journal(path))
+        finally:
+            path.unlink()
+
+    def test_blank_records_consume_numbers(self):
+        """Заголовок + 2 записи + 3 пустые + 1 запись -> 1, 2, 6."""
+        rows = self._rows(
+            "01.01.20;10:00;Тренировка;Жим;0;60;x;;5;90;;\n"
+            "01.01.20;10:00;Тренировка;Тяга;0;70;x;;5;90;;\n"
+            "\n"
+            "\n"
+            "\n"
+            "02.01.20;10:00;Тренировка;Присед;0;80;x;;5;90;;\n"
+        )
+        self.assertEqual([r.source_row for r in rows], [1, 2, 6])
+        self.assertEqual(max(r.source_row for r in rows), 6)
+
+    def test_note_only_record_consumes_a_number(self):
+        rows = self._rows(
+            "01.01.20;10:00;Тренировка;Жим;0;60;x;;5;90;;\n"
+            ';;;;;;;;"🙂"\n'
+            "02.01.20;10:00;Тренировка;Присед;0;80;x;;5;90;;\n"
+        )
+        self.assertEqual([r.source_row for r in rows], [1, 3])
+
+    def test_record_without_exercise_consumes_a_number(self):
+        rows = self._rows(
+            "01.01.20;10:00;Тренировка;Жим;0;60;x;;5;90;;\n"
+            "01.01.20;11:00;Тренировка;;0;0;x;;5;0;;\n"
+            "02.01.20;10:00;Тренировка;Присед;0;80;x;;5;90;;\n"
+        )
+        self.assertEqual([r.source_row for r in rows], [1, 3])
+
+
 @unittest.skipUnless(HAS_JOURNAL, "нет data/journal.csv")
 class JournalParserTests(unittest.TestCase):
+    def test_source_row_is_unique_per_file(self):
+        rows = list(etl.load_journal(JOURNAL_CSV))
+        self.assertEqual(len({r.source_row for r in rows}), len(rows))
+
     def test_counts_match_db(self):
         rows = list(etl.load_journal(JOURNAL_CSV))
         # as-of 2026-10-22, заменяется live-data тиром (W7):
