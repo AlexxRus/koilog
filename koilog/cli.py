@@ -417,15 +417,21 @@ def _print_plan_csv(plan, period_rows) -> None:
 
 
 def cmd_weeks(args: argparse.Namespace) -> int:
+    by_group = bool(getattr(args, "by_group", False))
     conn = _open(args)
     try:
-        rows = stats.weekly_koi(
-            conn, exercise=args.exercise, group=args.group, limit=args.limit
-        )
+        if by_group:
+            rows = stats.weekly_koi_by_group(
+                conn, group=args.group, limit=args.limit
+            )
+        else:
+            rows = stats.weekly_koi(
+                conn, exercise=args.exercise, group=args.group, limit=args.limit
+            )
         # подсчёт общего числа недель (целых) с учётом фильтров
         clauses: list[str] = []
         params: list[Any] = []
-        if args.exercise is not None:
+        if not by_group and args.exercise is not None:
             clauses.append("exercise = ?")
             params.append(args.exercise)
         if args.group is not None:
@@ -442,7 +448,10 @@ def cmd_weeks(args: argparse.Namespace) -> int:
     if not rows:
         print("недель с посчитанным КОИ нет")
         return 1
-    print(stats.format_weekly_koi(rows), end="")
+    formatter = (
+        stats.format_weekly_koi_by_group if by_group else stats.format_weekly_koi
+    )
+    print(formatter(rows), end="")
     if args.limit and total_weeks > (args.limit if args.limit > 0 else total_weeks):
         shown_weeks = min(args.limit, total_weeks) if args.limit > 0 else total_weeks
         print(f"показано {shown_weeks} из {total_weeks} недель "
@@ -1091,8 +1100,15 @@ def build_parser() -> argparse.ArgumentParser:
                              "из базы, а не 1RM стартового подхода")
     p_plan.set_defaults(func=cmd_plan)
 
-    p_weeks = sub.add_parser("weeks", help="недельные суммы КОИ по упражнениям")
-    p_weeks.add_argument("--exercise", help="только это упражнение")
+    p_weeks = sub.add_parser(
+        "weeks", help="недельные суммы КОИ по упражнениям или группам"
+    )
+    p_weeks_mode = p_weeks.add_mutually_exclusive_group()
+    p_weeks_mode.add_argument("--exercise", help="только это упражнение")
+    p_weeks_mode.add_argument(
+        "--by-group", action="store_true",
+        help="агрегат по группе: простое среднее КОИ её упражнений",
+    )
     p_weeks.add_argument("--group", help="только эта группа упражнений")
     p_weeks.add_argument("--limit", type=int, default=20)
     p_weeks.set_defaults(func=cmd_weeks)

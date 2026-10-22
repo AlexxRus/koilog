@@ -50,6 +50,8 @@ from typing import Any
 
 from . import equipment, taxonomy
 from .core import (
+    KOI_ABOVE_WEEK,
+    KOI_BANDS_WEEK,
     TRANSITIONS,
     Progression,
     TransitionPlan,
@@ -65,6 +67,7 @@ __all__ = [
     "PeriodStats",
     "ProgramPlan",
     "WeeklyKoi",
+    "WeeklyKoiGroup",
     "HistoryRow",
     "ascii_bar",
     "available_weights",
@@ -77,12 +80,14 @@ __all__ = [
     "format_report",
     "format_transitions",
     "format_weekly_koi",
+    "format_weekly_koi_by_group",
     "history",
     "periods",
     "progression_from_available",
     "progression_from_db",
     "since_for_months",
     "weekly_koi",
+    "weekly_koi_by_group",
 ]
 
 
@@ -557,6 +562,149 @@ def format_weekly_koi(rows: Sequence[WeeklyKoi]) -> str:
     lines.append(
         "меньше 2 - лёгкая, 2…3 - тяжёлая, 3…4 - очень тяжёлая, больше 4 - "
         "«Вы сошли с ума??»."
+    )
+    return "\n".join(lines) + "\n"
+
+
+@dataclass(frozen=True, slots=True)
+class WeeklyKoiGroup:
+    """Недельный КОИ **по группе**: простое среднее по её упражнениям.
+
+    ``koi_mean`` - среднее недельных сумм упражнений группы, **не взвешенное**
+    объёмом или числом подходов: КОИ - безразмерная интенсивность, и вес
+    подхода не должен возвращаться в неё через среднее. ``koi_max`` - самое
+    тяжёлое упражнение группы за неделю (среднее может скрыть одну тяжёлую
+    сессию). ``band`` - полоса по ``koi_mean`` из ``core.KOI_BANDS_WEEK``.
+    """
+
+    week: str
+    exercise_group: str
+    exercises: int
+    sets_done: int
+    koi_mean: float
+    koi_max: float
+    band: str
+
+
+def weekly_koi_by_group(
+    conn: sqlite3.Connection,
+    *,
+    group: str | None = None,
+    since: str | None = None,
+    limit: int | None = None,
+) -> list[WeeklyKoiGroup]:
+    """Недельный КОИ по группе - **простое среднее** по упражнениям группы.
+
+    Одна строка - пара «неделя, группа». Агрегат считается из
+    ``v_weekly_koi`` (по упражнению), а не из ``sets``: КОИ группы - это
+    витрина интенсивности, а не новая метрика. Среднее **не взвешивается**
+    ни подходами, ни тоннажом: иначе объём вернулся бы внутрь интенсивности
+    (та же причина, по которой отвергнута сумма, см. ``weekly_koi``).
+    Объём группы живёт отдельно, в ``health/groups.py``.
+
+    Группы без базы 1RM (``taxonomy.NO_RM_GROUPS``: ПРЕСС, ПОДЪЁМ НОГ,
+    ПЛАНКА, КАРДИО) в ``v_weekly_koi`` отсутствуют структурно - их нет и
+    здесь; витрина пишет это подписью, а не пустыми строками.
+
+    ``group`` фильтрует по группе, ``limit`` - количество **целых недель**
+    (как в ``weekly_koi``, а не строк).
+    """
+    clauses: list[str] = []
+    params: list[Any] = []
+    if group is not None:
+        clauses.append("exercise_group = ?")
+        params.append(group)
+    if since is not None:
+        clauses.append("week >= ?")
+        params.append(since)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+
+    limit_n = None
+    if limit is not None and int(limit) > 0:
+        limit_n = int(limit)
+
+    columns = (
+        "week, exercise_group, COUNT(*) AS exercises, "
+        "SUM(sets_done) AS sets_done, AVG(koi_week) AS koi_mean, "
+        "MAX(koi_week) AS koi_max"
+    )
+    if limit_n is not None:
+        # Фильтры применяются и к выбору недель, и к самим строкам: иначе
+        # `--group` с `--limit` вернул бы чужие группы тех же недель.
+        outer = (" AND " + " AND ".join(clauses)) if clauses else ""
+        sql = (
+            "WITH w AS (SELECT DISTINCT week FROM v_weekly_koi" + where +
+            f" ORDER BY week DESC LIMIT {limit_n}) "
+            f"SELECT {columns} FROM v_weekly_koi"
+            " WHERE week IN (SELECT week FROM w)" + outer +
+            " GROUP BY week, exercise_group"
+        )
+        exec_params = params + params
+    else:
+        sql = (
+            f"SELECT {columns} FROM v_weekly_koi" + where +
+            " GROUP BY week, exercise_group"
+        )
+        exec_params = params
+
+    sql += " ORDER BY week DESC, koi_mean DESC, exercise_group"
+
+    return [
+        WeeklyKoiGroup(
+            week=row["week"],
+            exercise_group=row["exercise_group"],
+            exercises=row["exercises"],
+            sets_done=row["sets_done"],
+            koi_mean=row["koi_mean"],
+            koi_max=row["koi_max"],
+            band=koi_band(row["koi_mean"], KOI_BANDS_WEEK, above=KOI_ABOVE_WEEK),
+        )
+        for row in conn.execute(sql, exec_params)
+    ]
+
+
+def format_weekly_koi_by_group(rows: Sequence[WeeklyKoiGroup]) -> str:
+    """Таблица недельного КОИ по группам - с шапкой и подписью отсутствия.
+
+    Режим стоит рядом со **средним**, а не с максимумом: полоса задана для
+    той величины, которую видно в колонке «КОИ ср» (``koi_max`` - справка).
+    Подпись прямо говорит, что среднее простое и что объём группы - не здесь.
+    """
+    if not rows:
+        return "недель с посчитанным КОИ нет\n"
+    header = (
+        f"{'неделя':<12}  {'группа':<22} {'упражнений':>10} "
+        f"{'подходов':>8} {'КОИ ср':>8} {'КОИ макс':>9}  режим"
+    )
+    lines = [header, "-" * len(header)]
+    for row in rows:
+        lines.append(
+            f"{row.week:<12}  {row.exercise_group[:22]:<22} "
+            f"{row.exercises:>10} {row.sets_done:>8} "
+            f"{row.koi_mean:>8.2f} {row.koi_max:>9.2f}  {row.band}"
+        )
+    lines.append("")
+    lines.append(
+        "КОИ группы - простое среднее по упражнениям группы за неделю,"
+    )
+    lines.append(
+        "не взвешенное объёмом или числом подходов: КОИ - интенсивность,"
+    )
+    lines.append(
+        "а объём группы виден в тоннаже (health/groups.py)."
+    )
+    lines.append(
+        "Режим - по среднему, полосы те же, что у упражнения: меньше 2 -"
+    )
+    lines.append(
+        "лёгкая, 2…3 - тяжёлая, 3…4 - очень тяжёлая, больше 4 - "
+        "«Вы сошли с ума??»."
+    )
+    lines.append(
+        "Групп 16 из 20: ПРЕСС, ПОДЪЁМ НОГ, ПЛАНКА и КАРДИО в КОИ не входят -"
+    )
+    lines.append(
+        "у них не считается 1RM, поэтому базы для КОИ нет."
     )
     return "\n".join(lines) + "\n"
 
