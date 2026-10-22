@@ -253,6 +253,86 @@ class RowsOutputTests(unittest.TestCase):
         self.assertNotIn("в канон и порог не входит", text)
 
 
+class DeterminismTests(unittest.TestCase):
+    """Тай-брейки выбора строки и порядок в тексте (хвост Task 55).
+
+    Правила названы в докстрингах :func:`digest._score_row` и
+    :func:`digest._ledger_specs`; здесь они прибиты тестами, чтобы «любое, но
+    одно» не превратилось в «как получится в SQLite».
+    """
+
+    def test_fallback_never_uses_a_future_canonical_day(self):
+        """Равноудалённые D-1 и D+1: берётся прошлое, будущее не подставляется."""
+        conn = _ledger([
+            ("2024-05-09", CURRENT, 0.30, 0.80, 0),
+            ("2024-05-10", VINTAGE, 0.99, 0.90, 1),
+            ("2024-05-11", CURRENT, 0.70, 0.80, 1),
+        ])
+        self.addCleanup(conn.close)
+        row = digest._score_row(conn, "2024-05-10", CURRENT)
+        self.assertEqual(row["day"], "2024-05-09")
+        self.assertEqual(row["score"], 0.30)
+        text = digest.format_digest(digest.day_state(conn, "2024-05-10", spec=CURRENT))
+        self.assertIn("скор (причинный за 2024-05-09): 0.30", text)
+        self.assertNotIn("0.70", text)
+
+    def test_future_canonical_day_alone_gives_no_score(self):
+        """Если канон есть только впереди, скор не выдумывается (пусто)."""
+        conn = _ledger([
+            ("2024-05-10", VINTAGE, 0.99, 0.90, 1),
+            ("2024-05-11", CURRENT, 0.70, 0.80, 0),
+        ])
+        self.addCleanup(conn.close)
+        self.assertIsNone(digest._score_row(conn, "2024-05-10", CURRENT))
+
+    def test_same_day_same_spec_latest_write_wins(self):
+        """Повторный скор дня под той же спекой: канон - последняя запись."""
+        conn = _ledger([
+            ("2024-05-10", CURRENT, 0.20, 0.80, 0),
+            ("2024-05-10", CURRENT, 0.60, 0.80, 1),
+        ])
+        self.addCleanup(conn.close)
+        row = digest._score_row(conn, "2024-05-10", CURRENT)
+        self.assertEqual(row["score"], 0.60)
+        self.assertEqual(row["alert"], 1)
+
+    def test_repeat_scoring_counts_the_day_once(self):
+        """Две строки одного дня под спекой - в счёте дней это один день."""
+        conn = _ledger([
+            ("2024-05-09", CURRENT, 0.30, 0.80, 0),
+            ("2024-05-10", CURRENT, 0.20, 0.80, 0),
+            ("2024-05-10", CURRENT, 0.60, 0.80, 1),
+            ("2024-05-10", VINTAGE, 0.95, 0.80, 1),
+        ])
+        self.addCleanup(conn.close)
+        self.assertEqual(digest._ledger_specs(conn), [(CURRENT, 2), (VINTAGE, 1)])
+
+    def test_warning_text_is_independent_of_write_order(self):
+        """Тот же состав, записанный в другом порядке, даёт тот же текст."""
+        rows = [
+            ("2024-05-09", CURRENT, 0.30, 0.80, 0),
+            ("2024-05-10", VINTAGE, 0.99, 0.90, 1),
+            ("2024-05-11", "spec0000000c", 0.55, 0.80, 0),
+        ]
+        first = _ledger(rows)
+        second = _ledger(list(reversed(rows)))
+        self.addCleanup(first.close)
+        self.addCleanup(second.close)
+        self.assertEqual(digest.spec_warning(first, CURRENT),
+                         digest.spec_warning(second, CURRENT))
+
+    def test_warning_vintage_order_is_days_then_hash(self):
+        """Равное число дней у винтажа: порядок по хэшу, а не по записи."""
+        conn = _ledger([
+            ("2024-05-11", "spec0000000c", 0.55, 0.80, 0),
+            ("2024-05-12", "spec0000000b", 0.55, 0.80, 0),
+            ("2024-05-09", CURRENT, 0.30, 0.80, 0),
+        ])
+        self.addCleanup(conn.close)
+        note = digest.spec_warning(conn, CURRENT)
+        self.assertLess(note.index("spec0000000b"), note.index("spec0000000c"))
+
+
 class LiveCanonTests(unittest.TestCase):
     """Свойства живой базы (как в W7-(g): свойства, а не константы)."""
 
@@ -319,6 +399,38 @@ class LiveCanonTests(unittest.TestCase):
         """Алерты винта не попадают в канонический ряд."""
         for item in score.rows(self.conn, spec=self.current):
             self.assertEqual(item["spec_hash"], self.current)
+
+    def test_repeat_scoring_of_a_day_keeps_one_canonical_number(self):
+        """Повторный скор дня (append-only) не делает из дня два разных числа.
+
+        На живой базе такие дни есть: ``record`` осознанно пишет последний день
+        заново, поэтому под одной спекой у дня бывает несколько строк. Канон -
+        последняя записанная, и она же - ``MAX(id)``.
+        """
+        rows = self.conn.execute(
+            "SELECT day, COUNT(*) AS n, MAX(id) AS last_id FROM ml_score "
+            "WHERE spec_hash = ? GROUP BY day HAVING n > 1", (self.current,)
+        ).fetchall()
+        for row in rows:
+            last = self.conn.execute(
+                "SELECT score FROM ml_score WHERE id = ?",
+                (row["last_id"],)).fetchone()[0]
+            got = digest._score_row(self.conn, row["day"], self.current)
+            self.assertEqual(got["day"], row["day"])
+            self.assertEqual(got["score"], last)
+
+    def test_repeat_scoring_does_not_change_the_day_frame(self):
+        """Число дней в ledger'е не зависит от повторных записей строк."""
+        specs = dict(digest._ledger_specs(self.conn))
+        self.assertIn(self.current, specs)
+        days = self.conn.execute(
+            "SELECT COUNT(DISTINCT day) FROM ml_score WHERE spec_hash = ?",
+            (self.current,)).fetchone()[0]
+        self.assertEqual(specs[self.current], days)
+        rows = self.conn.execute(
+            "SELECT COUNT(*) FROM ml_score WHERE spec_hash = ?",
+            (self.current,)).fetchone()[0]
+        self.assertGreaterEqual(rows, days)          # строк не меньше, чем дней
 
 
 if __name__ == "__main__":
