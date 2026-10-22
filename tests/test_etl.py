@@ -140,13 +140,32 @@ class ReportDateTests(unittest.TestCase):
             with self.assertRaises(ValueError, msg=bad):
                 etl.parse_report_date(bad)
 
+    @unittest.skipUnless(HAS_REAL_DATA, "нет data/journal.csv и/или data/report.csv")
+    def test_report_overlaps_but_is_not_the_journal(self):
+        """Отчёт и журнал - про одни и те же годы, но это разные выгрузки.
+
+        Прежняя пара констант (465 дат, 2015-06-21..2021-09-23) говорила лишь
+        о том, когда отчёт выгрузили. Свойства: даты пересекаются (стык
+        источников), отчёт начинается раньше журнала и кончается раньше -
+        то есть это два вывода одного приложения, разделённые по годам.
+        Отдельно проверять вложенность не нужно: её ловит сама загрузка -
+        отчёт пропускает только те даты, что уже есть в журнале, и падение
+        журнала на 23 подхода такой тест ломало зря.
+        """
+        report_days = set(etl.report_dates(REPORT))
+        journal_days = {row.date for row in etl.load_journal(JOURNAL_CSV)}
+        self.assertGreaterEqual(len(report_days & journal_days), 10)
+        self.assertLess(min(report_days), min(journal_days))
+        self.assertLess(max(report_days), max(journal_days))
+
     @unittest.skipUnless(HAS_REPORT, "нет data/report.csv")
     def test_all_report_dates_parse(self):
-        """Все 502 даты отчёта обязаны разбираться."""
+        """Даты отчёта обязаны разбираться все, без пропусков и дублей."""
         dates = etl.report_dates(REPORT)
-        self.assertEqual(len(dates), 465)
-        self.assertEqual(min(dates), "2015-06-21")
-        self.assertEqual(max(dates), "2021-09-23")
+        self.assertEqual(len(dates), len(set(dates)))
+        self.assertGreater(len(dates), 400)
+        for day in dates:
+            self.assertRegex(day, r"^\d{4}-\d{2}-\d{2}$")
 
     def test_minutes(self):
         self.assertEqual(etl.parse_report_minutes("21 мин."), 21.0)
@@ -368,12 +387,21 @@ class JournalParserTests(unittest.TestCase):
         rows = list(etl.load_journal(JOURNAL_CSV))
         self.assertEqual(len({r.source_row for r in rows}), len(rows))
 
-    def test_counts_match_db(self):
+    def test_counts_and_days_are_consistent(self):
+        """Свойства вместо констант «15451 подход / 945 дней» (W7-(g)).
+
+        Числа правятся при каждом экспорте (20-21.10 добавили 23 подхода и
+        2 дня) и не доказывают ничего о разборе: они лишь повторяют прогон.
+        Проверяются свойства разбора, верные при любой длине файла:
+        ``source_row`` уникален, дней и подходов - порядок полной истории
+        (пустой файл прошёл бы любую проверку формы, поэтому пол не «> 0»,
+        а сотни и тысячи).
+        """
         rows = list(etl.load_journal(JOURNAL_CSV))
-        # as-of 2026-10-22, заменяется live-data тиром (W7):
-        # журнал вырос на 23 подхода / 2 дня (тренировки 20-21.10).
-        self.assertEqual(len(rows), 15451)
-        self.assertEqual(len({r.date for r in rows}), 945)
+        days = {r.date for r in rows}
+        self.assertEqual(len({r.source_row for r in rows}), len(rows))
+        self.assertGreaterEqual(len(days), 900)
+        self.assertGreater(len(rows), 10_000)
 
     def test_no_null_exercises(self):
         rows = list(etl.load_journal(JOURNAL_CSV))
@@ -979,24 +1007,58 @@ class RealDataTests(unittest.TestCase):
         cls.conn.close()
         cls._dir.cleanup()
 
-    def test_row_counts(self):
-        # as-of 2026-10-22, заменяется live-data тиром (W7)
-        self.assertEqual(self.report.journal, 15451)
-        self.assertEqual(self.report.report, 5544)
-        self.assertEqual(self.report.total, 20995)
+    def test_overlapping_dates_skipped_are_exactly_the_seam(self):
+        """Пересечение считается, а не зашито: 2018-12-10 и 2021-09-23 - края."""
+        overlap = sorted(
+            {row.date for row in etl.load_journal(JOURNAL_CSV)}
+            & set(etl.report_dates(REPORT))
+        )
+        self.assertEqual(self.report.skipped_dates, overlap)
+        self.assertGreaterEqual(len(overlap), 2)
+        self.assertEqual(overlap[0], "2018-12-10")
+        self.assertEqual(overlap[-1], "2021-09-23")
 
-    def test_eleven_overlapping_dates_skipped(self):
-        self.assertEqual(len(self.report.skipped_dates), 11)
-        self.assertIn("2018-12-10", self.report.skipped_dates)
-        self.assertIn("2021-09-23", self.report.skipped_dates)
+    def test_history_edges_match_the_feeds(self):
+        """История: начало сшито из журнала и отчёта, хвост - самый свежий.
 
-    def test_history_is_contiguous(self):
+        Константы (2015-06-21, 2026-10-21, 1399 дней, 2045 тренировок) даже
+        при подстановке не доказывали согласия: обе стороны брались из одного
+        прогона. Проверяются свойства: крайние даты совпадают с фидами во все
+        стороны, а число дней/тренировок лежит между тем, что даёт один
+        источник, и тем, что дают два.
+        """
         total = etl.summary(self.conn)["total"]
-        # as-of 2026-10-22, заменяется live-data тиром (W7)
-        self.assertEqual(total["first_day"], "2015-06-21")
-        self.assertEqual(total["last_day"], "2026-10-21")
-        self.assertEqual(total["days"], 1399)
-        self.assertEqual(total["sessions"], 2045)
+        journal = list(etl.load_journal(JOURNAL_CSV))
+        report_days = set(etl.report_dates(REPORT))
+        journal_days = {row.date for row in journal}
+        journal_sessions = {row.session_id for row in journal}
+
+        self.assertEqual(total["first_day"], min(journal_days | report_days))
+        self.assertEqual(total["last_day"], max(journal_days))
+        self.assertEqual(total["days"], len(journal_days | report_days))
+        self.assertGreater(total["sessions"], len(journal_sessions))
+
+    def test_rows_in_db_match_the_parsed_feed(self):
+        """Числа в базе - это числа разбора, а не константы теста (W7-(g)).
+
+        Здесь стояли 15451 / 5544 / 20995. Фид растёт (20-21.10 добавили
+        23 подхода), и каждое падение означало лишь «журнал обновили».
+        Свойство же проверяет то, ради чего класс и написан: разбор и
+        загрузка не теряют строк, сколько бы их ни было в файле.
+        """
+        journal = sum(1 for _ in etl.load_journal(JOURNAL_CSV))
+        report_rows = list(etl.load_workoutreport(REPORT, skip_dates=()))
+        # Отчёт грузится без пропуска дат: это полный его состав.
+        skipped = set(self.report.skipped_dates)
+        on_skipped = sum(1 for row in report_rows if row.date in skipped)
+        self.assertEqual(self.report.journal, journal)
+        self.assertEqual(self.report.total,
+                         self.report.journal + self.report.report)
+        self.assertGreater(self.report.report, 0)
+        # Идентичность, а не «меньше»: в базе лежит ровно столько строк
+        # отчёта, сколько их в файле минус те, что ушли в пропуск (иначе
+        # дата задваилась бы или потерялась).
+        self.assertEqual(self.report.report + on_skipped, len(report_rows))
 
     def test_every_exercise_mapped(self):
         self.assertEqual(etl.unmapped_exercises(self.conn), [])
@@ -1052,8 +1114,10 @@ class RealDataTests(unittest.TestCase):
     def test_export(self):
         target = Path(self._dir.name) / "out.csv"
         written = etl.export_csv(self.conn, target)
-        # as-of 2026-10-22, заменяется live-data тиром (W7)
-        self.assertEqual(written, 20995)
+        # Число строк выгрузки - это число строк в базе, не константа теста.
+        self.assertEqual(
+            written,
+            self.conn.execute("SELECT COUNT(*) FROM sets").fetchone()[0])
         text = target.read_text(encoding="utf-8-sig")
         self.assertIn("exercise_group", text.splitlines()[0])
         self.assertIn("ЖИМ ЛЁЖА", text)
