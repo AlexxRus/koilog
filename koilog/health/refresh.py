@@ -65,6 +65,7 @@ class Step:
     freshness: list[tuple[str, str | None]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     overrides: list[str] = field(default_factory=list)
+    snapshots: list = field(default_factory=list)   # etl.Snapshot перед DELETE
 
 
 def _source_stamp(path: Path | None) -> str | None:
@@ -173,6 +174,7 @@ def _load_journal(
     step.journal_loaded = True
     step.warnings.extend(report.warnings)
     step.overrides.extend(report.overrides)
+    step.snapshots.extend(report.snapshots)
     step.stages.append(f"журнал ({report.journal} подходов)")
     return path
 
@@ -307,6 +309,8 @@ def format_freshness(step: Step) -> str:
         lines.append(f"внимание: {warning}")
     for line in step.overrides:
         lines.append(f"обход контракта фида: {line}")
+    for snapshot in step.snapshots:
+        lines.append(f"снимок: {snapshot.describe()}")
     if step.export_date:
         lines.append(f"выгрузка от {step.export_date}")
     body = health_text.table(("таблица", "дата"), list(step.freshness))

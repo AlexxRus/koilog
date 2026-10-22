@@ -36,13 +36,16 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
+import json
 import os
 import re
 import sqlite3
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import date as date_cls
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import rules, taxonomy
@@ -53,7 +56,11 @@ __all__ = [
     "JOURNAL_COLUMNS",
     "LoadReport",
     "OutlierGroup",
+    "RestoreReport",
+    "SNAPSHOT_DIRNAME",
+    "SNAPSHOT_KEEP",
     "SetRow",
+    "Snapshot",
     "TimedDecision",
     "WeightDecision",
     "QualityReport",
@@ -78,10 +85,14 @@ __all__ = [
     "parse_report_date",
     "parse_report_minutes",
     "quality_report",
+    "read_snapshot_meta",
     "recompute_metrics",
     "reinterpreted_as_seconds",
     "report_dates",
     "resolve_bodyweight",
+    "restore_snapshot",
+    "rotate_snapshots",
+    "snapshot_source",
     "summary",
     "timed_suspects",
     "unmapped_exercises",
@@ -288,6 +299,7 @@ class LoadReport:
     skipped_dates: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     overrides: list[str] = field(default_factory=list)
+    snapshots: list["Snapshot"] = field(default_factory=list)
 
     @property
     def total(self) -> int:
@@ -1327,6 +1339,372 @@ def _report_workout_name(program: str | None, part: str | None) -> str | None:
 
 
 # --------------------------------------------------------------------------
+# Снимки источников и откат (W7-(c))
+# --------------------------------------------------------------------------
+
+#: Имя подкаталога снимков: он лежит рядом с самой базой
+#: (``sql/snapshots/`` для боевой), а не в общем каталоге проекта. Снимок
+#: принадлежит базе, и подменять её на чужую, оставив снимки, нельзя.
+SNAPSHOT_DIRNAME = "snapshots"
+
+#: Сколько последних снимков на источник хранится (ротация K = 3).
+SNAPSHOT_KEEP = 3
+
+
+@dataclass(slots=True)
+class Snapshot:
+    """Снимок строк одного источника на диске.
+
+    Один SQLite-файл на снимок: типы колонок сохраняются, откат - вставка
+    обратно без разбора CSV. Рядом лежит ``.json`` с метаданными: источник,
+    число строк, время и ``sha256``. Хэш нужен потому, что файл на диске
+    может быть подменён или обрезан уже после снимка, и откат из него был бы
+    тихо неверным.
+    """
+
+    path: Path
+    source: str
+    rows: int
+    sha256: str
+    taken_at: str
+
+    @property
+    def meta_path(self) -> Path:
+        return self.path.with_suffix(".json")
+
+    def describe(self) -> str:
+        return (f"{self.path} ({self.source}, {self.rows} строк, "
+                f"sha256 {self.sha256[:12]})")
+
+
+@dataclass(slots=True)
+class RestoreReport:
+    """Что сделал (или сделал бы) откат из снимка."""
+
+    path: Path
+    source: str
+    rows: int                      # строк в снимке
+    before: int                    # строк источника сейчас
+    sha256: str
+    sha_ok: bool                   # хэш совпал с метаданными снимка
+    lost_days: list[str]           # дни, которых в снимке нет
+    after: int | None = None       # строк после отката
+    evidence: Snapshot | None = None   # снимок «плохого» состояния
+    verified: str | None = None
+    dry_run: bool = False
+    executed: bool = False
+
+    def lines(self) -> list[str]:
+        out = [f"снимок: {self.path}"]
+        out.append(
+            "сверка sha256: " + ("совпадает" if self.sha_ok
+                                  else "НЕ совпадает с метаданными")
+        )
+        out.append(
+            f"источник: {self.source}, сейчас {self.before} строк, "
+            f"в снимке {self.rows}"
+        )
+        if self.lost_days:
+            out.append(
+                f"дней, которых в снимке нет (потеряны): "
+                f"{len(self.lost_days)} - {', '.join(self.lost_days)}"
+            )
+        if self.evidence is not None:
+            out.append(f"снимок текущего состояния: {self.evidence.describe()}")
+        if self.dry_run:
+            out.append("пробный прогон: в базу ничего не записано")
+        elif not self.executed:
+            out.append("ничего не изменено: для отката нужен --yes")
+        elif self.after is not None:
+            out.append(
+                f"откат выполнен: {self.after} строк"
+                + (f", {self.verified}" if self.verified else "")
+            )
+        return out
+
+
+def _db_file(conn: sqlite3.Connection) -> Path:
+    """Файл основной базы: снимок и откат работают только с ней."""
+    for _, name, path in conn.execute("PRAGMA database_list"):
+        if name == "main":
+            if not path:
+                raise RuntimeError(
+                    "снимок требует файловую базу: у базы в памяти нет пути"
+                )
+            return Path(path)
+    raise RuntimeError("не удалось определить файл базы (PRAGMA database_list)")
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with io.open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _snapshot_folder(conn: sqlite3.Connection) -> Path:
+    return _db_file(conn).parent / SNAPSHOT_DIRNAME
+
+
+def read_snapshot_meta(path: str | os.PathLike) -> dict | None:
+    """Метаданные снимка из соседнего ``.json``; ``None``, если их нет."""
+    meta_path = Path(path).with_suffix(".json")
+    if not meta_path.exists():
+        return None
+    try:
+        with io.open(meta_path, encoding="utf-8") as handle:
+            meta = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return meta if isinstance(meta, dict) else None
+
+
+def rotate_snapshots(
+    source: str,
+    keep: int = SNAPSHOT_KEEP,
+    folder: str | os.PathLike | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> list[Path]:
+    """Оставить ``keep`` последних снимков источника; вернуть удалённые.
+
+    Имя снимка - ``<source>-<UTC:YYYYMMDDTHHMMSSZ>.db``, поэтому время в
+    UTC упорядочивается лексикографически: ротация - это сортировка имён.
+    Метаданные удаляются вместе с файлом, иначе ``read_snapshot_meta``
+    находил бы хэш снимка, которого уже нет.
+    """
+    if folder is None:
+        if conn is None:
+            raise ValueError("нужен либо folder, либо conn")
+        folder = _snapshot_folder(conn)
+    folder = Path(folder)
+    if not folder.exists():
+        return []
+    files = sorted(folder.glob(f"{source}-*.db"), reverse=True)
+    removed: list[Path] = []
+    for path in files[max(keep, 0):]:
+        path.unlink()
+        meta = path.with_suffix(".json")
+        if meta.exists():
+            meta.unlink()
+        removed.append(path)
+    return removed
+
+
+def snapshot_source(
+    conn: sqlite3.Connection,
+    source: str,
+    folder: str | os.PathLike | None = None,
+) -> Snapshot | None:
+    """Снять строки источника в отдельный SQLite-файл; ``None``, если пусто.
+
+    Снимок снимается **до** ``DELETE`` (порядок §1 спеки), поэтому откат
+    возвращает ровно те строки, что были в базе, а не то, что успел
+    разобрать загрузчик.
+
+    Запись атомарна: сначала ``.tmp``, ``fsync`` и только потом
+    ``os.replace``. Наполовину записанный снимок опаснее отсутствующего -
+    его приняли бы за готовый. Ротация (K = 3) идёт последней: только когда
+    новый файл уже на месте.
+    """
+    if folder is None:
+        folder = _snapshot_folder(conn)
+    folder = Path(folder)
+    rows = conn.execute(
+        "SELECT COUNT(*) FROM sets WHERE source = ?", (source,)
+    ).fetchone()[0]
+    if not rows:
+        return None
+
+    ddl = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sets'"
+    ).fetchone()
+    if ddl is None or not ddl[0]:
+        raise RuntimeError("в базе нет таблицы sets - снимать нечего")
+
+    folder.mkdir(parents=True, exist_ok=True)
+    taken_at = datetime.now(timezone.utc)
+    stamp = taken_at.strftime("%Y%m%dT%H%M%SZ")
+    # Имя по UTC-секунде: обычно снимок один на секунду. Второй за ту же
+    # секунду (откат сразу после загрузки) получает суффикс, а не затирает
+    # первый: тот может быть прямо сейчас приаттачен как источник отката, и
+    # подмена файла под ним - это не «свежий снимок», а сломанный откат.
+    path = folder / f"{source}-{stamp}.db"
+    counter = 2
+    while path.exists():
+        path = folder / f"{source}-{stamp}-{counter}.db"
+        counter += 1
+    tmp = path.with_name(path.name + ".tmp")
+    if tmp.exists():
+        tmp.unlink()
+
+    main_db = _db_file(conn)
+    snap = sqlite3.connect(tmp)
+    try:
+        snap.execute(ddl[0])
+        snap.execute("ATTACH DATABASE ? AS src", (str(main_db),))
+        snap.execute(
+            "INSERT INTO sets SELECT * FROM src.sets WHERE source = ?", (source,)
+        )
+        snap.commit()
+        snap.execute("DETACH DATABASE src")
+    finally:
+        snap.close()
+
+    fd = os.open(tmp, os.O_RDWR)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    sha256 = _file_sha256(tmp)
+    os.replace(tmp, path)
+
+    snapshot = Snapshot(
+        path=path,
+        source=source,
+        rows=rows,
+        sha256=sha256,
+        taken_at=taken_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+    snapshot.meta_path.write_text(
+        json.dumps({
+            "source": source,
+            "rows": rows,
+            "sha256": sha256,
+            "taken_at": snapshot.taken_at,
+            "db": str(main_db),
+        }, ensure_ascii=False, indent=1) + "\n",
+        encoding="utf-8",
+    )
+    rotate_snapshots(source, folder=folder)
+    return snapshot
+
+
+def restore_snapshot(
+    conn: sqlite3.Connection,
+    path: str | os.PathLike,
+    dry_run: bool = False,
+    confirm: bool = False,
+) -> RestoreReport:
+    """Вернуть строки источника из снимка бит-в-бит.
+
+    Порядок §7-бис, решение 3:
+
+    1. пересчёт ``sha256`` файла против метаданных снимка (расхождение -
+       предупреждение в отчёте, не отказ: файл мог быть переименован или
+       метаданные потеряны, а сам снимок цел);
+    2. снимок **текущего** состояния тем же механизмом - страховка на случай,
+       если откат окажется не тем, что нужно;
+    3. ``DELETE`` источника + вставка из снимка; ``source_row`` и все прочие
+       колонки сохраняются, ``id`` - суррогатный ключ, его выдаёт база:
+       вставка ``id`` из снимка столкнулась бы с ключами другого источника;
+    4. автосверка: число строк и разность множеств в обе стороны.
+
+    ``dry_run`` - только показать план. Без ``confirm`` (``--yes``) откат не
+    выполняется: снимок берётся **явным путём**, «последний снимок» не
+    подставляется.
+
+    Производные метрики (``rm_session``, ``rm_delta``, ``rm_ma_30d``, ``koi``)
+    не пересчитываются: откат бит-в-бит возвращает и их такими, какими они
+    были в снимке. Это осознанно: пересчёт молча изменил бы строки, и
+    «бит-в-бит» перестало бы быть проверяемым.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"снимок не найден: {path}")
+
+    sha256 = _file_sha256(path)
+    meta = read_snapshot_meta(path)
+    sha_ok = bool(meta) and meta.get("sha256") == sha256
+
+    try:
+        conn.execute("ATTACH DATABASE ? AS snap", (str(path),))
+    except sqlite3.DatabaseError as error:
+        raise ValueError(f"{path} - не снимок: {error}") from error
+    try:
+        if conn.execute(
+            "SELECT COUNT(*) FROM snap.sqlite_master "
+            "WHERE type = 'table' AND name = 'sets'"
+        ).fetchone()[0] == 0:
+            raise ValueError(f"{path} - не снимок: в файле нет таблицы sets")
+
+        rows = conn.execute("SELECT COUNT(*) FROM snap.sets").fetchone()[0]
+        sources = [r[0] for r in conn.execute(
+            "SELECT DISTINCT source FROM snap.sets"
+        )]
+        if len(sources) != 1:
+            raise ValueError(
+                f"{path} - не снимок одного источника: {sources!r}"
+            )
+        source = sources[0]
+        before = conn.execute(
+            "SELECT COUNT(*) FROM sets WHERE source = ?", (source,)
+        ).fetchone()[0]
+        current_days = {r[0] for r in conn.execute(
+            "SELECT DISTINCT date FROM sets WHERE source = ?", (source,)
+        )}
+        snapshot_days = {r[0] for r in conn.execute(
+            "SELECT DISTINCT date FROM snap.sets"
+        )}
+        lost_days = sorted(current_days - snapshot_days)
+
+        report = RestoreReport(
+            path=path, source=source, rows=rows, before=before,
+            sha256=sha256, sha_ok=sha_ok, lost_days=lost_days,
+            dry_run=dry_run,
+        )
+        if dry_run:
+            return report
+        if not confirm:
+            return report
+
+        # Страховка: снимок того состояния, из которого откатываемся. Он
+        # попадает в ту же ротацию K = 3 - «плохое» состояние не исчезает
+        # бесследно, но и места занимает не больше, чем любой снимок.
+        report.evidence = snapshot_source(conn, source)
+
+        columns = [
+            info[1] for info in conn.execute("PRAGMA table_info(sets)")
+            if info[1] != "id"
+        ]
+        listed = ", ".join(columns)
+        try:
+            conn.execute("DELETE FROM sets WHERE source = ?", (source,))
+            conn.execute(
+                f"INSERT INTO sets ({listed}) SELECT {listed} FROM snap.sets"
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+        after = conn.execute(
+            "SELECT COUNT(*) FROM sets WHERE source = ?", (source,)
+        ).fetchone()[0]
+        missing = conn.execute(
+            f"SELECT COUNT(*) FROM (SELECT {listed} FROM snap.sets "
+            f"EXCEPT SELECT {listed} FROM sets WHERE source = ?)", (source,)
+        ).fetchone()[0]
+        extra = conn.execute(
+            f"SELECT COUNT(*) FROM (SELECT {listed} FROM sets WHERE source = ? "
+            f"EXCEPT SELECT {listed} FROM snap.sets)", (source,)
+        ).fetchone()[0]
+
+        report.after = after
+        report.executed = True
+        if after == rows and not missing and not extra:
+            report.verified = "сверка бит-в-бит пройдена"
+        else:
+            report.verified = (
+                f"сверка НЕ пройдена: {after} строк, "
+                f"нет в базе {missing}, лишних {extra}"
+            )
+        return report
+    finally:
+        conn.execute("DETACH DATABASE snap")
+
+
+# --------------------------------------------------------------------------
 # Запись
 # --------------------------------------------------------------------------
 
@@ -1395,6 +1773,13 @@ def load_all(
     ``--allow-incomplete-feed``) не отменяет проверку, а пропускает её громко:
     каждая поблажка попадает в ``LoadReport.overrides``.
 
+    **Снимок перед ``DELETE``** (:func:`snapshot_source`, W7-(c)): строки
+    каждого перезаписываемого источника уходят в отдельный SQLite-файл рядом
+    с базой, хранится три последних на источник. Снимки обоих источников
+    снимаются до первого ``DELETE``, так что сбой снимка (диск, права) не
+    оставит базу наполовину перезагруженной. Откат - :func:`restore_snapshot`
+    (``koilog restore --snapshot PATH``).
+
     **Два прохода по весу тела.** Первый проход кладёт строки с константой
     ``body_weight``, чтобы получить в базе вообще всё, включая записи
     ``total_bodyweight``. Второй проход берёт вес тела по годам из этих же
@@ -1451,6 +1836,23 @@ def load_all(
     # задвоенным подходам. Пока файл передан, он - единственная правда об
     # источнике, поэтому старые строки удаляются. Источник, равный
     # ``None``, не трогается: его данных у нас нет.
+    #
+    # Снимок - часть порядка §1 контракта: ``DELETE`` начинается только
+    # после того, как снят снимок (W7-(c)). Иначе «перезагрузка» без
+    # возможности откатиться стирает историю безвозвратно. Снимки обоих
+    # источников снимаются **до** первого ``DELETE``: сбой снимка не должен
+    # оставить базу наполовину перезагруженной.
+    planned: list[str] = []
+    if journal is not None:
+        planned.append(SOURCE_JOURNAL)
+    if report is not None:
+        planned.append(SOURCE_REPORT)
+    snapshots = [
+        taken
+        for taken in (snapshot_source(conn, source) for source in planned)
+        if taken is not None
+    ]
+
     if journal is not None:
         conn.execute("DELETE FROM sets WHERE source = ?", (SOURCE_JOURNAL,))
         upsert(conn, fit_rows)
@@ -1466,6 +1868,7 @@ def load_all(
         skipped_dates=skipped,
         warnings=warnings,
         overrides=feed_overrides,
+        snapshots=snapshots,
     )
 
 

@@ -231,6 +231,8 @@ def cmd_load(args: argparse.Namespace) -> int:
 
         print(f"загружено подходов: {report.total} "
               f"(журнал {report.journal}, отчёт {report.report})")
+        for snapshot in report.snapshots:
+            print(f"снимок: {snapshot.describe()}")
         if report.skipped_dates:
             print(f"пропущено дат из отчёта: {len(report.skipped_dates)} "
                   f"(есть в журнале): {', '.join(report.skipped_dates)}")
@@ -730,6 +732,51 @@ def cmd_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_restore(args: argparse.Namespace) -> int:
+    """Вернуть источник из снимка: явный путь, план, затем ``--yes``."""
+    conn = _open(args)
+    try:
+        report = etl.restore_snapshot(
+            conn, args.snapshot, dry_run=args.dry_run, confirm=args.yes,
+        )
+        for line in report.lines():
+            print(line)
+        if report.executed:
+            # Скор по дням, которых в снимке нет: он посчитан на усечённом
+            # ряде и остаётся в ledger'е (append-only). Это информация, а не
+            # действие: «лечить» ledger молча нельзя.
+            for line in _restore_score_lines(conn, report.lost_days):
+                print(line)
+        print("производные метрики не пересчитывались: откат бит-в-бит")
+        if report.verified and "НЕ пройдена" in report.verified:
+            return 1
+        if not report.executed and not report.dry_run:
+            return 1
+    finally:
+        conn.close()
+    return 0
+
+
+def _restore_score_lines(conn, days: list[str]) -> list[str]:
+    """Информационные строки про ledger скора по потерянным дням."""
+    if not days:
+        return []
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ml_score'"
+    ).fetchone():
+        return []
+    marks = ", ".join("?" * len(days))
+    rows = conn.execute(
+        f"SELECT COUNT(*) FROM ml_score WHERE day IN ({marks})", days
+    ).fetchone()[0]
+    if not rows:
+        return []
+    return [
+        f"скор по потерянным дням: {rows} записей в ml_score - оценки "
+        "посчитаны на усечённом ряде и остаются в ledger'е (append-only)"
+    ]
+
+
 def cmd_refresh(args: argparse.Namespace) -> int:
     """Единый шаг конвейера: журнал -> выгрузка -> нагрузка -> эпизоды (-> ML)."""
     conn = _open(args)
@@ -1094,6 +1141,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_export = sub.add_parser("export", help="выгрузка в CSV")
     p_export.add_argument("--out", default=etl.DEFAULT_EXPORT)
     p_export.set_defaults(func=cmd_export)
+
+    p_restore = sub.add_parser(
+        "restore", help="вернуть источник из снимка (sql/snapshots/...) "
+                        "бит-в-бит; путь к снимку - только явный")
+    p_restore.add_argument("--snapshot", required=True,
+                           help="путь к файлу снимка (journal-*.db | report-*.db)")
+    p_restore.add_argument("--dry-run", action="store_true",
+                           help="только показать план, в базу не писать")
+    p_restore.add_argument("--yes", action="store_true",
+                           help="выполнить откат (без него печатается план)")
+    p_restore.set_defaults(func=cmd_restore)
 
     p_refresh = sub.add_parser(
         "refresh", help="весь конвейер разом: журнал -> выгрузка -> нагрузка "
