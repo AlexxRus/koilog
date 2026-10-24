@@ -167,6 +167,10 @@ def _daily_by_group(conn: sqlite3.Connection) -> dict[str, dict[str, list[float]
     Возвращает ``{имя: {дата: [тоннаж, подходы, секунды]}}``. Разбиение по
     имени, а не по группе, — чтобы смешанные группы («Приседания» на своём
     теле vs со штангой) разрешались через :func:`taxonomy.mode_of`.
+
+    Фильтры те же, что у КОИ/витрины: ``is_warmup = 0``, ``skipped = 0`` и
+    ``is_outlier = 0`` (4.9, N11-a: до правки выбросы текли в групповые
+    суммы — ОТЖИМАНИЯ 374 → 354 подхода, тоннаж 187 494 → 161 539 кг).
     """
     if not _has_table(conn, "sets"):
         return {}
@@ -182,6 +186,7 @@ def _daily_by_group(conn: sqlite3.Connection) -> dict[str, dict[str, list[float]
                         THEN COALESCE(time_seconds, 0) ELSE 0 END) AS seconds
         FROM sets
         WHERE date IS NOT NULL
+          AND is_outlier = 0
         GROUP BY exercise, date
         """
     ).fetchall()

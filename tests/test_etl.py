@@ -1216,6 +1216,17 @@ class QualityReportFormattingTests(unittest.TestCase):
         self.assertIn("Полностью незнакомая штука",
                       etl.quality_report(self.conn).unmapped)
 
+    def test_unmapped_hint_is_text_and_applies_nothing(self):
+        """N7: подсказка ближайших имён печатается, но не применяется."""
+        self._insert(1, exercise="Подтягивание на перекладине",
+                     exercise_group="НЕ ОПОЗНАН")
+        text = etl.quality_report(self.conn).format(limit=5)
+        self.assertIn("похоже на:", text)
+        self.assertIn("Подтягивания на перекладине", text)
+        # имя осталось неопознанным: автоподстановки нет
+        self.assertEqual(etl.unmapped_exercises(self.conn),
+                         ["Подтягивание на перекладине"])
+
     def test_total_bodyweight_below_constant_is_explained(self):
         self._insert(1, weight=31.7, added_weight=-38.3, reps=5,
                      weight_mode="total_bodyweight")

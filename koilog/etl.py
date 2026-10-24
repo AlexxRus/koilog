@@ -50,7 +50,7 @@ from pathlib import Path
 
 from . import rules, taxonomy
 from .core import BODY_WEIGHT, RM_MAX_REPS, one_rm
-from .taxonomy import Group, WeightMode as Mode, normalize
+from .taxonomy import Group, WeightMode as Mode, normalize, storage_name
 
 __all__ = [
     "JOURNAL_COLUMNS",
@@ -1153,7 +1153,7 @@ def load_journal(
                 continue
             day = parse_journal_date(raw_date)
             clock = _to_time(cell(1))
-            exercise = normalize(cell(3))
+            exercise = storage_name(cell(3))
             if not exercise:
                 continue
 
@@ -1170,7 +1170,7 @@ def load_journal(
                 session_id=session_id,
                 date=day,
                 time=clock,
-                workout_name=normalize(cell(2)) or None,
+                workout_name=storage_name(cell(2)) or None,
                 exercise=exercise,
                 set_index=counter[exercise],
                 is_warmup=1 if normalize(cell(2)) == "Разминка" else 0,
@@ -1312,7 +1312,7 @@ def load_workoutreport(
 
             ex_match = _REPORT_EXERCISE.match(line)
             if ex_match:
-                exercise = normalize(ex_match.group("name"))
+                exercise = storage_name(ex_match.group("name"))
                 continue
 
 
@@ -2078,6 +2078,11 @@ def recompute_metrics(conn: sqlite3.Connection) -> None:
 #: а рычаг, который сам снимает часть веса. Такие строки в оценку не идут.
 BODYWEIGHT_SOURCES: tuple[str, ...] = (
     "Подтягивания на перекладине",
+    # Короткая форма из журнала (4.9, N12): с 2026-10-24 резолвится в
+    # ТЯГА ВЕРТИКАЛЬНАЯ / TOTAL_BODYWEIGHT. До этого имя было неопознанным и
+    # в оценку веса тела не попадало; без него 2020 год оценивался в 100 кг
+    # по одному разреженному кластеру.
+    "Подтягивания",
     "Подтягивания обратным хватом",
     "Подтягивания узким обратным хватом",
     "Отжимания на брусьях",
@@ -2707,7 +2712,13 @@ class QualityReport:
         """
         lines: list[str] = []
         lines.append(f"нераспознанные упражнения: {len(self.unmapped)}")
-        lines += [f"    {name}" for name in self.unmapped[:limit]]
+        # Подсказка (4.9, N7): ближайшие имена словаря. Это ТОЛЬКО текст для
+        # человека - ничего не применяется, иначе опечатка молча увела бы
+        # подходы в чужую группу.
+        for name in self.unmapped[:limit]:
+            hint = taxonomy.suggest(name)
+            note = f"  (похоже на: {', '.join(hint)})" if hint else ""
+            lines.append(f"    {name}{note}")
 
         lines.append(f"подозрительные «повторы» (похоже на секунды): "
                      f"{len(self.timed_suspects)}")

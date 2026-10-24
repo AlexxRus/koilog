@@ -6,6 +6,7 @@ import csv
 import io
 import re
 import unittest
+import warnings
 from pathlib import Path
 
 from koilog.taxonomy import (
@@ -19,9 +20,22 @@ from koilog.taxonomy import (
     is_bodyweight_based,
     is_timed_exercise,
     normalize,
+    storage_name,
+    suggest,
     unmapped,
     weight_mode_of,
 )
+
+#: Имена словаря без единого подхода в данных. Словарь - реестр ретроспективы,
+#: мёртвые имена правомерны (4.9, N5=A); список фиксирован, чтобы новое
+#: мёртвое имя требовало решения, а не появлялось молча.
+DEAD_ENTRIES = frozenset({
+    "Жим гантелей",
+    "Махи в наклоне одной рукой",
+    "Разведение рук стоя",
+    "Сгибание рук с гантелями",
+    "Тяга гантели одной рукой стоя в наклоне",
+})
 
 ROOT = Path(__file__).resolve().parent.parent
 JOURNAL_CSV = ROOT / "data" / "journal.csv"
@@ -82,6 +96,27 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(normalize(""), "")
         self.assertEqual(normalize("   "), "")
 
+    def test_yo_folds_for_matching(self):
+        """N8: ё и е - одно имя на слое сопоставления."""
+        self.assertEqual(normalize("Жим гантелей лёжа"),
+                         normalize("Жим гантелей лежа"))
+        self.assertEqual(normalize("Подъёмы рук в стороны"),
+                         normalize("Подъемы рук в стороны"))
+        self.assertEqual(normalize("ЖЁСТКО"), normalize("ЖЕСТКО"))
+
+    def test_storage_name_keeps_yo(self):
+        """Контракт двух функций: запись не складывает ё с е (N6).
+
+        Иначе перезагрузка слила бы два ряда упражнения - правка истории,
+        запрещённая рамкой 4.9.
+        """
+        self.assertNotEqual(storage_name("Жим гантелей лёжа"),
+                            storage_name("Жим гантелей лежа"))
+        self.assertEqual(storage_name("Жим гантелей лёжа"), "Жим гантелей лёжа")
+        # пробелы и NBSP по-прежнему схлопываются - это не ё→е
+        self.assertEqual(storage_name("Ноги\xa0 /  Спина"), "Ноги / Спина")
+        self.assertEqual(storage_name(None), "")
+
 
 class LookupTests(unittest.TestCase):
     def test_exact(self):
@@ -132,6 +167,62 @@ class OwnerDecisionsTests(unittest.TestCase):
     def test_standing_raise_is_delts(self):
         """Решение владельца: Разведение рук стоя -> дельты."""
         self.assertEqual(group_of("Разведение рук стоя").name, "ДЕЛЬТЫ")
+
+
+class ResolvedNamesTests(unittest.TestCase):
+    """4.9: семь имён журнала резолвятся в словарь (N1=A - только группа).
+
+    До правки они давали ``UNKNOWN`` и не попадали ни в одну группу; тест
+    ``test_no_journal_name_unmapped`` падал ровно с этим списком.
+    """
+
+    EXPECTED = {
+        "Жим гантелей лёжа": "ЖИМ ЛЁЖА",
+        "Обратные разведения одной рукой": "ДЕЛЬТЫ",
+        "Подтягивания": "ТЯГА ВЕРТИКАЛЬНАЯ",
+        "Подъёмы рук в стороны": "ДЕЛЬТЫ",
+        "Сгибания на бицепс": "БИЦЕПС",
+        "Тяга гантели в наклоне одной рукой": "ТЯГА ГОРИЗОНТАЛЬНАЯ",
+        "Шраги": "ПЛЕЧИ И ТРАПЕЦИЯ",
+    }
+
+    def test_all_seven_have_a_group(self):
+        for name, group in self.EXPECTED.items():
+            self.assertEqual(group_of(name).name, group, name)
+
+    def test_yo_variant_needs_no_dictionary_entry(self):
+        """N8: «лёжа» матчится на «лежа», отдельной записи нет."""
+        self.assertNotIn("Жим гантелей лёжа", EXERCISE_GROUP)
+        self.assertIn("Жим гантелей лежа", EXERCISE_GROUP)
+        self.assertEqual(group_of("Жим гантелей лёжа").name, "ЖИМ ЛЁЖА")
+
+    def test_pullups_are_total_bodyweight(self):
+        """N12: 39...84 с дробями - суммарный вес тела с добавкой."""
+        self.assertEqual(weight_mode_of("Подтягивания"),
+                         WeightMode.TOTAL_BODYWEIGHT)
+        self.assertTrue(is_bodyweight_based("Подтягивания"))
+
+    def test_other_six_are_absolute(self):
+        for name in set(self.EXPECTED) - {"Подтягивания"}:
+            self.assertEqual(weight_mode_of(name), WeightMode.ABSOLUTE, name)
+
+
+class SuggestTests(unittest.TestCase):
+    """N7: подсказчик - текст, а не автомат."""
+
+    def test_suggests_dictionary_names_without_applying(self):
+        name = "Подтягивание на перекладине"      # пропущена «я»
+        found = suggest(name)
+        self.assertTrue(found)
+        self.assertLessEqual(len(found), 3)
+        self.assertIn("Подтягивания на перекладине", found)
+        self.assertTrue(all(item in EXERCISE_GROUP for item in found))
+        # ничего не применилось: имя осталось неизвестным
+        self.assertIs(group_of(name), UNKNOWN)
+
+    def test_empty_name_has_no_suggestions(self):
+        self.assertEqual(suggest(None), [])
+        self.assertEqual(suggest("   "), [])
 
 
 class WeightModeTests(unittest.TestCase):
@@ -237,12 +328,26 @@ class CoverageTests(unittest.TestCase):
 
     @unittest.skipUnless(HAS_REAL_DATA, "нет data/journal.csv и/или data/report.csv")
     def test_no_unused_entries(self):
+        """Мёртвые имена правомерны, но список фиксирован (4.9, N5=A).
+
+        Смягчено до warn: словарь - реестр ретроспективы, имена из старых
+        выгрузок в текущих данных могут отсутствовать. Поэтому пять известных
+        мёртвых имён только предупреждают; любое **новое** мёртвое имя - уже
+        повод для решения, а не тихая запись словаря.
+        """
         real = journal_names() | report_names()
         keys = {normalize(n) for n in real}
         stale = sorted(
             name for name in EXERCISE_GROUP if normalize(name) not in keys
         )
-        self.assertEqual(stale, [], f"в словаре есть имена, которых нет в данных: {stale}")
+        if stale:
+            warnings.warn(f"в словаре есть имена без данных: {stale}",
+                          stacklevel=2)
+        unexpected = [name for name in stale if name not in DEAD_ENTRIES]
+        self.assertEqual(
+            unexpected, [],
+            f"новые мёртвые имена словаря (нужно решение): {unexpected}",
+        )
 
     def test_every_entry_points_at_a_real_group(self):
         broken = {

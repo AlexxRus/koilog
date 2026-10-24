@@ -46,7 +46,8 @@ def _schema(conn: sqlite3.Connection) -> None:
             koi        REAL,
             time_seconds INTEGER,
             is_warmup  INTEGER NOT NULL DEFAULT 0,
-            skipped    INTEGER NOT NULL DEFAULT 0
+            skipped    INTEGER NOT NULL DEFAULT 0,
+            is_outlier INTEGER NOT NULL DEFAULT 0
         );
         """
     )
@@ -65,11 +66,13 @@ def _add(
     weight: float | None = 100.0,
     reps: int | None = 10,
     time_seconds: int | None = None,
+    is_outlier: int = 0,
 ) -> None:
     conn.execute(
-        "INSERT INTO sets (exercise, date, weight, reps, time_seconds) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (exercise, date, weight, reps, time_seconds),
+        "INSERT INTO sets "
+        "(exercise, date, weight, reps, time_seconds, is_outlier) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (exercise, date, weight, reps, time_seconds, is_outlier),
     )
 
 
@@ -545,6 +548,36 @@ class DigestBoundaryTests(unittest.TestCase):
         st = digest.day_state(conn, "2024-01-20")
         self.assertEqual(digest.groups_state(conn, "2024-01-20")["rows"], [])
         self.assertIn("нет данных", digest._groups_line(st["groups"]))
+
+
+class OutlierFilterTests(unittest.TestCase):
+    """4.9 (N11-a): выбросы не текут в групповую витрину.
+
+    До правки фильтр был только ``is_warmup/skipped``; на живой базе это
+    давало ОТЖИМАНИЯ 374 подхода / 187 494 кг вместо 354 / 161 539.
+    """
+
+    def test_outlier_row_is_excluded_from_daily_sums(self):
+        conn = _db()
+        self.addCleanup(conn.close)
+        _schema(conn)
+        _add(conn, "Жим штанги лежа", "2024-01-10", 100.0, 10)
+        _add(conn, "Жим штанги лежа", "2024-01-10", 400.0, 10, is_outlier=1)
+        conn.commit()
+        daily = groups._daily_by_group(conn)
+        # остался только невыбросовый подход: 100 кг x 10
+        self.assertEqual(daily["Жим штанги лежа"]["2024-01-10"],
+                         [1000.0, 1.0, 0.0])
+
+    def test_outlier_only_day_disappears_from_series(self):
+        conn = _db()
+        self.addCleanup(conn.close)
+        _schema(conn)
+        _add(conn, "Жим штанги лежа", "2024-01-10", 100.0, 10)
+        _add(conn, "Жим штанги лежа", "2024-01-11", 400.0, 10, is_outlier=1)
+        conn.commit()
+        daily = groups._daily_by_group(conn)
+        self.assertNotIn("2024-01-11", daily["Жим штанги лежа"])
 
 
 if __name__ == "__main__":
