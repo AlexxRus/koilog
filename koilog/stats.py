@@ -66,6 +66,7 @@ __all__ = [
     "PERIOD_DAYS",
     "PeriodStats",
     "ProgramPlan",
+    "RecentExercise",
     "WeeklyKoi",
     "WeeklyKoiGroup",
     "HistoryRow",
@@ -77,6 +78,7 @@ __all__ = [
     "format_history",
     "format_periods",
     "format_plan",
+    "format_recent_exercises",
     "format_report",
     "format_transitions",
     "format_weekly_koi",
@@ -85,6 +87,7 @@ __all__ = [
     "periods",
     "progression_from_available",
     "progression_from_db",
+    "recent_exercises",
     "since_for_months",
     "weekly_koi",
     "weekly_koi_by_group",
@@ -437,6 +440,72 @@ def since_for_months(conn: sqlite3.Connection, months: int) -> str | None:
         (str(int(months)),),
     ).fetchone()
     return row[0] if row and row[0] else None
+
+
+# --------------------------------------------------------------------------
+# Список упражнений за последний месяц (UX ручного ввода, 4.12)
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class RecentExercise:
+    """Имя, число подходов и последняя дата в окне последних дней."""
+
+    exercise: str
+    sets: int
+    last_day: str
+
+
+def recent_exercises(
+    conn: sqlite3.Connection, days: int = 28
+) -> list[RecentExercise]:
+    """Имена, которые реально использовались за последние ``days`` дней.
+
+    Окно считается от **последней даты в базе**, а не от календарного
+    «сегодня» (как :func:`since_for_months`): журнал может отставать.
+    Входят все имена, включая кардио и «Разминку»: это защита от опечаток
+    перед ручным вводом, а не витрина нагрузки. Сортировка - последняя
+    дата, затем число подходов, затем имя.
+    """
+    if days <= 0:
+        return []
+    row = conn.execute(
+        "SELECT MAX(date), date(MAX(date), '-' || ? || ' days') FROM sets"
+        " WHERE date IS NOT NULL",
+        (str(int(days) - 1),),
+    ).fetchone()
+    if not row or not row[0] or not row[1]:
+        return []
+    rows = conn.execute(
+        """
+        SELECT exercise, COUNT(*) AS sets, MAX(date) AS last_day
+          FROM sets
+         WHERE date IS NOT NULL AND date >= ?
+         GROUP BY exercise
+         ORDER BY last_day DESC, sets DESC, exercise
+        """,
+        (row[1],),
+    ).fetchall()
+    return [RecentExercise(r[0], r[1], r[2]) for r in rows]
+
+
+def format_recent_exercises(
+    rows: Sequence[RecentExercise], width: int = 36
+) -> str:
+    """Таблица «имя | подходов | последняя дата» для ноутбука и CLI.
+
+    Имя по умолчанию не укорачивается: полное «Тяга гантели в наклоне
+    одной рукой» должно быть видно целиком - ради этого список и нужен.
+    """
+    if not rows:
+        return "за последний месяц записей нет\n"
+    header = f"{'упражнение':<{width}}  {'подходов':>8}  последняя дата"
+    lines = [header, "-" * len(header)]
+    for row in rows:
+        lines.append(
+            f"{row.exercise[:width]:<{width}}  {row.sets:>8}  {row.last_day}"
+        )
+    return "\n".join(lines) + "\n"
 
 
 # --------------------------------------------------------------------------
