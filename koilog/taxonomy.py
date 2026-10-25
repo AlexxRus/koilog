@@ -43,7 +43,6 @@ __all__ = [
     "counts_rm_of",
     "group_of",
     "is_bodyweight_based",
-    "lookup",
     "mode_of",
     "normalize",
     "storage_name",

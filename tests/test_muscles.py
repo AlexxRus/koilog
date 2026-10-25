@@ -148,5 +148,21 @@ class CsvParityTests(unittest.TestCase):
             self.assertEqual(profile.note, row["note"], row["exercise"])
 
 
+class IndexCollisionTests(unittest.TestCase):
+    """T-94: ``_index()`` падает на двойном сопоставлении после normalize."""
+
+    def test_double_mapping_raises(self):
+        old = muscles._COMPOSITION
+        try:
+            muscles._COMPOSITION = {
+                "Жим гантелей лежа": ("грудь",),
+                "Жим гантелей лёжа": ("трицепс",),
+            }
+            with self.assertRaisesRegex(ValueError, "двойное сопоставление"):
+                muscles._index()
+        finally:
+            muscles._COMPOSITION = old
+
+
 if __name__ == "__main__":
     unittest.main()

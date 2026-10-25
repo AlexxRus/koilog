@@ -9,6 +9,7 @@ import unittest
 import warnings
 from pathlib import Path
 
+from koilog import taxonomy
 from koilog.taxonomy import (
     BODYWEIGHT_EXERCISES,
     EXERCISE_GROUP,
@@ -311,6 +312,39 @@ class TimedTests(unittest.TestCase):
     def test_timed_set_only_contains_known_exercises(self):
         unknown = unmapped(TIMED_EXERCISES)
         self.assertEqual(unknown, [], f"в TIMED_EXERCISES есть чужие имена: {unknown}")
+
+
+class ExportGuardTests(unittest.TestCase):
+    """T-94: ``__all__`` не содержит мёртвых имён и импортируется целиком."""
+
+    def test_all_names_exist_and_lookup_is_gone(self):
+        for name in taxonomy.__all__:
+            self.assertTrue(hasattr(taxonomy, name), name)
+        self.assertNotIn("lookup", taxonomy.__all__)
+        namespace: dict = {}
+        exec("from koilog.taxonomy import *", namespace)
+        self.assertNotIn("lookup", namespace)
+        self.assertIn("group_of", namespace)
+
+
+class IndexCollisionTests(unittest.TestCase):
+    """T-94: гвард двойного сопоставления действительно срабатывает."""
+
+    def test_taxonomy_double_mapping_raises(self):
+        old_group = taxonomy.EXERCISE_GROUP
+        old_index = dict(taxonomy._INDEX)
+        try:
+            taxonomy.EXERCISE_GROUP = {
+                "Жим гантелей лежа": "ЖИМ ЛЁЖА",
+                "Жим гантелей лёжа": "ТРИЦЕПС",
+            }
+            taxonomy._INDEX.clear()
+            with self.assertRaisesRegex(ValueError, "двойное сопоставление"):
+                taxonomy._build_index()
+        finally:
+            taxonomy.EXERCISE_GROUP = old_group
+            taxonomy._INDEX.clear()
+            taxonomy._INDEX.update(old_index)
 
 
 class CoverageTests(unittest.TestCase):
