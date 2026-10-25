@@ -431,20 +431,30 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
 
 
 def _session_rows(conn: sqlite3.Connection) -> dict[str, dict]:
-    """Свести ``sets`` в дневные суммы: подходы, тоннаж, КОИ, лучший e1RM."""
+    """Свести ``sets`` в дневные суммы: подходы, тоннаж, КОИ, лучший e1RM.
+
+    Вход чистый (4.13, N11-b): выбросы исключены из всех дневных сумм
+    (``is_outlier = 0``), гравитронные подходы - из ``tonnage``/``koi_sum``
+    (вес помощи, а не нагрузки), но остаются в ``sets`` и ``rm_best``:
+    частота тренировки и лучший 1RM дня от флага не зависят.
+    """
     rows = conn.execute(
         """
         SELECT date,
                COUNT(*)                                          AS sets,
                SUM(CASE WHEN is_warmup = 0 AND skipped = 0
+                         AND is_gravitron = 0
                         THEN weight * reps ELSE 0 END)           AS tonnage,
-               SUM(CASE WHEN is_warmup = 0 AND skipped = 0 AND rm_session > 0
+               SUM(CASE WHEN is_warmup = 0 AND skipped = 0
+                         AND is_gravitron = 0 AND rm_session > 0
                         THEN weight * reps * (weight / rm_session)
                         ELSE 0 END)                              AS tonnage_iw,
-               SUM(COALESCE(koi, 0))                             AS koi_sum,
+               SUM(CASE WHEN is_gravitron = 0
+                        THEN COALESCE(koi, 0) ELSE 0 END)        AS koi_sum,
                MAX(rm_session)                                   AS rm_best
         FROM sets
         WHERE date IS NOT NULL
+          AND is_outlier = 0
         GROUP BY date
         """
     ).fetchall()

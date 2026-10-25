@@ -1268,5 +1268,43 @@ class QualityReportFormattingTests(unittest.TestCase):
         self.assertIn("Планка", report.format(limit=5))
 
 
+class GravitronFlagTests(unittest.TestCase):
+    """4.13: гравитрон помечается, но история не правится."""
+
+    def _row(self, day, weight, exercise="Подтягивания", reps=8):
+        return etl.SetRow(
+            source="journal", source_row=1, session_id="s", date=day,
+            exercise=exercise, weight=weight, reps=reps,
+        )
+
+    def test_old_assistance_is_marked(self):
+        row = etl._finalize(self._row("2019-03-09", 39.0), body_weight=69.0)
+        self.assertEqual(row.added_weight, -30.0)
+        self.assertEqual(row.is_gravitron, 1)
+
+    def test_2021_lever_is_not_marked(self):
+        row = etl._finalize(
+            self._row("2021-08-19", 60.0,
+                      exercise="Подтягивания широким хватом за голову"),
+            body_weight=68.0,
+        )
+        self.assertEqual(row.added_weight, -8.0)
+        self.assertEqual(row.is_gravitron, 0)
+
+    def test_normal_pullup_is_not_marked(self):
+        row = etl._finalize(self._row("2019-03-09", 80.0), body_weight=69.0)
+        self.assertEqual(row.is_gravitron, 0)
+
+    def test_schema_has_the_flag_with_default_zero(self):
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        etl.create_schema(conn)
+        columns = {
+            row[1]: row for row in conn.execute("PRAGMA table_info(sets)")
+        }
+        self.assertIn("is_gravitron", columns)
+        self.assertEqual(columns["is_gravitron"][4], "0")
+
+
 if __name__ == "__main__":
     unittest.main()

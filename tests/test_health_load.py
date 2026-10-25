@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import unittest
 
 from koilog.health import load
@@ -143,6 +144,62 @@ class RmRegressTests(unittest.TestCase):
     def test_rest_days_are_not_flagged(self):
         series = [None, 100.0, None, 100.0, None, 100.0, None, 100.0]
         self.assertEqual(sum(load.rm_regress(series)), 0)
+
+
+class SessionRowsCleanInputTests(unittest.TestCase):
+    """4.13: вход load_daily чист от выбросов и гравитрона."""
+
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.row_factory = sqlite3.Row
+        self.conn.executescript(
+            """
+            CREATE TABLE sets (
+                date TEXT, exercise TEXT, weight REAL, reps INTEGER,
+                rm_session REAL, koi REAL,
+                is_warmup INTEGER NOT NULL DEFAULT 0,
+                skipped INTEGER NOT NULL DEFAULT 0,
+                is_outlier INTEGER NOT NULL DEFAULT 0,
+                is_gravitron INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+        self.addCleanup(self.conn.close)
+
+    def _add(self, date, weight, reps, *, koi=1.0, rm_session=100.0,
+             outlier=0, gravitron=0, skipped=0):
+        self.conn.execute(
+            "INSERT INTO sets (date, exercise, weight, reps, rm_session, "
+            "koi, is_outlier, is_gravitron, skipped) "
+            "VALUES (?, 'Жим штанги лежа', ?, ?, ?, ?, ?, ?, ?)",
+            (date, weight, reps, rm_session, koi, outlier, gravitron,
+             skipped),
+        )
+        self.conn.commit()
+
+    def test_outlier_is_out_of_all_daily_sums(self):
+        self._add("2024-01-10", 100.0, 5, koi=1.0)
+        self._add("2024-01-10", 400.0, 5, koi=2.0, outlier=1)
+        row = load._session_rows(self.conn)["2024-01-10"]
+        self.assertEqual(row["sets"], 1)
+        self.assertEqual(row["tonnage"], 500.0)
+        self.assertEqual(row["koi_sum"], 1.0)
+
+    def test_gravitron_leaves_tonnage_and_koi_but_not_sets_rm(self):
+        self._add("2019-03-09", 80.0, 5, koi=2.0, rm_session=100.0)
+        self._add("2019-03-09", 39.0, 5, koi=3.0, rm_session=120.0,
+                  gravitron=1)
+        row = load._session_rows(self.conn)["2019-03-09"]
+        self.assertEqual(row["sets"], 2)
+        self.assertEqual(row["tonnage"], 400.0)   # только 80 x 5
+        self.assertEqual(row["koi_sum"], 2.0)     # гравитрон не в КОИ
+        self.assertEqual(row["rm_best"], 120.0)   # rm_best не трогаем
+
+    def test_koi_of_outlier_is_already_null_and_does_not_change(self):
+        self._add("2024-01-10", 100.0, 5, koi=1.0)
+        self._add("2024-01-10", 400.0, 5, koi=5.0, outlier=1)
+        self.assertEqual(load._session_rows(self.conn)["2024-01-10"]["koi_sum"],
+                         1.0)
 
 
 if __name__ == "__main__":

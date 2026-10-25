@@ -73,6 +73,17 @@ class RecentExercisesTests(unittest.TestCase):
         self.assertIn("подходов", text)
         self.assertTrue(text.endswith("\n"))
 
+    def test_format_expands_for_name_longer_than_width(self):
+        """Имя длиннее width расширяет колонку, а не обрезается (Task 90)."""
+        name = "Вертикальная тяга верхнего блока за голову широким хватом"
+        self.assertGreater(len(name), 36)
+        _add(self.conn, "2024-02-10", name)
+        self.conn.commit()
+        text = stats.format_recent_exercises(
+            stats.recent_exercises(self.conn), width=36)
+        self.assertIn(name, text)
+        self.assertNotIn(name[:35] + "  ", text)
+
 
 if __name__ == "__main__":
     unittest.main()

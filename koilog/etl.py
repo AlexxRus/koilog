@@ -178,6 +178,7 @@ CREATE TABLE IF NOT EXISTS sets (
   note           TEXT,
   is_outlier     INTEGER NOT NULL DEFAULT 0,
   outlier_rule   TEXT,
+  is_gravitron   INTEGER NOT NULL DEFAULT 0,
   rm             REAL,
   rm_session     REAL,
   rm_delta       REAL,
@@ -203,6 +204,7 @@ CREATE INDEX IF NOT EXISTS ix_sets_source   ON sets(source);
 ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("is_outlier", "INTEGER NOT NULL DEFAULT 0"),
     ("outlier_rule", "TEXT"),
+    ("is_gravitron", "INTEGER NOT NULL DEFAULT 0"),
     ("raw_weight", "REAL"),
 )
 
@@ -337,6 +339,7 @@ class SetRow:
     note: str | None = None
     is_outlier: int = 0
     outlier_rule: str | None = None
+    is_gravitron: int = 0
     rm: float | None = None
 
     @property
@@ -360,7 +363,8 @@ class SetRow:
             str(self.weight_mode), self.set_index, self.is_warmup,
             self.weight, self.raw_weight, self.added_weight, self.reps, self.time_seconds,
             self.distance, self.rest_seconds, self.is_timed, self.timed_reason,
-            self.skipped, self.note, self.is_outlier, self.outlier_rule, self.rm,
+            self.skipped, self.note, self.is_outlier, self.outlier_rule,
+            self.is_gravitron, self.rm,
         )
 
 
@@ -369,12 +373,12 @@ _COLUMNS = (
     "duration_min, exercise, exercise_group, equipment, weight_mode, "
     "set_index, is_warmup, weight, raw_weight, added_weight, reps, time_seconds, "
     "distance, rest_seconds, is_timed, timed_reason, skipped, note, "
-    "is_outlier, outlier_rule, rm"
+    "is_outlier, outlier_rule, is_gravitron, rm"
 )
 
 _INSERT = (
     f"INSERT INTO sets ({_COLUMNS}) VALUES "
-    f"({', '.join('?' * 29)}) "
+    f"({', '.join('?' * 30)}) "
     f"ON CONFLICT(source, source_row) DO UPDATE SET "
     + ", ".join(
         f"{name} = excluded.{name}"
@@ -735,6 +739,18 @@ def _classify(exercise: str | None) -> tuple[Group, Mode]:
     return taxonomy.group_of(exercise), taxonomy.weight_mode_of(exercise)
 
 
+#: Гравитрон: записан вес **помощи**, а не нагрузки (4.13).
+#:
+#: Сигнатура: режим ``total_bodyweight`` и ``added_weight`` существенно
+#: отрицательный (вес записи заметно меньше веса тела года). Порог -8 кг
+#: замерен на данных: 34 подхода 2015-2019 (3.04 % всех подтягиваний),
+#: тоннаж 12 101.8 кг. Шесть подходов 2021 «широким хватом за голову»
+#: (added = -8.0) - рычаг, а не гравитрон, поэтому граница даты
+#: ``date < 2020-01-01``. Флаг display/мониторинг, в решения не идёт (D11-b).
+GRAVITRON_MAX_ADDED = -8.0
+GRAVITRON_LAST_DAY = "2020-01-01"
+
+
 def _finalize(row: SetRow, body_weight: float = BODY_WEIGHT) -> SetRow:
     """Дополнить разобранную строку: группа, тайминг, вес, 1RM."""
     group, mode = _classify(row.exercise)
@@ -791,6 +807,15 @@ def _finalize(row: SetRow, body_weight: float = BODY_WEIGHT) -> SetRow:
     )
     row.is_outlier = 0 if hit is None else 1
     row.outlier_rule = str(hit) if hit is not None else None
+
+    # 2-бис. Гравитрон (4.13): вес помощи, а не нагрузки. Флаг только
+    # помечает, история не правится; из тонажа его убирает load._session_rows.
+    row.is_gravitron = 1 if (
+        row.weight_mode is Mode.TOTAL_BODYWEIGHT
+        and row.added_weight is not None
+        and row.added_weight <= GRAVITRON_MAX_ADDED
+        and row.date < GRAVITRON_LAST_DAY
+    ) else 0
 
     # 3. Метрики. Пропущенный, тайминговый и помеченный выбросом подход
     #    ничего не получает: из них нечего считать.
@@ -1930,12 +1955,18 @@ def _refill_bodyweight(
             rm,
             0 if hit is None else 1,
             str(hit) if hit is not None else None,
+            1 if (
+                decision.mode is Mode.TOTAL_BODYWEIGHT
+                and decision.added_weight is not None
+                and decision.added_weight <= GRAVITRON_MAX_ADDED
+                and row["date"] < GRAVITRON_LAST_DAY
+            ) else 0,
             row["id"],
         ))
 
     conn.executemany(
         "UPDATE sets SET weight = ?, added_weight = ?, rm = ?, "
-        "is_outlier = ?, outlier_rule = ? WHERE id = ?",
+        "is_outlier = ?, outlier_rule = ?, is_gravitron = ? WHERE id = ?",
         updates,
     )
     conn.commit()
