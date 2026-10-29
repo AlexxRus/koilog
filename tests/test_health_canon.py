@@ -254,7 +254,7 @@ class RowsOutputTests(unittest.TestCase):
 
 
 class DeterminismTests(unittest.TestCase):
-    """Тай-брейки выбора строки и порядок в тексте (хвост Task 55).
+    """Тай-брейки выбора строки и порядок в тексте (хвосты N-2).
 
     Правила названы в докстрингах :func:`digest._score_row` и
     :func:`digest._ledger_specs`; здесь они прибиты тестами, чтобы «любое, но
@@ -336,9 +336,9 @@ class DeterminismTests(unittest.TestCase):
 def _ledger_rows(path) -> int | None:
     """Число строк ledger'а или ``None``, если таблицы ``ml_score`` нет.
 
-    Гвард живого класса (GU-105): ``ml_score`` создаёт ``score``/``refresh
-    --deep``, а не ``load``. Файл базы, оставшийся после ``load``, таблицы не
-    имеет - и это состояние среды, а не данных.
+    Гвард живого класса (пререг ``docs/4-16-live-guards.md``): ``ml_score``
+    создаёт ``score``/``refresh --deep``, а не ``load``. Файл базы, оставшийся
+    после ``load``, таблицы не имеет - и это состояние среды, а не данных.
     """
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
