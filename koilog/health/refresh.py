@@ -212,12 +212,20 @@ def run(
     (``--allow-incomplete-feed``): снимает abort-проверки полноты и формы.
     Обход громкий: строка в :func:`format_freshness` и маркер
     :data:`FEED_OVERRIDE_KEY` в ``aw_meta`` рядом со слепком файла.
+
+    **Отказ среды - до работы.** Если ни выгрузки часов, ни таблиц ``aw_*``
+    нет (базу ещё ни разу не разбирали), шаг поднимает ``RuntimeError`` с
+    одной строкой «сначала: apple-load» **до** загрузки журнала. Так отказ не
+    оставляет в базе полузагруженный ``sets``: слепок журнала пишется в
+    ``aw_meta``, которой без часов не существует.
     """
     step = Step(deep=deep)
-    journal_path = _load_journal(
-        conn, journal, step, allow_incomplete_feed=allow_incomplete_feed
-    )
 
+    # Источник часов разрешается **до** стадии журнала: это не разбор (он
+    # дорог, ~45 с), а поиск файла. Нужен он здесь, чтобы отказ среды
+    # срабатывал до первой записи: стадия журнала пишет ``sets`` и слепок в
+    # ``aw_meta``, а ``aw_*`` создаёт только разбор выгрузки. Прежний порядок
+    # оставлял в базе полузагруженный журнал и падал уже на слепке.
     resolved = None
     try:
         resolved = apple.resolve_source(source)
@@ -225,6 +233,15 @@ def run(
         resolved = None
 
     step.source = resolved.path if resolved else None
+
+    if resolved is None and not _has_table(conn, "aw_meta"):
+        raise RuntimeError(
+            "нет таблиц aw_* - сначала:  python -m koilog apple-load"
+        )
+
+    journal_path = _load_journal(
+        conn, journal, step, allow_incomplete_feed=allow_incomplete_feed
+    )
 
     if resolved is None:
         step.stages.append("выгрузка (нет файла — работаю от базы)")

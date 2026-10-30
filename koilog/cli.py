@@ -103,6 +103,17 @@ def _open(args: argparse.Namespace) -> sqlite3.Connection:
     return conn
 
 
+def _env_failure(exc: Exception) -> int:
+    """Отказ среды: одна строка в stderr и код 1, без трассировки.
+
+    Сообщения модулей здоровья уже говорят, чего не хватает и что запустить
+    («сначала: …»). Стек вызовов поверх такой строки только прячет её. Отказ
+    при этом остаётся отказом: команда ничего не считает и возвращает 1.
+    """
+    print(str(exc).strip() or exc.__class__.__name__, file=sys.stderr)
+    return 1
+
+
 def _csv_number(value: float | None, digits: int = 2) -> str:
     """Число для CSV: с округлением, ``None`` - пустой ячейкой.
 
@@ -795,6 +806,10 @@ def cmd_refresh(args: argparse.Namespace) -> int:
         step = health_refresh.run(conn, deep=args.deep, source=args.xml,
                                   journal=journal,
                                   allow_incomplete_feed=args.allow_incomplete_feed)
+    except (RuntimeError, sqlite3.OperationalError) as exc:
+        # Отказ среды (нет таблиц aw_*, нет load_daily для --deep): текст
+        # модуля уже говорит, чего не хватает, - трассировка не нужна.
+        return _env_failure(exc)
     finally:
         conn.close()
     print(health_refresh.format_freshness(step))
@@ -833,7 +848,11 @@ def cmd_illness(args: argparse.Namespace) -> int:
     """Пересобрать и показать эпизоды болезни (``--detail`` — каналы эпизода)."""
     conn = _open(args)
     try:
-        health_illness.build(conn, window=args.window)
+        try:
+            health_illness.build(conn, window=args.window)
+        except RuntimeError as exc:
+            # Неполная база (нет aw_daily): отказ одной строкой, не стеком.
+            return _env_failure(exc)
         if args.detail is not None:
             from .health import analysis as health_analysis
 
@@ -854,7 +873,11 @@ def cmd_ml(args: argparse.Namespace) -> int:
 
     conn = _open(args)
     try:
-        data = health_ml.report(conn, window=args.window, as_json=args.json)
+        try:
+            data = health_ml.report(conn, window=args.window, as_json=args.json)
+        except RuntimeError as exc:
+            # Нет aw_daily/load_daily или нет numpy - обе беды среды.
+            return _env_failure(exc)
     finally:
         conn.close()
 
@@ -963,8 +986,7 @@ def cmd_score(args: argparse.Namespace) -> int:
         except (RuntimeError, sqlite3.OperationalError) as exc:
             # нет ML-таблиц или нет extra ml - это не повод для трассировки:
             # говорим, какой шаг конвейера пропущен
-            print(str(exc), file=sys.stderr)
-            return 1
+            return _env_failure(exc)
 
         items = health_score.rows(conn, limit=args.last,
                                   prospective_only=args.prospective,
