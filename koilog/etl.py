@@ -834,11 +834,6 @@ def _finalize(row: SetRow, body_weight: float = BODY_WEIGHT) -> SetRow:
 # Парсер: журнала
 # --------------------------------------------------------------------------
 
-JOURNAL_COLUMNS = (
-    "date", "time", "workout", "exercise", "distance", "weight", "multiplier",
-    "time_s", "reps", "rest_s", "skipped", "note",
-)
-
 
 def _journal_session_id(day: str, clock: str | None, index: int) -> str:
     """Ключ тренировки: дата и время, а при его отсутствии - порядковый номер.
