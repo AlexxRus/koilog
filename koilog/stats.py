@@ -181,7 +181,8 @@ class ExerciseStats:
 #: Сводные показатели по упражнению. Считаются в два прохода: сначала
 #: агрегаты, потом лучший и последний 1RM оконными функциями - в одном
 #: SELECT'е «максимум + последняя строка» не выразить.
-#: ``{since}`` подставляется как условие даты (см. :func:`exercise_report`).
+#: ``{since}`` подставляется как условие даты (см. :func:`exercise_report`),
+#: ``{warmup}`` - фильтр разминки (см. :func:`exercise_report`).
 _TOTALS_SQL = """
 SELECT exercise,
        MIN(exercise_group)                AS exercise_group,
@@ -198,6 +199,7 @@ SELECT exercise,
   FROM sets
  WHERE skipped = 0
    AND is_outlier = 0
+   {warmup}
    {since}
  GROUP BY exercise
 """
@@ -319,6 +321,7 @@ def exercise_report(
     order: str = "best_rm",
     limit: int | None = None,
     since: str | None = None,
+    include_warmup: bool = False,
 ) -> list[ExerciseStats]:
     """Сводка по упражнениям, отсортированная по заданному признаку.
 
@@ -328,6 +331,14 @@ def exercise_report(
     иначе первая тренировка окна всегда показывала бы ``None``. Упражнения
     без подходов в окне в сводку не попадают вовсе: в них и нет смысла,
     если ими давно не занимались.
+
+    ``include_warmup`` (по умолчанию выключено) оставляет в сводке
+    псевдо-упражнение «разминка». Это счётчик введённых строк, а не
+    тренировочный объём: у разминки нет ни веса, ни повторов, ни 1RM, ни
+    КОИ, поэтому на ``best_rm``/``last_rm``/``record_rm`` переключатель не
+    влияет - фильтр стоит только в агрегатах ``sets``. Разминка считается и
+    в :func:`window_sets`, чтобы переключатель был виден там, где окно
+    фильтрует по 1RM и строки разминки в таблице нет.
 
     ``order``:
 
@@ -348,11 +359,17 @@ def exercise_report(
         raise ValueError(f"неизвестный ключ сортировки: {order!r}")
 
     if since:
-        totals_sql = _TOTALS_SQL.format(since="AND date >= ?")
+        totals_sql = _TOTALS_SQL.format(
+            warmup="" if include_warmup else "AND is_warmup = 0",
+            since="AND date >= ?",
+        )
         details_sql = _BEST_LAST_SQL.format(since="WHERE date >= ?")
         params: tuple[str, ...] = (since, since)
     else:
-        totals_sql = _TOTALS_SQL.format(since="")
+        totals_sql = _TOTALS_SQL.format(
+            warmup="" if include_warmup else "AND is_warmup = 0",
+            since="",
+        )
         details_sql = _BEST_LAST_SQL.format(since="")
         params = ()
 
@@ -422,6 +439,30 @@ def exercise_report(
     else:
         out.sort(key=keys, reverse=True)
     return out[:limit] if limit else out
+
+
+def window_sets(
+    conn: sqlite3.Connection, since: str | None = None
+) -> tuple[int, int]:
+    """Подходы окна: всего и без разминки.
+
+    То же окно, что у :func:`exercise_report`: ``skipped = 0``,
+    ``is_outlier = 0``, опционально ``date >= since``. Возвращает
+    ``(всего, рабочих)``. Нужен витринам, которые фильтруют по 1RM: там
+    строки разминки в таблице нет ни в одном положении переключателя, и без
+    отдельного счётчика «Учитывать разминку» было бы невидимым.
+    """
+    where = "skipped = 0 AND is_outlier = 0"
+    params: tuple[str, ...] = ()
+    if since:
+        where += " AND date >= ?"
+        params = (since,)
+    row = conn.execute(
+        f"SELECT COUNT(*), COALESCE(SUM(CASE WHEN is_warmup = 0 THEN 1 ELSE 0 "
+        f"END), 0) FROM sets WHERE {where}",
+        params,
+    ).fetchone()
+    return int(row[0] or 0), int(row[1] or 0)
 
 
 def since_for_months(conn: sqlite3.Connection, months: int) -> str | None:
@@ -1541,7 +1582,10 @@ def progression_from_db(
 
 
 def _one_stats(conn: sqlite3.Connection, exercise: str) -> ExerciseStats | None:
-    found = exercise_report(conn, exercise=exercise)
+    # ``include_warmup=True``: это разбор одного имени (программа/проверка
+    # наличия), а не витрина. Для «Разминки» поведение остаётся прежним,
+    # для настоящих упражнений разминка - другое имя и ни на что не влияет.
+    found = exercise_report(conn, exercise=exercise, include_warmup=True)
     return found[0] if found else None
 
 

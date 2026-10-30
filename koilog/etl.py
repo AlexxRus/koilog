@@ -59,6 +59,7 @@ __all__ = [
     "RestoreReport",
     "SNAPSHOT_DIRNAME",
     "SNAPSHOT_KEEP",
+    "WARMUP_NAME",
     "SetRow",
     "Snapshot",
     "TimedDecision",
@@ -74,6 +75,7 @@ __all__ = [
     "ExerciseAudit",
     "export_csv",
     "implied_bodyweight",
+    "is_warmup_name",
     "load_all",
     "load_journal",
     "load_workoutreport",
@@ -141,6 +143,25 @@ LEGACY_SOURCES: tuple[tuple[str, str], ...] = (
     ("fitsession", SOURCE_JOURNAL),
     ("workoutreport", SOURCE_REPORT),
 )
+
+#: Псевдо-упражнение разминки в колонке ``УПРАЖНЕНИЕ`` журнала. Разминка -
+#: метаданные тренировки, а не подход реального упражнения: у неё нет веса,
+#: повторов, 1RM и КОИ, и в этих расчётах она не участвует. Флаг
+#: ``sets.is_warmup`` ставится по **имени упражнения** (колонка 3), а не по
+#: названию тренировки (колонка 2): названия тренировок вида «2. Жим» с
+#: разминкой не совпадают никогда.
+WARMUP_NAME = "Разминка"
+
+
+def is_warmup_name(exercise: str | None) -> bool:
+    """Разминка ли это - по имени упражнения, без учёта регистра.
+
+    Сравнение идёт через :func:`koilog.taxonomy.normalize`, потому что имя
+    набирается руками: в журнале встречаются лишние пробелы и разный регистр.
+    """
+    return bool(exercise) and (
+        normalize(exercise).casefold() == WARMUP_NAME.casefold()
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1200,7 +1221,7 @@ def load_journal(
                 workout_name=storage_name(cell(2)) or None,
                 exercise=exercise,
                 set_index=counter[exercise],
-                is_warmup=1 if normalize(cell(2)) == "Разминка" else 0,
+                is_warmup=1 if is_warmup_name(exercise) else 0,
                 weight=_to_float(cell(5)),
                 reps=_to_int(cell(8)),
                 time_seconds=_to_int(cell(7)),

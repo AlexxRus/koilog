@@ -313,8 +313,10 @@ def cmd_stats(args: argparse.Namespace) -> int:
             order=args.order,
             limit=args.limit,
             since=since,
+            include_warmup=args.include_warmup,
         )
-        total = len(stats.exercise_report(conn))
+        total = len(stats.exercise_report(
+            conn, include_warmup=args.include_warmup))
     finally:
         conn.close()
 
@@ -837,7 +839,8 @@ def cmd_health_load(args: argparse.Namespace) -> int:
         if not days:
             print("нет данных для окна (нужны разобранные sets и/или aw_*)")
             return 1
-        text = health_load.format_summary(conn)
+        text = health_load.format_summary(
+            conn, include_warmup=args.include_warmup)
     finally:
         conn.close()
     print(text)
@@ -1089,6 +1092,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_stats.add_argument("--all", action="store_true",
                          help="вся история без окна")
     p_stats.add_argument("--csv", action="store_true", help="вывод в CSV")
+    p_stats.add_argument(
+        "--include-warmup", action="store_true",
+        help="не прятать псевдо-упражнение «разминка» из сводки "
+             "(по умолчанию в счётчике подходов её нет)",
+    )
     p_stats.set_defaults(func=cmd_stats)
 
     p_plan = sub.add_parser("plan", help="программа роста нагрузки")
@@ -1234,6 +1242,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_health.add_argument("--window", default=health_load.DEFAULT_WINDOW,
                           help=f"первая дата включительно (по умолчанию "
                                f"{health_load.DEFAULT_WINDOW})")
+    p_health.add_argument(
+        "--include-warmup", action="store_true",
+        help="считать разминочные строки в числе подходов (по умолчанию "
+             "они показаны отдельной строкой и в счётчик не входят)",
+    )
     p_health.set_defaults(func=cmd_health_load)
 
     p_illness = sub.add_parser(
