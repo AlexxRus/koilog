@@ -658,8 +658,39 @@ def health_days(
 # --------------------------------------------------------------------------
 
 
-def summarize(conn: sqlite3.Connection) -> dict:
-    """Сводка по ``load_daily`` для CLI и ноутбука."""
+def _warmup_in_window(conn: sqlite3.Connection) -> int:
+    """Строки разминки в окне ``load_daily`` (те же даты, что у колонки ``sets``).
+
+    ``load_daily.sets`` - это ``COUNT(*)`` строк дня без выбросов, поэтому
+    разминка входит в неё наравне с подходами (развилка F-1: колонку не
+    трогаем, она модельная). Здесь она считается отдельно, чтобы витрина
+    могла показать рабочие подходы, не меняя модель.
+    """
+    row = conn.execute(
+        """
+        SELECT COUNT(*)
+          FROM sets
+         WHERE is_warmup = 1
+           AND is_outlier = 0
+           AND date >= (SELECT MIN(date) FROM load_daily)
+           AND date <= (SELECT MAX(date) FROM load_daily)
+        """
+    ).fetchone()
+    return int(row[0] or 0)
+
+
+def summarize(
+    conn: sqlite3.Connection, *, include_warmup: bool = False
+) -> dict:
+    """Сводка по ``load_daily`` для CLI и ноутбука.
+
+    ``sets`` - колонка ``load_daily`` как есть (включая разминку: на ней
+    висит суррогатный sRPE, поэтому она модельная). ``warmup`` - сколько из
+    них разминочных строк. ``sets_working`` - сколько подходов попадает в
+    счётчик: ``sets`` минус разминка, а с ``include_warmup=True`` - все
+    ``sets`` (разминка учитывается). Тоннаж от опции не зависит: у разминки
+    нет веса, в него она не входит ни в одном положении.
+    """
     row = conn.execute(
         """
         SELECT COUNT(*)                         AS days,
@@ -686,6 +717,11 @@ def summarize(conn: sqlite3.Connection) -> dict:
            WHERE acwr IS NOT NULL ORDER BY acwr DESC LIMIT 1"""
     ).fetchone()
     out = {**dict(row), "first": period["first"], "last": period["last"]}
+    out["warmup"] = _warmup_in_window(conn) if out["days"] else 0
+    column_sets = out["sets"] or 0
+    out["sets_working"] = (
+        column_sets if include_warmup else column_sets - out["warmup"]
+    )
     out["acwr_peak_date"] = peak["date"] if peak else None
     out["acwr_peak"] = peak["acwr"] if peak else None
     out["acwr_peak_warmup"] = peak["gap_warmup"] if peak else None
@@ -693,16 +729,29 @@ def summarize(conn: sqlite3.Connection) -> dict:
     return out
 
 
-def format_summary(conn: sqlite3.Connection) -> str:
-    """Готовая сводка ``load_daily`` для CLI и ноутбука."""
-    summary = summarize(conn)
+def format_summary(
+    conn: sqlite3.Connection, *, include_warmup: bool = False
+) -> str:
+    """Готовая сводка ``load_daily`` для CLI и ноутбука.
+
+    С ``include_warmup=False`` (по умолчанию) счётчик показывает рабочие
+    подходы, а ниже отдельной строкой - сколько разминочных строк в него не
+    вошло. С ``include_warmup=True`` текст байт-в-байт прежний: разминка
+    учтена в числе подходов.
+    """
+    summary = summarize(conn, include_warmup=include_warmup)
     if not summary["days"]:
         return "load_daily пуст: сначала  python -m koilog health-load"
     lines = [
         f"дней в ряду: {summary['days']}  "
         f"({summary['first']} … {summary['last']})",
-        f"подходов: {summary['sets']}   тоннаж: {summary['tonnage']:.0f} кг",
+        f"подходов: {summary['sets_working']}   "
+        f"тоннаж: {summary['tonnage']:.0f} кг",
     ]
+    if not include_warmup and summary["warmup"]:
+        lines.append(
+            f"  разминка: {summary['warmup']} подходов не входит в счётчик"
+        )
     if summary["acwr"] is not None:
         lines.append(f"ACWR: средний {summary['acwr']:.2f}, "
                      f"макс {summary['acwr_max']:.2f}")

@@ -103,6 +103,17 @@ def _open(args: argparse.Namespace) -> sqlite3.Connection:
     return conn
 
 
+def _env_failure(exc: Exception) -> int:
+    """Отказ среды: одна строка в stderr и код 1, без трассировки.
+
+    Сообщения модулей здоровья уже говорят, чего не хватает и что запустить
+    («сначала: …»). Стек вызовов поверх такой строки только прячет её. Отказ
+    при этом остаётся отказом: команда ничего не считает и возвращает 1.
+    """
+    print(str(exc).strip() or exc.__class__.__name__, file=sys.stderr)
+    return 1
+
+
 def _csv_number(value: float | None, digits: int = 2) -> str:
     """Число для CSV: с округлением, ``None`` - пустой ячейкой.
 
@@ -302,8 +313,10 @@ def cmd_stats(args: argparse.Namespace) -> int:
             order=args.order,
             limit=args.limit,
             since=since,
+            include_warmup=args.include_warmup,
         )
-        total = len(stats.exercise_report(conn))
+        total = len(stats.exercise_report(
+            conn, include_warmup=args.include_warmup))
     finally:
         conn.close()
 
@@ -795,6 +808,10 @@ def cmd_refresh(args: argparse.Namespace) -> int:
         step = health_refresh.run(conn, deep=args.deep, source=args.xml,
                                   journal=journal,
                                   allow_incomplete_feed=args.allow_incomplete_feed)
+    except (RuntimeError, sqlite3.OperationalError) as exc:
+        # Отказ среды (нет таблиц aw_*, нет load_daily для --deep): текст
+        # модуля уже говорит, чего не хватает, - трассировка не нужна.
+        return _env_failure(exc)
     finally:
         conn.close()
     print(health_refresh.format_freshness(step))
@@ -822,7 +839,8 @@ def cmd_health_load(args: argparse.Namespace) -> int:
         if not days:
             print("нет данных для окна (нужны разобранные sets и/или aw_*)")
             return 1
-        text = health_load.format_summary(conn)
+        text = health_load.format_summary(
+            conn, include_warmup=args.include_warmup)
     finally:
         conn.close()
     print(text)
@@ -833,7 +851,11 @@ def cmd_illness(args: argparse.Namespace) -> int:
     """Пересобрать и показать эпизоды болезни (``--detail`` — каналы эпизода)."""
     conn = _open(args)
     try:
-        health_illness.build(conn, window=args.window)
+        try:
+            health_illness.build(conn, window=args.window)
+        except RuntimeError as exc:
+            # Неполная база (нет aw_daily): отказ одной строкой, не стеком.
+            return _env_failure(exc)
         if args.detail is not None:
             from .health import analysis as health_analysis
 
@@ -854,7 +876,11 @@ def cmd_ml(args: argparse.Namespace) -> int:
 
     conn = _open(args)
     try:
-        data = health_ml.report(conn, window=args.window, as_json=args.json)
+        try:
+            data = health_ml.report(conn, window=args.window, as_json=args.json)
+        except RuntimeError as exc:
+            # Нет aw_daily/load_daily или нет numpy - обе беды среды.
+            return _env_failure(exc)
     finally:
         conn.close()
 
@@ -963,8 +989,7 @@ def cmd_score(args: argparse.Namespace) -> int:
         except (RuntimeError, sqlite3.OperationalError) as exc:
             # нет ML-таблиц или нет extra ml - это не повод для трассировки:
             # говорим, какой шаг конвейера пропущен
-            print(str(exc), file=sys.stderr)
-            return 1
+            return _env_failure(exc)
 
         items = health_score.rows(conn, limit=args.last,
                                   prospective_only=args.prospective,
@@ -1067,6 +1092,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_stats.add_argument("--all", action="store_true",
                          help="вся история без окна")
     p_stats.add_argument("--csv", action="store_true", help="вывод в CSV")
+    p_stats.add_argument(
+        "--include-warmup", action="store_true",
+        help="не прятать псевдо-упражнение «разминка» из сводки "
+             "(по умолчанию в счётчике подходов её нет)",
+    )
     p_stats.set_defaults(func=cmd_stats)
 
     p_plan = sub.add_parser("plan", help="программа роста нагрузки")
@@ -1212,6 +1242,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_health.add_argument("--window", default=health_load.DEFAULT_WINDOW,
                           help=f"первая дата включительно (по умолчанию "
                                f"{health_load.DEFAULT_WINDOW})")
+    p_health.add_argument(
+        "--include-warmup", action="store_true",
+        help="считать разминочные строки в числе подходов (по умолчанию "
+             "они показаны отдельной строкой и в счётчик не входят)",
+    )
     p_health.set_defaults(func=cmd_health_load)
 
     p_illness = sub.add_parser(

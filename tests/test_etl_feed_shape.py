@@ -22,8 +22,8 @@ ROOT = Path(__file__).resolve().parent.parent
 FEEDS = ROOT / "tests" / "fixtures" / "feeds"
 
 HEADER = (
-    "ДАТА;ВРЕМЯ;ТРЕНИРОВКА;УПРАЖНЕНИЕ;ДИСТАНЦИЯ КМ;ВЕС;МНОЖИТЕЛЬ;"
-    "ВРЕМЯ;ПОВТОРЫ;ОТДЫХ;ПРОПУЩЕН;ПРИМЕЧАНИЯ"
+    "ДАТА;ВРЕМЯ;ТРЕНИРОВКА;УПРАЖНЕНИЕ;ДИСТАНЦИЯ КМ;ВЕС КГ;МНОЖИТЕЛЬ;"
+    "ВРЕМЯ С;ПОВТОРЕНИЯ;ОТДЫХ С;ПРОПУЩЕННЫЙ;ЗАМЕТКА"
 )
 
 
@@ -34,6 +34,43 @@ def write_tmp(text: str) -> Path:
     with handle:
         handle.write(text)
     return Path(handle.name)
+
+
+#: Классы предупреждений формы: префикс текста -> имя класса. Пин канона
+#: сверяет **классы**, а не числа: сколько пустых записей и инверсий в
+#: конкретном экспорте - свойство вендора, а не канона
+#: (`docs/4-18-feed-format.md` §7.1, C-1 = без чисел).
+WARNING_CLASSES = {
+    "имена колонок отличаются от канонических": "header",
+    "даты идут не по возрастанию": "order",
+    "пустых записей": "blanks",
+}
+
+#: Известные классы формы: возможны ровно эти три. Подмножество допустимо -
+#: вендор может починить порядок или перестать вставлять пустые полосы, - а
+#: неизвестный класс нет: он валит пин (``warning_classes``).
+EXPECTED_CANON_CLASSES = frozenset(WARNING_CLASSES.values())
+
+
+def warning_classes(warnings: list[str]) -> set[str]:
+    """Свести тексты предупреждений к классам; неизвестный класс - провал.
+
+    Четвёртый (и любой новый) класс не «допустим по умолчанию»: пин обязан
+    упасть, иначе он согласится с ошибкой формы.
+    """
+    found: set[str] = set()
+    for text in warnings:
+        for prefix, name in WARNING_CLASSES.items():
+            if text.startswith(prefix):
+                found.add(name)
+                break
+        else:
+            raise AssertionError(
+                f"неизвестный класс предупреждения формы: {text!r} - "
+                "канон-контракт (`docs/4-18-feed-format.md` §7.1) требует "
+                "решения, а не молчаливого согласия"
+            )
+    return found
 
 
 class _FeedCase(unittest.TestCase):
@@ -99,6 +136,10 @@ class WarningTests(_FeedCase):
         self.assertEqual(shape.bad_dates, 1)
         self.assertEqual(shape.inversions, 0)
         self.assertTrue(any("нечитаемой датой" in w for w in shape.warnings))
+        # Четвёртый класс - нечитаемая дата - обязан валить пин канона:
+        # классификатор не пропускает незнакомое предупреждение.
+        with self.assertRaises(AssertionError):
+            warning_classes(shape.warnings)
 
 
 class AbortTests(_FeedCase):
@@ -197,18 +238,30 @@ class OrderTests(unittest.TestCase):
 @unittest.skipUnless((ROOT / "data" / "journal.csv").exists(),
                      "нет data/journal.csv")
 class CanonicalFeedTests(unittest.TestCase):
-    """Канон не должен шуметь: все четыре класса аномалий молчат."""
+    """Канон-контракт: шапка вендора принята, числа аномалий не прибиты.
 
-    def test_canonical_journal_has_no_warnings(self):
+    Политика - `docs/4-18-feed-format.md` §7.1 (D9-a = C, C-1 = без чисел).
+    Проверяются **классы** аномалий и структура фида; количества пустых
+    записей и инверсий - свойство конкретного экспорта, а не канона.
+
+    Числа, которые остались, - не про форму, а про то, что перед нами живой
+    канон, а не обрезанный файл: строк много, строки-заметки есть.
+    """
+
+    def test_canonical_journal_matches_the_contract(self):
         shape = etl.check_feed(etl.DEFAULT_JOURNAL)
-        self.assertEqual(shape.warnings, [])
-        self.assertEqual(shape.blank_records, 0)
-        self.assertEqual(shape.inversions, 0)
-        self.assertEqual(shape.bad_dates, 0)
+        # Структура: шапка - вендорский канон, все даты читаемы.
         self.assertEqual(shape.header, etl.JOURNAL_COLUMNS)
+        self.assertEqual(shape.bad_dates, 0)
         self.assertGreater(shape.data_records, 15_000)
-        # Строки-заметки в каноне есть - и это не предупреждение.
         self.assertGreater(shape.note_rows, 0)
+        # Классы: только известные (сегодня - порядок и пустые полосы;
+        # класса `header` нет, потому что шапка вендора и есть канон).
+        # Четвёртый класс - нечитаемая дата - валит пин исключением.
+        self.assertLessEqual(
+            warning_classes(shape.warnings),
+            set(EXPECTED_CANON_CLASSES),
+        )
 
 
 if __name__ == "__main__":

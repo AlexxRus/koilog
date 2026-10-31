@@ -829,6 +829,27 @@ class ChartTests(unittest.TestCase):
             conn.close()
 
 
+def _sets_rows(path: str | Path) -> int | None:
+    """Число подходов в базе или ``None``, если таблицы ``sets`` нет.
+
+    Гвард живого класса (пререг ``docs/4-16-live-guards.md``): файл базы может
+    существовать, не будучи базой. ``load`` в пустом дереве оставляет файл со
+    схемой, прерванный прогон - нулевой файл. Такой файл не должен давать
+    падений с именами, указывающими на данные: это состояние среды, а не
+    данных.
+    """
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        found = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sets'"
+        ).fetchone()
+        if not found:
+            return None
+        return conn.execute("SELECT COUNT(*) FROM sets").fetchone()[0]
+    finally:
+        conn.close()
+
+
 class RealProgramInventoryTests(unittest.TestCase):
     """Программа по настоящим данным не предлагает веса из инвентаря.
 
@@ -842,6 +863,14 @@ class RealProgramInventoryTests(unittest.TestCase):
     def setUpClass(cls):
         if not Path(etl.DEFAULT_DB).exists():
             raise unittest.SkipTest(f"нет базы {etl.DEFAULT_DB}: выполните load")
+        rows = _sets_rows(etl.DEFAULT_DB)
+        if rows is None:
+            raise unittest.SkipTest(
+                f"в базе {etl.DEFAULT_DB} нет таблицы sets: выполните load")
+        if rows == 0:
+            raise unittest.SkipTest(
+                f"база {etl.DEFAULT_DB} пуста: в sets нет подходов - "
+                f"выполните load")
         cls.conn = etl.connect(etl.DEFAULT_DB)
         cls.names = [
             row[0]

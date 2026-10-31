@@ -882,5 +882,62 @@ class MainTests(CliFixture):
         self.assertNotIn("Traceback", err.getvalue())
 
 
+# --------------------------------------------------------------------------
+# Отказ среды: одна читаемая строка и код 1, без трассировки
+# --------------------------------------------------------------------------
+
+
+class EnvironmentFailureTests(CliFixture):
+    """Схема без часов: команда отказывает строкой, а не стеком вызовов."""
+
+    def assert_env_failure(self, code: int, out: str, err: str, needle: str):
+        self.assertEqual(code, 1)
+        self.assertNotIn("Traceback", err)
+        lines = [line for line in err.strip().splitlines() if line.strip()]
+        self.assertEqual(len(lines), 1, err)
+        self.assertIn(needle, lines[0])
+        self.assertEqual(out, "")
+
+    def test_illness_without_hours_tables(self):
+        code, out, err = self.run_cli("illness")
+        self.assert_env_failure(code, out, err, "aw_daily")
+
+    def test_ml_without_health_tables(self):
+        code, out, err = self.run_cli("ml")
+        self.assert_env_failure(code, out, err, "apple-load")
+
+    def test_score_without_ml_tables(self):
+        code, out, err = self.run_cli("score")
+        self.assert_env_failure(code, out, err, "refresh --deep")
+
+    def test_refresh_without_export_refuses_before_work(self):
+        missing = str(Path(self._dir.name) / "нет.xml")
+        code, out, err = self.run_cli(
+            "refresh", "--no-journal", "--xml", missing)
+        self.assert_env_failure(code, out, err, "apple-load")
+
+    def test_refresh_journal_stage_writes_nothing_before_refusal(self):
+        # Отказ на слепке журнала не должен оставлять полузагруженный sets:
+        # среда проверяется до стадии журнала, а не после загрузки.
+        journal = Path(self._dir.name) / "journal.csv"
+        journal.write_text(
+            ";".join(etl.JOURNAL_COLUMNS) + "\n"
+            '17.01.24;18:00;"Тест";"Приседания со штангой";;60;1;;5;120;;""\n',
+            encoding="utf-8")
+        before = self._count_sets()
+        missing = str(Path(self._dir.name) / "нет.xml")
+        code, out, err = self.run_cli(
+            "refresh", "--journal", str(journal), "--xml", missing)
+        self.assert_env_failure(code, out, err, "apple-load")
+        self.assertEqual(self._count_sets(), before)
+
+    def _count_sets(self) -> int:
+        conn = sqlite3.connect(self.db)
+        try:
+            return conn.execute("SELECT COUNT(*) FROM sets").fetchone()[0]
+        finally:
+            conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()

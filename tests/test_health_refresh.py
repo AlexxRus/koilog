@@ -285,5 +285,31 @@ class RefreshJournalTests(unittest.TestCase):
         self.assertEqual(fresh["sets"], "2024-01-17")
 
 
+class EnvironmentRefusalTests(unittest.TestCase):
+    """Нет ни выгрузки, ни таблиц aw_*: отказ **до** загрузки журнала."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        folder = Path(self._tmp.name)
+        self.conn = etl.connect(folder / "training.db")
+        etl.create_schema(self.conn)
+        self.journal = folder / "journal.csv"
+        self.journal.write_text(_JOURNAL, encoding="utf-8")
+        self.missing = folder / "нет.xml"
+
+    def tearDown(self) -> None:
+        self.conn.close()
+        self._tmp.cleanup()
+
+    def test_refuses_readably_and_writes_no_sets(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            refresh.run(self.conn, source=self.missing, journal=self.journal)
+        self.assertIn("apple-load", str(ctx.exception))
+        # отказ до первой записи: слепок журнала живёт в aw_meta, которой
+        # без разбора часов не существует, - и sets остаётся пустым
+        row = self.conn.execute("SELECT COUNT(*) FROM sets").fetchone()
+        self.assertEqual(row[0], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

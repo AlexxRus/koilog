@@ -59,6 +59,7 @@ __all__ = [
     "RestoreReport",
     "SNAPSHOT_DIRNAME",
     "SNAPSHOT_KEEP",
+    "WARMUP_NAME",
     "SetRow",
     "Snapshot",
     "TimedDecision",
@@ -74,6 +75,7 @@ __all__ = [
     "ExerciseAudit",
     "export_csv",
     "implied_bodyweight",
+    "is_warmup_name",
     "load_all",
     "load_journal",
     "load_workoutreport",
@@ -141,6 +143,25 @@ LEGACY_SOURCES: tuple[tuple[str, str], ...] = (
     ("fitsession", SOURCE_JOURNAL),
     ("workoutreport", SOURCE_REPORT),
 )
+
+#: Псевдо-упражнение разминки в колонке ``УПРАЖНЕНИЕ`` журнала. Разминка -
+#: метаданные тренировки, а не подход реального упражнения: у неё нет веса,
+#: повторов, 1RM и КОИ, и в этих расчётах она не участвует. Флаг
+#: ``sets.is_warmup`` ставится по **имени упражнения** (колонка 3), а не по
+#: названию тренировки (колонка 2): названия тренировок вида «2. Жим» с
+#: разминкой не совпадают никогда.
+WARMUP_NAME = "Разминка"
+
+
+def is_warmup_name(exercise: str | None) -> bool:
+    """Разминка ли это - по имени упражнения, без учёта регистра.
+
+    Сравнение идёт через :func:`koilog.taxonomy.normalize`, потому что имя
+    набирается руками: в журнале встречаются лишние пробелы и разный регистр.
+    """
+    return bool(exercise) and (
+        normalize(exercise).casefold() == WARMUP_NAME.casefold()
+    )
 
 
 # --------------------------------------------------------------------------
@@ -834,11 +855,6 @@ def _finalize(row: SetRow, body_weight: float = BODY_WEIGHT) -> SetRow:
 # Парсер: журнала
 # --------------------------------------------------------------------------
 
-JOURNAL_COLUMNS = (
-    "date", "time", "workout", "exercise", "distance", "weight", "multiplier",
-    "time_s", "reps", "rest_s", "skipped", "note",
-)
-
 
 def _journal_session_id(day: str, clock: str | None, index: int) -> str:
     """Ключ тренировки: дата и время, а при его отсутствии - порядковый номер.
@@ -855,13 +871,20 @@ def _journal_session_id(day: str, clock: str | None, index: int) -> str:
 #: Канонический заголовок журнала: 12 колонок. Первые четыре - структурные
 #: (без них разбор невозможен), остальные - именами, потому что парсинг
 #: позиционный (W7 §7-бис, решение 4).
+#:
+#: Имена - вендорские, как в экспорте от 27.10.2026 (`ВЕС КГ`, `ВРЕМЯ С`,
+#: `ПОВТОРЕНИЯ`, `ОТДЫХ С`, `ПРОПУЩЕННЫЙ`, `ЗАМЕТКА`): этот формат принят
+#: каноном (`docs/4-18-feed-format.md` §7.1). Расхождение имён остаётся
+#: предупреждением, а не ошибкой, - разбор позиционный.
 JOURNAL_COLUMNS = (
-    "ДАТА", "ВРЕМЯ", "ТРЕНИРОВКА", "УПРАЖНЕНИЕ", "ДИСТАНЦИЯ КМ", "ВЕС",
-    "МНОЖИТЕЛЬ", "ВРЕМЯ", "ПОВТОРЫ", "ОТДЫХ", "ПРОПУЩЕН", "ПРИМЕЧАНИЯ",
+    "ДАТА", "ВРЕМЯ", "ТРЕНИРОВКА", "УПРАЖНЕНИЕ", "ДИСТАНЦИЯ КМ", "ВЕС КГ",
+    "МНОЖИТЕЛЬ", "ВРЕМЯ С", "ПОВТОРЕНИЯ", "ОТДЫХ С", "ПРОПУЩЕННЫЙ", "ЗАМЕТКА",
 )
 
 #: Порог предупреждения о пустых записях: доля физических строк. Канон - 0%,
-#: улика ``broken-reversed`` - 9.1%; порыв 1% даёт запас на разовые пустые.
+#: замер инцидентной формы 21.10 - 9.1% (файл удалён по D4; замеры:
+#: `docs/feed-contract-spec.md` §3, `docs/housekeeping.md` §13); порыв 1% даёт
+#: запас на разовые пустые.
 BLANK_RECORD_WARN_SHARE = 0.01
 
 
@@ -1198,7 +1221,7 @@ def load_journal(
                 workout_name=storage_name(cell(2)) or None,
                 exercise=exercise,
                 set_index=counter[exercise],
-                is_warmup=1 if normalize(cell(2)) == "Разминка" else 0,
+                is_warmup=1 if is_warmup_name(exercise) else 0,
                 weight=_to_float(cell(5)),
                 reps=_to_int(cell(8)),
                 time_seconds=_to_int(cell(7)),

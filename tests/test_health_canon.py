@@ -254,7 +254,7 @@ class RowsOutputTests(unittest.TestCase):
 
 
 class DeterminismTests(unittest.TestCase):
-    """Тай-брейки выбора строки и порядок в тексте (хвост Task 55).
+    """Тай-брейки выбора строки и порядок в тексте (хвосты N-2).
 
     Правила названы в докстрингах :func:`digest._score_row` и
     :func:`digest._ledger_specs`; здесь они прибиты тестами, чтобы «любое, но
@@ -333,6 +333,25 @@ class DeterminismTests(unittest.TestCase):
         self.assertLess(note.index("spec0000000b"), note.index("spec0000000c"))
 
 
+def _ledger_rows(path) -> int | None:
+    """Число строк ledger'а или ``None``, если таблицы ``ml_score`` нет.
+
+    Гвард живого класса (пререг ``docs/4-16-live-guards.md``): ``ml_score``
+    создаёт ``score``/``refresh --deep``, а не ``load``. Файл базы, оставшийся
+    после ``load``, таблицы не имеет - и это состояние среды, а не данных.
+    """
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        found = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ml_score'"
+        ).fetchone()
+        if not found:
+            return None
+        return conn.execute("SELECT COUNT(*) FROM ml_score").fetchone()[0]
+    finally:
+        conn.close()
+
+
 class LiveCanonTests(unittest.TestCase):
     """Свойства живой базы (как в W7-(g): свойства, а не константы)."""
 
@@ -341,6 +360,14 @@ class LiveCanonTests(unittest.TestCase):
         path = DEFAULT_DB
         if not path.exists():
             raise unittest.SkipTest(f"нет живой базы: {path}")
+        rows = _ledger_rows(path)
+        if rows is None:
+            raise unittest.SkipTest(
+                f"в базе нет таблицы ml_score: выполните refresh --deep "
+                f"(или score --replay): {path}")
+        if rows == 0:
+            raise unittest.SkipTest(
+                f"ledger ml_score пуст: выполните score --replay ({path})")
         cls.conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         cls.conn.row_factory = sqlite3.Row
         cls.current = score.spec_hash()
