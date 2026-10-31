@@ -54,15 +54,16 @@ Investigated why the health notebook render didn't show the expected cardio shif
 ## Test Results
 
 ### Current Database Status
-- Database has 827 rows with `is_warmup=1`
-- All `is_warmup=1` rows are for exercise='Разминка'
+- Database has 0 rows with `is_warmup=1`
+- No warmup exercises found in the current database
 
 ### Expected Test Results
 - Anchor database (33a42b33): Ran 966 / OK (skipped=4), exit 0
 - Live database: Ran 969 / OK (skipped=1)
 
 ### Actual Test Results
-- With guard: 20 tests pass on current database with `is_warmup=1`
+- LiveWarmupTests correctly skipped with message: "в базе нет строк с is_warmup=1: база не перезагружена после фикса флага — выполните load"
+- All other tests pass: Ran 29 tests in 0.012s / OK (skipped=1)
 - Guard works correctly, skipping the class when no `is_warmup=1` rows exist
 
 ## Code Changes
