@@ -12,6 +12,23 @@ base64 PNG), потому что nbclient/jupyter в окружении нет. 
 Корень репозитория определяется от расположения этого файла (или переменной
 окружения ``KOILOG_ROOT``); рабочий каталог переключается на него, поэтому имя
 ноутбука задаётся относительно корня.
+
+**Контракт сериализованной формы (NB-98):**
+
+- ``nbformat`` 4, ``nbformat_minor`` 4.4 (не 4.5).
+- ``LF``, ровно один хвостовой перевод строки.
+- ``text`` у ``stream`` — **список строк**, не строка.
+- ``image/png`` — строка base64.
+- ``execution_count`` = порядковый номер code-ячейки.
+- ``id`` у ячеек **отсутствует** (удаление драйвером).
+- ``metadata`` не трогается (оставить как есть).
+- порядок выводов: ``stream`` раньше ``display_data`` (фиксированное ограничение).
+
+Ограничения (B0, C0):
+- ``execute_result`` не сериализуется (долг с триггером «первый прогон в
+  настоящем Jupyter»).
+- порядок выводов не гарантируется без ``plt.show()`` (на живых данных
+  совпадает с фактическим).
 """
 import base64
 import contextlib
@@ -27,12 +44,25 @@ ROOT = os.environ.get(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+def _remove_cell_ids(nb: dict) -> None:
+    """Удалить ``id`` у всех ячеек (A2)."""
+    for cell in nb.get("cells", []):
+        cell.pop("id", None)
+
+
+def _ensure_nbformat_minor_44(nb: dict) -> None:
+    """Понизить ``nbformat_minor`` до 4.4 (A2)."""
+    nb["nbformat_minor"] = 4
+
+
 def run(name: str, only: set[int] | None,
         setup: set[int] | None = None) -> None:
     os.environ.setdefault("MPLBACKEND", "Agg")
     os.chdir(ROOT)
     path = os.path.join(ROOT, name)
     nb = json.load(io.open(path, encoding="utf-8"))
+    _remove_cell_ids(nb)
+    _ensure_nbformat_minor_44(nb)
     setup = setup or set()
 
     ns: dict = {"__name__": "__main__"}
