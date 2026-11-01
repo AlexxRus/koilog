@@ -142,6 +142,54 @@ class WarningTests(_FeedCase):
             warning_classes(shape.warnings)
 
 
+class IncrementalChunkTests(unittest.TestCase):
+    """Форма куска - та же, что у полного фида: флага режима нет.
+
+    Кусок проверяется существующей :func:`etl.check_feed`, отдельной функции
+    формы не заводится (`docs/4-20-incremental-journal.md` §6).
+    """
+
+    def _write(self, text: str) -> Path:
+        path = write_tmp(text)
+        self.addCleanup(path.unlink)
+        return path
+
+    def test_incremental_feed_shape_checks(self):
+        clean = self._write(
+            HEADER + "\n"
+            "20.10.26;18:00;1. Жим;Жим гантелей лёжа;;30;1;;10;90;;\n"
+        )
+        shape = etl.check_feed(clean, etl.SOURCE_JOURNAL)
+        self.assertEqual(shape.header, etl.JOURNAL_COLUMNS)
+        self.assertEqual(shape.data_records, 1)
+        self.assertEqual(shape.warnings, [])
+
+        # Ярус ii: у куска не 12 колонок - тот же abort, что у полного фида.
+        narrow = self._write("ДАТА;ВРЕМЯ;ТРЕНИРОВКА\n20.10.26;18:00;1. Жим\n")
+        with self.assertRaises(etl.FeedShapeError) as caught:
+            etl.check_feed(narrow, etl.SOURCE_JOURNAL)
+        self.assertIn("колонок", str(caught.exception))
+
+        # Ярус iv: первая дата не читается. ISO-дата - именно такой случай:
+        # журнал пишет ``20.10.26``, и кусок с ``2026-10-20`` отвергается.
+        iso = self._write(
+            HEADER + "\n"
+            "2026-10-20;18:00;1. Жим;Жим гантелей лёжа;;30;1;;10;90;;\n"
+        )
+        with self.assertRaises(etl.FeedShapeError) as caught:
+            etl.check_feed(iso, etl.SOURCE_JOURNAL)
+        self.assertIn("не даёт дату", str(caught.exception))
+
+        # Строка-заметка - штатная форма канона и в куске: не предупреждение.
+        with_note = self._write(
+            HEADER + "\n"
+            "20.10.26;18:00;1. Жим;;;;;;;;;примечание\n"
+        )
+        note_shape = etl.check_feed(with_note, etl.SOURCE_JOURNAL)
+        self.assertEqual(note_shape.note_rows, 1)
+        self.assertEqual(note_shape.warnings, [])
+
+
 class AbortTests(_FeedCase):
     def test_no_header_aborts(self):
         """Ярус i: первая строка - уже данные."""

@@ -4,6 +4,8 @@
 
 ``load``
     Разобрать оба CSV в базу и напечатать отчёт о качестве.
+    ``load --incremental PATH`` дописывает кусок журнала, не трогая
+    загруженное.
 ``stats``
     Сводка по упражнениям: объём, лучший и последний 1RM, динамика.
 ``plan``
@@ -213,6 +215,8 @@ def _drop_legacy(conn) -> str | None:
 
 
 def cmd_load(args: argparse.Namespace) -> int:
+    if args.incremental:
+        return _cmd_load_incremental(args)
     conn = etl.connect(args.db)
     try:
         dropped = _drop_legacy(conn)
@@ -255,6 +259,54 @@ def cmd_load(args: argparse.Namespace) -> int:
 
     print()
     return cmd_check(argparse.Namespace(db=args.db, limit=15, quiet=False))
+
+
+def _plural(count: int, one: str, few: str, many: str) -> str:
+    """Русская форма при числе: 1 строка, 2 строки, 5 строк."""
+    if count % 10 == 1 and count % 100 != 11:
+        word = one
+    elif count % 10 in (2, 3, 4) and count % 100 not in (12, 13, 14):
+        word = few
+    else:
+        word = many
+    return f"{count} {word}"
+
+
+def _cmd_load_incremental(args: argparse.Namespace) -> int:
+    """``load --incremental PATH``: дописать кусок журнала.
+
+    Отчёт не грузится и ``journal.csv`` не читается: кусок - отдельный файл,
+    полная перезагрузка обоих источников остаётся у ``load`` без флага.
+    Отказ (форма куска, разрез сессии, конфликт метрик) - строкой в stderr
+    и кодом 1, без трассировки: это ошибка данных, а не сбой среды.
+    """
+    fallback = args.bodyweight if args.bodyweight is not None else args.body_weight
+    conn = etl.connect(args.db)
+    try:
+        try:
+            report = etl._load_incremental(
+                conn, args.incremental, body_weight=fallback
+            )
+        except (etl.FeedShapeError, etl.IncrementalFeedError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+    finally:
+        conn.close()
+
+    for warning in report.warnings:
+        print(f"внимание: {warning}", file=sys.stderr)
+    if args.quiet:
+        print(report.added)
+        return 0
+
+    print(f"Загрузка инкрементального фида: {Path(report.path).name}")
+    if report.gap_days:
+        print(f"Gap: {_plural(report.gap_days, 'день', 'дня', 'дней')} "
+              f"({report.first_day} - {report.previous_day})")
+    print(f"Новых подходов: {report.added}")
+    print(f"Дубликатов: {report.duplicates}")
+    print(f"Загружено: {_plural(report.added, 'строка', 'строки', 'строк')}")
+    return 0
 
 
 def _print_bodyweight(applied: dict[int, float]) -> None:
@@ -1072,6 +1124,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_load.add_argument("--quiet", action="store_true",
                         help="вывести только количество подходов")
+    p_load.add_argument(
+        "--incremental", metavar="PATH", default=None,
+        help="дописать кусок журнала: дедуп по бизнес-ключу, целые сессии, "
+             "отказ до первой записи; отчёт не грузится, journal.csv не "
+             "меняется",
+    )
     p_load.set_defaults(func=cmd_load)
 
     p_stats = sub.add_parser("stats", help="сводка по упражнениям")

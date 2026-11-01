@@ -470,6 +470,190 @@ class LoadAllGuardTests(TempDbMixin):
         )
 
 
+#: Шапка куска журнала - канонические 12 колонок (``etl.JOURNAL_COLUMNS``).
+#: Даты в фикстурах - в формате журнала (``20.10.26``): ISO-строку
+#: ``parse_journal_date`` не разбирает, и ``check_feed`` отверг бы кусок ещё
+#: до разбора (``docs/4-20-incremental-journal.md`` §4).
+INCREMENTAL_HEADER = (
+    "ДАТА;ВРЕМЯ;ТРЕНИРОВКА;УПРАЖНЕНИЕ;ДИСТАНЦИЯ КМ;ВЕС КГ;МНОЖИТЕЛЬ;"
+    "ВРЕМЯ С;ПОВТОРЕНИЯ;ОТДЫХ С;ПРОПУЩЕННЫЙ;ЗАМЕТКА"
+)
+
+#: Засев тиров 3, 4б и 5: одна целая сессия ``20.10.26 18:00``, 3 подхода.
+INCREMENTAL_SEED_ROWS = (
+    "20.10.26;18:00;1. Жим;Жим гантелей лёжа;;30;1;;10;90;;",
+    "20.10.26;18:00;1. Жим;Жим гантелей лёжа;;30;1;;10;90;;",
+    "20.10.26;18:00;1. Жим;Жим гантелей лёжа;;30;1;;8;90;;",
+)
+
+#: Тир 1: одна новая целая сессия.
+INCREMENTAL_TIER1 = "21.10.26;18:10;2. Жим;Жим гантелей лёжа;;30;1;;10;90;;"
+
+#: Тир 2: две новые целые сессии подряд.
+INCREMENTAL_TIER2_ROWS = (
+    "22.10.26;18:00;2. Жим;Жим гантелей лёжа;;30;1;;10;90;;",
+    "22.10.26;18:00;2. Жим;Жим гантелей лёжа;;30;1;;10;90;;",
+    "22.10.26;18:00;2. Жим;Жим гантелей лёжа;;30;1;;9;90;;",
+    "23.10.26;18:05;3. Тяга;Тяга гантели одной рукой стоя в наклоне;;24;1;;12;90;;",
+    "23.10.26;18:05;3. Тяга;Тяга гантели одной рукой стоя в наклоне;;24;1;;12;90;;",
+    "23.10.26;18:05;3. Тяга;Тяга гантели одной рукой стоя в наклоне;;24;1;;11;90;;",
+)
+
+#: Тир 4а: шапка из трёх колонок - отказ по форме.
+INCREMENTAL_TIER4A = "ДАТА;ВРЕМЯ;ТРЕНИРОВКА\n21.10.26;18:10;2. Жим\n"
+
+#: Тир 5: засев, но у третьего подхода 9 повторов вместо 8.
+INCREMENTAL_TIER5_ROWS = INCREMENTAL_SEED_ROWS[:2] + (
+    "20.10.26;18:00;1. Жим;Жим гантелей лёжа;;30;1;;9;90;;",
+)
+
+#: Тир 7: строка-заметка съедает номер, данные получают ``source_row = 2``.
+INCREMENTAL_TIER7 = (
+    INCREMENTAL_HEADER + "\n"
+    "21.10.26;18:10;2. Жим;;;;;;;;;примечание\n"
+    "21.10.26;18:10;2. Жим;Жим гантелей лёжа;;30;1;;10;90;;\n"
+)
+
+
+def chunk(*rows: str) -> str:
+    """Текст куска: каноническая шапка и строки данных."""
+    return INCREMENTAL_HEADER + "\n" + "".join(f"{row}\n" for row in rows)
+
+
+class IncrementalLoadTests(TempDbMixin):
+    """Кусок журнала дописывается, не трогая загруженное.
+
+    Тиры §4 пререгистра (`docs/4-20-incremental-journal.md`). База -
+    синтетическая (схема ``etl.SCHEMA``), поэтому числа не зависят от
+    состояния живого фида.
+    """
+
+    def _write(self, text: str) -> Path:
+        path = write_tmp(text)
+        self.addCleanup(path.unlink)
+        return path
+
+    def _load(self, text: str) -> etl.IncrementalReport:
+        return etl._load_incremental(self.conn, self._write(text))
+
+    def _count(self) -> int:
+        return self.conn.execute("SELECT COUNT(*) FROM sets").fetchone()[0]
+
+    def _rows(self) -> list[tuple]:
+        return [
+            tuple(row)
+            for row in self.conn.execute("SELECT * FROM sets ORDER BY id")
+        ]
+
+    def test_load_incremental_new_data(self):
+        """Тир 1: одна новая целая сессия, sets 0 -> 1."""
+        report = self._load(chunk(INCREMENTAL_TIER1))
+        self.assertEqual((report.added, report.duplicates), (1, 0))
+        self.assertEqual(self._count(), 1)
+        row = self.conn.execute(
+            "SELECT date, time, exercise, reps, source_row FROM sets"
+        ).fetchone()
+        self.assertEqual(
+            tuple(row),
+            ("2026-10-21", "18:10:00", "Жим гантелей лёжа", 10, 1),
+        )
+
+    def test_load_incremental_duplicates(self):
+        """Тир 3: кусок повторяет засев - 3 дубликата, строки бит-в-бит."""
+        self._load(chunk(*INCREMENTAL_SEED_ROWS))
+        before = self._rows()
+        report = self._load(chunk(*INCREMENTAL_SEED_ROWS))
+        self.assertEqual((report.added, report.duplicates), (0, 3))
+        self.assertEqual(report.gap_days, 0)
+        self.assertEqual(self._count(), 3)
+        self.assertEqual(self._rows(), before)
+
+    def test_load_incremental_gap(self):
+        """Тиры 1 и 2: gap = первая дата куска - последняя дата в базе."""
+        self._load(chunk(*INCREMENTAL_SEED_ROWS))
+        report = self._load(chunk(INCREMENTAL_TIER1))
+        self.assertEqual(report.gap_days, 1)
+        self.assertEqual(report.first_day, "2026-10-21")
+        self.assertEqual(report.previous_day, "2026-10-20")
+
+        # Тир 2 - на своём засеве: первая дата 22.10 против 20.10 в базе.
+        # Соединение закрывается до ``tearDown``: временный каталог удаляется
+        # там же, а на Windows открытый файл базы не даёт его удалить.
+        other = etl.connect(Path(self._dir.name) / "tier2.db")
+        try:
+            etl._load_incremental(
+                other, self._write(chunk(*INCREMENTAL_SEED_ROWS))
+            )
+            report = etl._load_incremental(
+                other, self._write(chunk(*INCREMENTAL_TIER2_ROWS))
+            )
+            self.assertEqual(report.gap_days, 2)
+            self.assertEqual((report.added, report.duplicates), (6, 0))
+            self.assertEqual(
+                other.execute("SELECT COUNT(*) FROM sets").fetchone()[0], 9
+            )
+        finally:
+            other.close()
+
+    def test_load_incremental_shape_errors(self):
+        """Тир 4а: форма куска проверяется до разбора, база пуста."""
+        with self.assertRaises(etl.FeedShapeError) as caught:
+            self._load(INCREMENTAL_TIER4A)
+        self.assertIn("колонок", str(caught.exception))
+        # Совместимость: это ошибка данных, а не сбой среды.
+        self.assertIsInstance(caught.exception, ValueError)
+        self.assertEqual(self._count(), 0)
+
+    @unittest.skipUnless(HAS_JOURNAL, "нет data/journal.csv")
+    def test_load_incremental_journal_unchanged(self):
+        """Канонический ``journal.csv`` не трогается: кусок - отдельный файл."""
+        before = etl._file_sha256(etl.DEFAULT_JOURNAL)
+        self._load(chunk(INCREMENTAL_TIER1))
+        self.assertEqual(etl._file_sha256(etl.DEFAULT_JOURNAL), before)
+
+    def test_load_incremental_refuse_same_data(self):
+        """Тиры 6 и 7: повтор того же куска и дедуп по бизнес-ключу."""
+        self.assertEqual(self._load(chunk(INCREMENTAL_TIER1)).added, 1)
+        again = self._load(chunk(INCREMENTAL_TIER1))
+        self.assertEqual((again.added, again.duplicates), (0, 1))
+
+        # Тир 7: та же строка данных при другой физической строке файла.
+        parsed = list(
+            etl.load_journal(self._write(INCREMENTAL_TIER7), incremental=True)
+        )
+        self.assertEqual([row.source_row for row in parsed], [2])
+        trick = self._load(INCREMENTAL_TIER7)
+        self.assertEqual((trick.added, trick.duplicates), (0, 1))
+        self.assertEqual(self._count(), 1)
+        self.assertEqual(
+            self.conn.execute("SELECT source_row FROM sets").fetchone()[0], 1
+        )
+
+    def test_load_incremental_metric_conflict(self):
+        """Тир 5: ключ совпал, метрики разошлись - отказ, не тихий пропуск."""
+        self._load(chunk(*INCREMENTAL_SEED_ROWS))
+        before = self._rows()
+        with self.assertRaises(etl.IncrementalFeedError) as caught:
+            self._load(chunk(*INCREMENTAL_TIER5_ROWS))
+        self.assertIn("повторы 9 против 8", str(caught.exception))
+        self.assertEqual(self._count(), 3)
+        self.assertEqual(self._rows(), before)
+
+    def test_load_incremental_reject_on_error(self):
+        """Тиры 4а и 4б: отказ до первой записи, ни одной строки."""
+        with self.assertRaises(etl.FeedShapeError):
+            self._load(INCREMENTAL_TIER4A)
+        self.assertEqual(self._count(), 0)
+
+        self._load(chunk(*INCREMENTAL_SEED_ROWS))
+        before = self._rows()
+        with self.assertRaises(etl.IncrementalFeedError) as caught:
+            self._load(chunk(*INCREMENTAL_SEED_ROWS[:2]))
+        self.assertIn("целых сессий", str(caught.exception))
+        self.assertEqual(self._count(), 3)
+        self.assertEqual(self._rows(), before)
+
+
 class SchemaTests(TempDbMixin):
     def test_idempotent_create(self):
         etl.create_schema(self.conn)

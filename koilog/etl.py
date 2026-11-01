@@ -31,6 +31,12 @@
 ``continue``, номер уже израсходован). Поэтому ``source_row`` - только ключ
 идемпотентности ``(source, source_row)``, а не семантический идентификатор
 подхода: в файле с пустыми разделителями номера «съедаются».
+
+Отдельный файл-кусок (диапазон дат) можно **дописать** явной командой
+``load --incremental PATH`` (:func:`_load_incremental`): дедупликация идёт по
+бизнес-ключу, а не по ``source_row``, и уже загруженные строки остаются
+бит-в-бит. Контракт полного фида это не меняет: ``journal.csv`` по-прежнему
+каноничный полный файл.
 """
 
 from __future__ import annotations
@@ -53,6 +59,8 @@ from .core import BODY_WEIGHT, RM_MAX_REPS, one_rm
 from .taxonomy import Group, WeightMode as Mode, normalize, storage_name
 
 __all__ = [
+    "IncrementalFeedError",
+    "IncrementalReport",
     "JOURNAL_COLUMNS",
     "LoadReport",
     "OutlierGroup",
@@ -330,6 +338,19 @@ class LoadReport:
 
 
 @dataclass(slots=True)
+class IncrementalReport:
+    """Итог подгрузки куска журнала (``docs/4-20-incremental-journal.md``)."""
+
+    path: str
+    added: int = 0
+    duplicates: int = 0
+    gap_days: int = 0
+    first_day: str | None = None
+    previous_day: str | None = None
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class SetRow:
     """Один подход в том виде, в каком он попадёт в БД."""
 
@@ -406,6 +427,14 @@ _INSERT = (
         for name in _COLUMNS.replace(" ", "").split(",")
         if name not in ("source", "source_row")
     )
+)
+
+#: Вставка без ``ON CONFLICT``: инкрементальный режим не имеет права
+#: переписывать уже лежащие строки, поэтому конфликт обязан быть ошибкой, а
+#: не тихим ``UPDATE``. Номера ``source_row`` для куска выдаются заведомо
+#: свободные (``MAX + 1``), так что конфликта быть не должно.
+_INSERT_PLAIN = (
+    f"INSERT INTO sets ({_COLUMNS}) VALUES ({', '.join('?' * 30)})"
 )
 
 
@@ -906,6 +935,20 @@ class FeedShrinkError(RuntimeError):
     """
 
 
+class IncrementalFeedError(ValueError):
+    """Кусок журнала нельзя принять: отказ **до** первой записи.
+
+    Два случая (``docs/4-20-incremental-journal.md`` §2.2 и §4):
+
+    * кусок не из целых сессий - у сессии, которая уже есть в базе, другой
+      набор подходов (кусок начинается или кончается внутри неё);
+    * у совпавшего бизнес-ключа разошлись метрики (повторы, вес, время).
+
+    Наследуется от :class:`ValueError`: это ошибка данных, а не сбой среды,
+    и внешний код, ловивший ``ValueError``, продолжает работать.
+    """
+
+
 @dataclass(slots=True)
 class FeedCoverage:
     """Сколько строк и какой диапазон дат занимает источник."""
@@ -1168,12 +1211,22 @@ def check_feed(
 def load_journal(
     path: str | os.PathLike = DEFAULT_JOURNAL,
     body_weight: float = BODY_WEIGHT,
+    incremental: bool = False,
 ) -> Iterator[SetRow]:
     """Разобрать плоскую выгрузку журнала.
 
     Читается через модуль ``csv`` с ``newline=''`` - в файле 1 531 строка с
     переносом внутри кавычек, построчная обработка на такой выгрузке
     разваливается.
+
+    ``incremental=True`` - режим куска (``load --incremental``): файл обязан
+    быть выгрузкой диапазона, а не всей историей. Отличие от полного режима
+    одно, зато проверяемое: у каждой строки подхода обязано быть время.
+    Сессия опознаётся парой ``(дата; время)``, и без времени кусок нельзя
+    сверить с базой по сессиям - а значит, нельзя проверить, что он не режет
+    сессию (:class:`IncrementalFeedError` вместо молчаливого разбора).
+    Полный режим оставляет прежнее поведение: строка без времени получает
+    ключ ``дата#номер``.
     """
     with io.open(path, encoding="utf-8-sig", newline="") as handle:
         reader = csv.reader(handle, delimiter=";")
@@ -1204,6 +1257,11 @@ def load_journal(
             exercise = storage_name(cell(3))
             if not exercise:
                 continue
+            if incremental and clock is None:
+                raise IncrementalFeedError(
+                    f"строка {number} куска без времени: сессию не опознать, "
+                    "а без сессии не проверить её целостность"
+                )
 
             session_id = _journal_session_id(day, clock, len(session_index))
             if session_id not in session_index:
@@ -1231,6 +1289,167 @@ def load_journal(
                 note=cell(11),
             )
             yield _finalize(row, body_weight)
+
+
+# --------------------------------------------------------------------------
+# Инкрементальная подгрузка куска журнала
+# --------------------------------------------------------------------------
+
+#: Бизнес-ключ строки журнала: ``(дата; время; упражнение; счётчик подхода
+#: в сессии)``. ``source_row`` в него не входит намеренно - в частичном
+#: экспорте нумерация CSV-записей своя, и один и тот же подход получает там
+#: другой номер. Счётчик - тот же, что в полной загрузке: он считается
+#: внутри сессии по упражнению (``per_session`` в :func:`load_journal`).
+JournalKey = tuple[str, str | None, str, int | None]
+
+
+def _journal_key(row: SetRow) -> JournalKey:
+    return (row.date, row.time, row.exercise, row.set_index)
+
+
+def _journal_metrics(row: SetRow) -> tuple[int | None, float | None, int | None]:
+    """Метрики для сверки: повторы, записанный вес, время.
+
+    Вес берётся **записанный** (``raw_weight``), а не ``weight``: в базе
+    ``weight`` уже переписан весом тела для режимов ``vest_only`` и
+    ``total_bodyweight`` (и может отличаться от строки к строке в пределах
+    года). Сверка по производному весу отказывала бы каждому подтягиванию
+    после полной загрузки, хотя журнал не менялся.
+    """
+    weight = row.raw_weight if row.raw_weight is not None else row.weight
+    return (row.reps, weight, row.time_seconds)
+
+
+def _journal_index(
+    conn: sqlite3.Connection,
+) -> dict[str, dict[JournalKey, tuple[int | None, float | None, int | None]]]:
+    """Что уже лежит в базе по журналу: сессия -> ключ -> метрики."""
+    index: dict[
+        str, dict[JournalKey, tuple[int | None, float | None, int | None]]
+    ] = {}
+    rows = conn.execute(
+        "SELECT session_id, date, time, exercise, set_index, reps, "
+        "raw_weight, weight, time_seconds "
+        "  FROM sets WHERE source = ?",
+        (SOURCE_JOURNAL,),
+    )
+    for row in rows:
+        stored = (
+            row["reps"],
+            row["raw_weight"] if row["raw_weight"] is not None else row["weight"],
+            row["time_seconds"],
+        )
+        key: JournalKey = (
+            row["date"], row["time"], row["exercise"], row["set_index"],
+        )
+        index.setdefault(row["session_id"], {})[key] = stored
+    return index
+
+
+def _metric_conflict(
+    row: SetRow,
+    stored: tuple[int | None, float | None, int | None],
+) -> str | None:
+    """Расхождение метрик при совпавшем ключе - текстом, иначе ``None``."""
+    reps, weight, seconds = stored
+    actual = _journal_metrics(row)
+    if actual[0] != reps:
+        return f"повторы {actual[0]} против {reps} в базе"
+    if actual[1] != weight:
+        return f"вес {actual[1]} против {weight} в базе"
+    if actual[2] != seconds:
+        return f"время {actual[2]} с против {seconds} с в базе"
+    return None
+
+
+def _load_incremental(
+    conn: sqlite3.Connection,
+    path: str | os.PathLike,
+    body_weight: float = BODY_WEIGHT,
+) -> IncrementalReport:
+    """Дописать кусок журнала, не трогая уже загруженное.
+
+    Порядок (``docs/4-20-incremental-journal.md`` §2, §2.2, §6):
+
+    1. Форма файла - существующей :func:`check_feed`, той же, что у полного
+       фида: у куска форма не другая, отдельной функции нет.
+    2. Разбор куска (:func:`load_journal` в режиме ``incremental``).
+    3. **План целиком до первой записи**: по каждой сессии куска - есть ли
+       она в базе, тот же ли у неё набор подходов, совпадают ли у совпавших
+       ключей метрики. Любое расхождение - :class:`IncrementalFeedError`, и
+       тогда в базу не пишется ничего.
+    4. Запись только новых строк, обычным ``INSERT``: существующие строки
+       остаются бит-в-бит. ``source_row`` новых строк продолжает нумерацию
+       источника, чтобы ключ ``(source, source_row)`` не столкнулся.
+    5. Пересчёт производных метрик (``rm_session``/``rm_delta``/
+       ``rm_ma_30d``/``koi``) - только если что-то добавлено.
+
+    ``journal.csv`` не участвует: кусок - отдельный файл (§1 П.2), полная
+    перезагрузка остаётся делом ``load_all``.
+    """
+    create_schema(conn)
+    shape = check_feed(path, SOURCE_JOURNAL)
+    rows = list(load_journal(path, body_weight, incremental=True))
+    report = IncrementalReport(path=str(path), warnings=list(shape.warnings))
+    if not rows:
+        return report
+
+    report.first_day = min(row.date for row in rows)
+    previous = conn.execute(
+        "SELECT MAX(date) FROM sets WHERE source = ?", (SOURCE_JOURNAL,)
+    ).fetchone()[0]
+    report.previous_day = previous
+    if previous is not None and report.first_day > previous:
+        report.gap_days = (
+            date_cls.fromisoformat(report.first_day)
+            - date_cls.fromisoformat(previous)
+        ).days
+
+    existing = _journal_index(conn)
+    sessions: dict[str, list[SetRow]] = {}
+    for row in rows:
+        sessions.setdefault(row.session_id, []).append(row)
+
+    new_rows: list[SetRow] = []
+    for session_id, session_rows in sessions.items():
+        known = existing.get(session_id)
+        if known is not None:
+            chunk_keys = {_journal_key(row) for row in session_rows}
+            if chunk_keys != set(known):
+                raise IncrementalFeedError(
+                    f"кусок не из целых сессий: сессия {session_id} - в куске "
+                    f"{len(session_rows)} подходов, в базе {len(known)} - "
+                    "отказ до первой записи"
+                )
+        for row in session_rows:
+            stored = known.get(_journal_key(row)) if known else None
+            if stored is None:
+                new_rows.append(row)
+                continue
+            conflict = _metric_conflict(row, stored)
+            if conflict is not None:
+                raise IncrementalFeedError(
+                    f"конфликт метрик: {session_id}, {row.exercise}, подход "
+                    f"{row.set_index} - {conflict} - отказ, не тихий пропуск"
+                )
+            report.duplicates += 1
+
+    if new_rows:
+        base = conn.execute(
+            "SELECT COALESCE(MAX(source_row), 0) FROM sets WHERE source = ?",
+            (SOURCE_JOURNAL,),
+        ).fetchone()[0]
+        for offset, row in enumerate(new_rows, start=1):
+            row.source_row = base + offset
+        try:
+            conn.executemany(_INSERT_PLAIN, [row.as_tuple() for row in new_rows])
+            conn.commit()
+        except sqlite3.Error:
+            conn.rollback()
+            raise
+        recompute_metrics(conn)
+        report.added = len(new_rows)
+    return report
 
 
 # --------------------------------------------------------------------------
