@@ -44,7 +44,7 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -88,6 +88,7 @@ __all__ = [
     "progression_from_available",
     "progression_from_db",
     "recent_exercises",
+    "resolve_exercise",
     "since_for_months",
     "weekly_koi",
     "weekly_koi_by_group",
@@ -97,6 +98,16 @@ __all__ = [
 # --------------------------------------------------------------------------
 # Статистика по упражнениям
 # --------------------------------------------------------------------------
+
+#: Подписи режима записи веса (NU-138 п.5, display-only). Формулы 1RM/КОИ от
+#: них не зависят: это текст рядом с числом, а не новая метрика.
+WEIGHT_TAG_TOTAL = "тело+груз"
+WEIGHT_TAG_ADDED = "только груз"
+
+#: Упражнения, у которых суммарный вес тела ещё по интерим-модели (RM-98):
+#: подпись честно говорит, что 1RM здесь условный. Список - отображение, не
+#: правило расчёта; проверяется пином NU-138.
+INTERIM_BW_EXERCISES: frozenset[str] = frozenset({"Отжимания"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +145,23 @@ class ExerciseStats:
     record_rm: float | None = None
     prev_day: str | None = None
     prev_rm: float | None = None
+    weight_modes: tuple[str, ...] = ()
+
+    @property
+    def weight_semantics(self) -> str | None:
+        """Подпись режима записи веса для витрины (NU-138 п.5).
+
+        ``None`` - упражнение пишется снарядом (``absolute``) или режимов в
+        окне нет. Смешанный случай (``vest_only`` + ``total_bodyweight``,
+        как у отжиманий) показывает суммарный режим: именно он даёт
+        «111.7», из-за которого подпись и понадобилась.
+        """
+        modes = set(self.weight_modes)
+        if "total_bodyweight" in modes:
+            return WEIGHT_TAG_TOTAL
+        if "vest_only" in modes:
+            return WEIGHT_TAG_ADDED
+        return None
 
     @property
     def best_set(self) -> str:
@@ -195,7 +223,8 @@ SELECT exercise,
        MAX(date)                          AS last_day,
        GROUP_CONCAT(DISTINCT source)      AS sources,
        COALESCE(SUM(is_timed), 0)         AS timed_sets,
-       COALESCE(SUM(koi), 0.0)            AS koi_total
+       COALESCE(SUM(koi), 0.0)            AS koi_total,
+       GROUP_CONCAT(DISTINCT weight_mode) AS weight_modes
   FROM sets
  WHERE skipped = 0
    AND is_outlier = 0
@@ -420,6 +449,10 @@ def exercise_report(
                 record_rm=detail["record_rm"] if detail else None,
                 prev_day=detail["prev_day"] if detail else None,
                 prev_rm=detail["prev_rm"] if detail else None,
+                weight_modes=tuple(sorted(
+                    mode for mode in (row["weight_modes"] or "").split(",")
+                    if mode
+                )),
             )
         )
 
@@ -704,6 +737,7 @@ def weekly_koi_by_group(
     group: str | None = None,
     since: str | None = None,
     limit: int | None = None,
+    group_label: Callable[[str], str | None] | None = None,
 ) -> list[WeeklyKoiGroup]:
     """Недельный КОИ по группе - **простое среднее** по упражнениям группы.
 
@@ -718,8 +752,14 @@ def weekly_koi_by_group(
     ПЛАНКА, КАРДИО) в ``v_weekly_koi`` отсутствуют структурно - их нет и
     здесь; витрина пишет это подписью, а не пустыми строками.
 
-    ``group`` фильтрует по группе, ``limit`` - количество **целых недель**
-    (как в ``weekly_koi``, а не строк).
+    ``group`` фильтрует по **группе таксономии** (до подписи), ``limit`` -
+    количество **целых недель** (как в ``weekly_koi``, а не строк).
+
+    ``group_label`` (NU-138 п.4) - display-резолвер подписи группы. С ним
+    строки ``v_weekly_koi`` перегруппировываются по упражнениям и подписи:
+    дельты режутся на передние/средние/задние. Среднее и максимум берутся из
+    тех же ``koi_week`` - без весов участия и без новых констант, полоса
+    считается по среднему, как и раньше. Без резолвера поведение прежнее.
     """
     clauses: list[str] = []
     params: list[Any] = []
@@ -734,6 +774,10 @@ def weekly_koi_by_group(
     limit_n = None
     if limit is not None and int(limit) > 0:
         limit_n = int(limit)
+
+    if group_label is not None:
+        return _weekly_koi_by_label(
+            conn, group_label, clauses=clauses, params=params, limit_n=limit_n)
 
     columns = (
         "week, exercise_group, COUNT(*) AS exercises, "
@@ -773,6 +817,75 @@ def weekly_koi_by_group(
         )
         for row in conn.execute(sql, exec_params)
     ]
+
+
+def _weekly_koi_rows(
+    conn: sqlite3.Connection,
+    clauses: Sequence[str],
+    params: Sequence[Any],
+    limit_n: int | None,
+) -> list[sqlite3.Row]:
+    """Строки ``v_weekly_koi`` **по упражнению** для перегруппировки.
+
+    Фильтры (и выбор недель при ``limit``) те же, что в SQL-агрегате: подпись
+    не должна молча менять окно.
+    """
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    columns = "week, exercise, exercise_group, sets_done, koi_week"
+    if limit_n is not None:
+        outer = (" AND " + " AND ".join(clauses)) if clauses else ""
+        sql = (
+            "WITH w AS (SELECT DISTINCT week FROM v_weekly_koi" + where +
+            f" ORDER BY week DESC LIMIT {limit_n}) "
+            f"SELECT {columns} FROM v_weekly_koi"
+            " WHERE week IN (SELECT week FROM w)" + outer +
+            " ORDER BY week DESC, exercise"
+        )
+        return list(conn.execute(sql, list(params) + list(params)))
+    sql = (
+        f"SELECT {columns} FROM v_weekly_koi" + where +
+        " ORDER BY week DESC, exercise"
+    )
+    return list(conn.execute(sql, list(params)))
+
+
+def _weekly_koi_by_label(
+    conn: sqlite3.Connection,
+    group_label: Callable[[str], str | None],
+    *,
+    clauses: Sequence[str],
+    params: Sequence[Any],
+    limit_n: int | None,
+) -> list[WeeklyKoiGroup]:
+    """Агрегат по **подписи** группы: дельты режутся на подгруппы.
+
+    Перегруппировка идёт по строкам ``v_weekly_koi`` (уже по упражнению):
+    среднее/максимум считаются из тех же ``koi_week``, что и в базовом
+    агрегате. Ни подходы, ни тоннаж в среднее не входят.
+    """
+    buckets: dict[tuple[str, str], list[sqlite3.Row]] = {}
+    for row in _weekly_koi_rows(conn, clauses, params, limit_n):
+        label = group_label(row["exercise"]) or row["exercise_group"]
+        buckets.setdefault((row["week"], label), []).append(row)
+
+    out: list[WeeklyKoiGroup] = []
+    for (week, label), items in buckets.items():
+        values = [item["koi_week"] for item in items]
+        mean = sum(values) / len(values)
+        out.append(WeeklyKoiGroup(
+            week=week,
+            exercise_group=label,
+            exercises=len({item["exercise"] for item in items}),
+            sets_done=sum(item["sets_done"] for item in items),
+            koi_mean=mean,
+            koi_max=max(values),
+            band=koi_band(mean, KOI_BANDS_WEEK, above=KOI_ABOVE_WEEK),
+        ))
+    # Порядок как у SQL: неделя DESC, среднее DESC; внутри равных - по
+    # подписи. Две сортировки дают его стабильно (Python sort устойчив).
+    out.sort(key=lambda row: row.exercise_group)
+    out.sort(key=lambda row: (row.week, row.koi_mean), reverse=True)
+    return out
 
 
 def format_weekly_koi_by_group(rows: Sequence[WeeklyKoiGroup]) -> str:
@@ -818,6 +931,17 @@ def format_weekly_koi_by_group(rows: Sequence[WeeklyKoiGroup]) -> str:
     lines.append(
         "у них не считается 1RM, поэтому базы для КОИ нет."
     )
+    if any(row.exercise_group.startswith("дельты") for row in rows):
+        lines.append("")
+        lines.append(
+            "дельты разрезаны на передние/средние/задние - это подпись"
+        )
+        lines.append(
+            "витрины (NU-138 п.4): среднее и максимум те же, веса участия"
+        )
+        lines.append(
+            "не вводятся, справочник мышц не меняется."
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -841,6 +965,8 @@ WITH f AS (
            rm_session,
            rm_delta,
            koi,
+           weight_mode,
+           added_weight,
            ROW_NUMBER() OVER (
                PARTITION BY date, session_id
                ORDER BY rm DESC, reps DESC, set_index ASC
@@ -863,7 +989,9 @@ SELECT date,
        MAX(rm_delta)            AS rm_delta,
        MAX(CASE WHEN rn = 1 THEN weight END) AS top_weight,
        MAX(CASE WHEN rn = 1 THEN reps   END) AS top_reps,
-       MAX(CASE WHEN rn = 1 THEN rm     END) AS top_rm
+       MAX(CASE WHEN rn = 1 THEN rm     END) AS top_rm,
+       MAX(CASE WHEN rn = 1 THEN weight_mode  END) AS top_mode,
+       MAX(CASE WHEN rn = 1 THEN added_weight END) AS top_added
   FROM f
  GROUP BY date, session_id
  ORDER BY date, session_id
@@ -885,16 +1013,79 @@ class HistoryRow:
     top_weight: float | None = None
     top_reps: int | None = None
     top_rm: float | None = None
+    top_mode: str | None = None
+    top_added: float | None = None
 
     @property
     def top_set(self) -> str:
+        """Лучший подход: ``90 (70+20)`` для ``total_bodyweight``, иначе вес.
+
+        Компоненты (NU-138 п.5) имеют смысл только у суммарной записи: там вес
+        = тело + добавка, и разложение восстанавливается однозначно. У
+        ``vest_only`` записанная величина - уже добавка, разлагать нечего,
+        поэтому печатается просто вес. Если у суммарной записи добавка NULL,
+        разложение неизвестно - честный ``—``, без выдумывания тела.
+        """
         if self.top_weight is None:
             return "—"
+        if self.top_mode == "total_bodyweight":
+            if self.top_added is None:
+                return "—"
+            body = self.top_weight - self.top_added
+            return f"{self.top_weight:g} ({body:g}+{self.top_added:g})"
         return f"{self.top_weight:g} кг x {self.top_reps}"
+
+    @property
+    def top_semantics(self) -> str:
+        """Семантика записи веса верхнего подхода (NU-138 п.5)."""
+        if self.top_mode == "total_bodyweight":
+            return WEIGHT_TAG_TOTAL
+        if self.top_mode == "vest_only":
+            return WEIGHT_TAG_ADDED
+        if self.top_mode == "absolute":
+            return "снаряд"
+        return "—"
 
     @property
     def band(self) -> str | None:
         return koi_band(self.koi_sum)
+
+
+def resolve_exercise(conn: sqlite3.Connection, exercise: str) -> str:
+    """Имя упражнения для чтения: точное выигрывает, иначе вариант с е/ё.
+
+    Слой сопоставления, а не записи (NU-138 п.2, решение D3): если имени нет
+    точно, ищется хранимое имя, равное запросу после ``taxonomy.normalize``
+    (ё→е, неразрывные пробелы). Записанные имена **не переписываются** -
+    это то же правило, что в 4.9: ``Жим гантелей лёжа`` и ``Жим гантелей
+    лежа`` остаются раздельными рядами, точное совпадение всегда выигрывает.
+
+    Если кандидатов несколько (варианты с е/ё оба хранятся), берётся самый
+    частый, при равенстве - первый по алфавиту: выбор детерминирован.
+    Нет ни точного, ни свёрнутого совпадения - возвращается исходная строка,
+    и вызывающий получает обычный пустой результат с подсказкой.
+
+    Резолвер один на проект: ноутбук не собирает его сам. Подключён только
+    в :func:`history`; ``etl.exercise_audit``/``explain`` не меняются
+    (граница п.2).
+    """
+    key = taxonomy.normalize(exercise)
+    if not key:
+        return exercise
+    rows = conn.execute(
+        "SELECT exercise, COUNT(*) AS n FROM sets GROUP BY exercise"
+    ).fetchall()
+    if any(row["exercise"] == exercise for row in rows):
+        return exercise
+    folded = key.casefold()
+    matches = [
+        row for row in rows
+        if taxonomy.normalize(row["exercise"]).casefold() == folded
+    ]
+    if not matches:
+        return exercise
+    matches.sort(key=lambda row: (-row["n"], row["exercise"]))
+    return matches[0]["exercise"]
 
 
 def history(
@@ -907,6 +1098,10 @@ def history(
     reverse: bool = False,
 ) -> list[HistoryRow]:
     """История одной тренировки упражнения за интервал ``since``…``until``.
+
+    Имя приводится :func:`resolve_exercise`: точное совпадение выигрывает,
+    иначе срабатывает вариант с е/ё (NU-138 п.2). Запись в базе не меняется;
+    разрешённое имя печатает :func:`format_history`, если его передать.
 
     Интервал задаётся в ISO (``ГГГГ-ММ-ДД``) и **включает обе границы**:
     ``since`` - с какого дня показывать, ``until`` - по какой. Любая граница
@@ -923,6 +1118,7 @@ def history(
 
     ``None`` вместо ``limit`` - все тренировки интервала.
     """
+    exercise = resolve_exercise(conn, exercise)
     sql = _HISTORY_SQL.format(
         since="AND date >= ?" if since else "",
         until="AND date <= ?" if until else "",
@@ -946,6 +1142,8 @@ def history(
             top_weight=row["top_weight"],
             top_reps=row["top_reps"],
             top_rm=row["top_rm"],
+            top_mode=row["top_mode"],
+            top_added=row["top_added"],
         )
         for row in conn.execute(sql, params)
     ]
@@ -976,8 +1174,8 @@ def format_history(
     order = "от новых к старым" if reverse else "от старых к новым"
     lines = [f"=== {exercise}: история за {window} ({order}) ==="]
     header = (
-        f"{'дата':>10} {'верхний подход':>16} {'подх':>5} {'повторов':>8} "
-        f"{'объём':>9} {'1RM':>7} {'Δ 1RM':>7} {'КОИ':>7}  режим"
+        f"{'дата':>10} {'верхний подход':>16} {'запись':<12} {'подх':>5} "
+        f"{'повторов':>8} {'объём':>9} {'1RM':>7} {'Δ 1RM':>7} {'КОИ':>7}  режим"
     )
     lines.append(header)
     lines.append("-" * len(header))
@@ -985,18 +1183,26 @@ def format_history(
         rm = f"{row.rm_session:.1f}" if row.rm_session is not None else "—"
         delta = f"{row.rm_delta:+.2f}" if row.rm_delta is not None else "—"
         lines.append(
-            f"{row.date:>10} {row.top_set:>16} {row.sets:>5} "
+            f"{row.date:>10} {row.top_set:>16} {row.top_semantics:<12} "
+            f"{row.sets:>5} "
             f"{row.reps_total:>8} {row.volume:>9.0f} {rm:>7} {delta:>7} "
             f"{row.koi_sum:>7.2f}  {row.band or '—'}"
         )
     lines.append("")
     lines.append(
-        "верхний подход - лучший подход тренировки; 1RM = его 1RM (Brzycki); "
-        "Δ 1RM - к предыдущей"
+        "верхний подход - лучший подход тренировки; у записей «тело+груз» он"
     )
     lines.append(
-        "тренировке упражнения; КОИ - сумма подходов тренировки, режим по "
-        "core.KOI_BANDS."
+        "показан суммой с компонентами (тело+добавка), у «только груз» - одной"
+    )
+    lines.append(
+        "добавкой; если компонент неизвестен, честный «—». 1RM = его 1RM"
+    )
+    lines.append(
+        "(Brzycki); Δ 1RM - к предыдущей тренировке упражнения; КОИ - сумма"
+    )
+    lines.append(
+        "подходов тренировки, режим по core.KOI_BANDS."
     )
     return "\n".join(lines) + "\n"
 
@@ -1612,7 +1818,12 @@ def _empty_stats(exercise: str) -> ExerciseStats:
 # --------------------------------------------------------------------------
 
 
-def format_report(rows: Sequence[ExerciseStats], *, width: int = 30) -> str:
+def format_report(
+    rows: Sequence[ExerciseStats],
+    *,
+    width: int = 30,
+    group_label: Callable[[str], str | None] | None = None,
+) -> str:
     """Таблица статистики по упражнениям для чтения глазами.
 
     Колонки:
@@ -1636,6 +1847,14 @@ def format_report(rows: Sequence[ExerciseStats], *, width: int = 30) -> str:
         тренировок; у упражнений «тело + жилет» включает вес тела.
     ``объём``
         Сумма ``вес x повторы`` по подходам окна, в килограммо-повторах.
+
+    ``group_label`` - display-резолвер подписи группы (NU-138 п.4). Он меняет
+    **только текст** колонки «группа»: агрегаты считаются по упражнению и от
+    подписи не зависят. ``stats`` не импортирует ``muscles`` - резолвер
+    передаёт вызывающий (в ноутбуке - ``muscle_load.group_label``).
+
+    Режим записи веса (NU-138 п.5) виден у BW-упражнений пометкой в скобках;
+    числа от неё не меняются - это отображение.
     """
     if not rows:
         return "нет упражнений под фильтр\n"
@@ -1645,7 +1864,18 @@ def format_report(rows: Sequence[ExerciseStats], *, width: int = 30) -> str:
         f"{'рекорд':>7} {'посл.':>7} {'Δ к рекорду':>11} {'МА30':>7} {'объём':>10}"
     ]
     lines.append("-" * (width + 20 + 5 + 4 * 7 + 11 + 10 + 8))
+    tagged = False
+    interim: list[str] = []
     for row in rows:
+        name = row.exercise
+        if row.weight_semantics is not None:
+            name = f"{name} [{row.weight_semantics}]"
+            tagged = True
+            if row.exercise in INTERIM_BW_EXERCISES:
+                interim.append(row.exercise)
+        group = row.exercise_group
+        if group_label is not None:
+            group = group_label(row.exercise) or row.exercise_group
         best = f"{row.best_rm:.1f}" if row.best_rm is not None else "—"
         record = f"{row.record_rm:.1f}" if row.record_rm is not None else "—"
         last = f"{row.last_rm:.1f}" if row.last_rm is not None else "—"
@@ -1661,10 +1891,26 @@ def format_report(rows: Sequence[ExerciseStats], *, width: int = 30) -> str:
         )
         ma = f"{row.ma_30d:.1f}" if row.ma_30d is not None else "—"
         lines.append(
-            f"{row.exercise[: width - 1]:<{width}} "
-            f"{row.exercise_group[:19]:<20} "
+            f"{name[: width - 1]:<{width}} "
+            f"{group[:19]:<20} "
             f"{row.sets:>5} {best:>7} {record:>7} {last:>7} {delta:>11} {ma:>7} "
             f"{row.volume:>10.0f}"
+        )
+    if tagged:
+        lines.append("")
+        lines.append(
+            "в скобках - режим записи веса: «тело+груз» - суммарный (тело плюс"
+        )
+        lines.append(
+            "добавка), «только груз» - записана одна добавка; это подпись,"
+        )
+        lines.append(
+            "а не новая метрика - 1RM, КОИ и объём считаются как раньше."
+        )
+    for exercise in interim:
+        lines.append(
+            f"{exercise}: интерим до RM-98 - модель суммарного веса тела ещё не "
+            f"финальная, 1RM этого упражнения условный."
         )
     return "\n".join(lines) + "\n"
 

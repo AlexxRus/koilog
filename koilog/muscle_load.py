@@ -26,6 +26,7 @@ from . import muscles, taxonomy
 
 __all__ = [
     "BODYWEIGHT",
+    "DELTA_GROUP",
     "IRON",
     "RECOVERY_DAYS",
     "Freshness",
@@ -35,12 +36,22 @@ __all__ = [
     "Ring",
     "Tonnage",
     "freshness",
+    "group_label",
     "ring",
     "session_ring",
     "tonnage_by_muscle",
     "week_key",
     "week_ring",
 ]
+
+#: Группа таксономии, внутри которой витрины режут дельты (NU-138 п.4, D1).
+#: Разбивка сужена именно до неё: у 38 упражнений **других** групп дельтовидная
+#: метка в профиле есть (жим лёжа, тяга в наклоне), и глобальная разбивка
+#: выдала бы им чужую подпись.
+DELTA_GROUP = "ДЕЛЬТЫ"
+
+#: Группа, которой таксономия не знает: подпись берётся из записи ``sets``.
+UNKNOWN_GROUP = "НЕ ОПОЗНАН"
 
 #: Нормализованные имена режимов (в ``sets.weight_mode`` — ``absolute`` /
 #: ``vest_only`` / ``total_bodyweight``; ``absolute`` = железо).
@@ -138,6 +149,38 @@ class Freshness:
 def week_key(day: str) -> str:
     """Ключ недели в формате проекта: ``strftime('%Y-W%W', date)``."""
     return date_cls.fromisoformat(day).strftime("%Y-W%W")
+
+
+def group_label(exercise: str) -> str | None:
+    """Подпись группы для витрин: обычная группа, у ``ДЕЛЬТЫ`` - подгруппа.
+
+    Display-only резолвер NU-138 п.4 (решение D1). Для упражнений **других**
+    групп возвращается их группа таксономии как есть: дельтовидная метка в
+    профиле (``Жим гантелей лёжа`` → «дельты передние») подпись не меняет -
+    иначе ложная разбивка разошлась бы на 38 упражнений.
+
+    У членов группы ``ДЕЛЬТЫ`` берётся первая дельтовидная метка справочника
+    4.10 (``дельты передние``/``средние``/``задние``). Если у имени нет
+    профиля или метки, возвращается сама группа - без выдумывания подгруппы.
+
+    ``None`` - имени нет в таксономии: подпись должна остаться той, что
+    записана в ``sets`` (``exercise_group``), а не превращаться в «НЕ
+    ОПОЗНАН». Вызывающий делает ``group_label(name) or row.exercise_group``.
+
+    В решения (state/gate/ramp/digest/score/ml) модуль не входит: функция
+    живёт на слое витрин и передаётся в ``stats`` вызывающим.
+    """
+    group = taxonomy.group_of(exercise).name
+    if group == UNKNOWN_GROUP:
+        return None
+    if group != DELTA_GROUP:
+        return group
+    profile = muscles.muscles_of(exercise)
+    if profile is not None:
+        for muscle in profile.muscles:
+            if muscle.startswith("дельты"):
+                return muscle
+    return group
 
 
 def _mode(exercise: str, stored: str | None) -> str:

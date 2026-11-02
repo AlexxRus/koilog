@@ -36,7 +36,7 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from . import equipment, etl, rules, stats
+from . import equipment, etl, muscle_load, rules, stats
 from .core import BODY_WEIGHT
 from .health import apple as health_apple
 from .health import digest as health_digest
@@ -388,7 +388,7 @@ def cmd_stats(args: argparse.Namespace) -> int:
             )))
         return 0
 
-    print(stats.format_report(rows))
+    print(stats.format_report(rows, group_label=muscle_load.group_label))
     print(_STATS_LEGEND)
     if since:
         print(f"окно: последние {args.months} мес. до последней тренировки, "
@@ -487,7 +487,8 @@ def cmd_weeks(args: argparse.Namespace) -> int:
     try:
         if by_group:
             rows = stats.weekly_koi_by_group(
-                conn, group=args.group, limit=args.limit
+                conn, group=args.group, limit=args.limit,
+                group_label=muscle_load.group_label,
             )
         else:
             rows = stats.weekly_koi(
