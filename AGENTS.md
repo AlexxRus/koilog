@@ -149,6 +149,39 @@
 - `koilog/etl.py` — базовые таблицы (`sets`, представления WEEKLY/SESSION), `connect()`, миграции колонок.
 - `koilog/health/*` — свои `_SCHEMA` (aw_*, load_daily/health_days/test_days, illness_*, ml_*).
 
+### `sets.is_foreign` — чужие тренировки «Диана» (DN-102, `ea931be`)
+
+Пререг — `docs/dn-102-prereg.md`. Append-only: строки **не удаляются**, только
+исключаются из витрин; health не трогается. Колонка `is_foreign INTEGER NOT NULL
+DEFAULT 0` (`CREATE TABLE` / `ADDED_COLUMNS` / `SetRow` / `as_tuple` / `_COLUMNS` /
+`'?'*31`), миграция — `_add_missing_columns` при следующем `load`/`refresh`.
+
+- **Вычисление — только `_finalize`** (единая точка обеих веток): `program='Диана'`
+  (канон) **или** `'Диана' in workout_name` (защитный). Флаг переживает
+  `DELETE` + повторный `INSERT` отчёта — предикат считается из источника.
+- **Фильтр витрин — литералы `AND is_foreign = 0`** (общего хелпера нет):
+  `stats.py` — `_SUMMARY_SQL`, CTE `days` в `_BEST_LAST_SQL`, `window_sets`,
+  `recent_exercises` (список), `_HISTORY_SQL`, `_PERIOD_SQL` (6 запросов);
+  `etl.py` — вью `v_weekly_koi` / `v_session_koi`; `muscle_load._pool`;
+  `cli._stock_gaps` / `_latest_year` (D5). Границы окна (`MAX(date)`) не
+  фильтруются — прецедент `is_outlier`.
+- **Не трогать (D3/D4):** `estimate_bodyweight` / `BODYWEIGHT_SOURCES` (у «Дианы»
+  0 строк в `BODYWEIGHT_SOURCES`), аудит/диагностика (`outlier_*`, `summary`,
+  `exercise_audit`, `explain_sets`, `export_csv`), `recompute_metrics` /
+  `_COUNTS_SQL` / `_KOI_UPDATE`. Health-модули `is_foreign` не знают — тест-фенс
+  в `tests/test_dn_102_foreign.py`.
+- **Раздел качества:** `ForeignSlice` / `foreign_summary` → `QualityReport.foreign`;
+  `QualityReport.format()` печатает «ЧУЖИЕ ТРЕНИРОВКИ … данные сохранены
+  (append-only)».
+- **Тесты:** `tests/test_dn_102_foreign.py` (18) + пин в `tests/test_etl.py`.
+  Живая база: 21 040 всего → 20 977 в витринах (63 чужих на 3 дня,
+  пересечение с выбросами 6 из 26).
+- **Прогон:** `Ran 1036 / OK (skipped=1)`, exit 0 (208.560 s). Замер
+  `countTestCases()`: база `2fed0cc` = **1017**, HEAD = **1036** → **+19**
+  (18 новых + 1 пин); зеркальный бейзлайн пререга 1014 отличается на 3 —
+  живой класс `RealProgramInventoryTests` (на зеркале без `sql/training.db`
+  снимается через `SkipTest`). Render — `93892fc`.
+
 ## 4. CLI
 - `koilog/cli.py` — команды: `load`, `apple-load`, `health-load`, `illness`, `ml`, `report`, `refresh` (флаги `--deep`, `--xml`, `--journal`, `--no-journal`), `digest` (`--date`, `--json`), `score` (`--date`, `--replay`, `--since`, `--last`, `--prospective`, `--model`, `--budget`, `--json`). `cmd_refresh` вызывает `health_refresh.run`. `--xml` задаёт источник часов, `--journal` — путь к журналу (`--no-journal` — не грузить); слепки (`refresh_source`, `refresh_journal`) действуют и для них (загрузка/разбор только при изменении файла).
 - `cmd_score`: без флагов — `sync` (сев при пустом ledger'е, иначе запись дня), печатает последние дни; `--replay` — сев истории; `--date` — `audit` (пересчёт без записи). `RuntimeError`/`sqlite3.OperationalError` (нет ML-таблиц / нет extra ml) ловятся → сообщение в stderr, код 1 (без трассировки).
