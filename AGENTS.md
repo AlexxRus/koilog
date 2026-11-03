@@ -160,7 +160,7 @@ DEFAULT 0` (`CREATE TABLE` / `ADDED_COLUMNS` / `SetRow` / `as_tuple` / `_COLUMNS
   (канон) **или** `'Диана' in workout_name` (защитный). Флаг переживает
   `DELETE` + повторный `INSERT` отчёта — предикат считается из источника.
 - **Фильтр витрин — литералы `AND is_foreign = 0`** (общего хелпера нет):
-  `stats.py` — `_SUMMARY_SQL`, CTE `days` в `_BEST_LAST_SQL`, `window_sets`,
+  `stats.py` — `_TOTALS_SQL`, CTE `days` в `_BEST_LAST_SQL`, `window_sets`,
   `recent_exercises` (список), `_HISTORY_SQL`, `_PERIOD_SQL` (6 запросов);
   `etl.py` — вью `v_weekly_koi` / `v_session_koi`; `muscle_load._pool`;
   `cli._stock_gaps` / `_latest_year` (D5). Границы окна (`MAX(date)`) не
