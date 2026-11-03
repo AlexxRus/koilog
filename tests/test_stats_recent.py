@@ -11,7 +11,10 @@ from koilog import stats
 def _db() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
-    conn.executescript("CREATE TABLE sets (date TEXT, exercise TEXT);")
+    conn.executescript(
+        "CREATE TABLE sets (date TEXT, exercise TEXT, "
+        "is_foreign INTEGER NOT NULL DEFAULT 0);"
+    )
     return conn
 
 

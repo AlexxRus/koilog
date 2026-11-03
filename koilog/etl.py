@@ -82,6 +82,8 @@ __all__ = [
     "exercise_audit",
     "ExerciseAudit",
     "export_csv",
+    "ForeignSlice",
+    "foreign_summary",
     "implied_bodyweight",
     "is_warmup_name",
     "load_all",
@@ -208,6 +210,7 @@ CREATE TABLE IF NOT EXISTS sets (
   is_outlier     INTEGER NOT NULL DEFAULT 0,
   outlier_rule   TEXT,
   is_gravitron   INTEGER NOT NULL DEFAULT 0,
+  is_foreign     INTEGER NOT NULL DEFAULT 0,
   rm             REAL,
   rm_session     REAL,
   rm_delta       REAL,
@@ -234,6 +237,7 @@ ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("is_outlier", "INTEGER NOT NULL DEFAULT 0"),
     ("outlier_rule", "TEXT"),
     ("is_gravitron", "INTEGER NOT NULL DEFAULT 0"),
+    ("is_foreign", "INTEGER NOT NULL DEFAULT 0"),
     ("raw_weight", "REAL"),
 )
 
@@ -289,7 +293,7 @@ SELECT {iso_week_sql("date")}                 AS week,
             WHEN SUM(koi) <  4 THEN 'Очень тяжёлый'
             ELSE 'Вы сошли с ума??' END       AS band
 FROM sets
-WHERE koi IS NOT NULL AND exercise_group IS NOT NULL
+WHERE koi IS NOT NULL AND exercise_group IS NOT NULL AND is_foreign = 0
 GROUP BY week, exercise;
 """
 
@@ -311,7 +315,7 @@ SELECT date,
             WHEN SUM(koi) < 2.0 THEN 'Load'
             ELSE 'Crazy' END                  AS band
 FROM sets
-WHERE koi IS NOT NULL AND exercise_group IS NOT NULL
+WHERE koi IS NOT NULL AND exercise_group IS NOT NULL AND is_foreign = 0
 GROUP BY date, session_id, exercise;
 """
 
@@ -382,6 +386,7 @@ class SetRow:
     is_outlier: int = 0
     outlier_rule: str | None = None
     is_gravitron: int = 0
+    is_foreign: int = 0
     rm: float | None = None
 
     @property
@@ -406,7 +411,7 @@ class SetRow:
             self.weight, self.raw_weight, self.added_weight, self.reps, self.time_seconds,
             self.distance, self.rest_seconds, self.is_timed, self.timed_reason,
             self.skipped, self.note, self.is_outlier, self.outlier_rule,
-            self.is_gravitron, self.rm,
+            self.is_gravitron, self.is_foreign, self.rm,
         )
 
 
@@ -415,12 +420,12 @@ _COLUMNS = (
     "duration_min, exercise, exercise_group, equipment, weight_mode, "
     "set_index, is_warmup, weight, raw_weight, added_weight, reps, time_seconds, "
     "distance, rest_seconds, is_timed, timed_reason, skipped, note, "
-    "is_outlier, outlier_rule, is_gravitron, rm"
+    "is_outlier, outlier_rule, is_gravitron, is_foreign, rm"
 )
 
 _INSERT = (
     f"INSERT INTO sets ({_COLUMNS}) VALUES "
-    f"({', '.join('?' * 30)}) "
+    f"({', '.join('?' * 31)}) "
     f"ON CONFLICT(source, source_row) DO UPDATE SET "
     + ", ".join(
         f"{name} = excluded.{name}"
@@ -434,7 +439,7 @@ _INSERT = (
 #: не тихим ``UPDATE``. Номера ``source_row`` для куска выдаются заведомо
 #: свободные (``MAX + 1``), так что конфликта быть не должно.
 _INSERT_PLAIN = (
-    f"INSERT INTO sets ({_COLUMNS}) VALUES ({', '.join('?' * 30)})"
+    f"INSERT INTO sets ({_COLUMNS}) VALUES ({', '.join('?' * 31)})"
 )
 
 
@@ -865,6 +870,14 @@ def _finalize(row: SetRow, body_weight: float = BODY_WEIGHT) -> SetRow:
         and row.added_weight is not None
         and row.added_weight <= GRAVITRON_MAX_ADDED
         and row.date < GRAVITRON_LAST_DAY
+    ) else 0
+
+    # 2-в. Чужой тренинг «Диана» (docs/dn-102-prereg.md, п.D1-бис): флаг только
+    # помечает, ничего не удаляет. Канонический предикат program='Диана',
+    # защитный workout_name LIKE '%Диана%' - эквивалентны на текущих данных.
+    row.is_foreign = 1 if (
+        row.program == "Диана"
+        or (row.workout_name is not None and "Диана" in row.workout_name)
     ) else 0
 
     # 3. Метрики. Пропущенный, тайминговый и помеченный выбросом подход
@@ -2957,6 +2970,23 @@ def exercise_audit(
 
 
 @dataclass(frozen=True, slots=True)
+class ForeignSlice:
+    """Срез чужих тренировок («Диана») для раздела качества (docs/dn-102-prereg.md, п.T6).
+
+    Строки с ``is_foreign = 1`` не удаляются (append-only): они остаются в базе
+    и в экспорте, но исключены из витрин флагом.
+    """
+
+    sets: int
+    days: int
+    total_sets: int
+    outlier_overlap: int
+    outlier_total: int
+    first_day: str
+    last_day: str
+
+
+@dataclass(frozen=True, slots=True)
 class QualityReport:
     """Итог проверки данных: что требует ручного решения."""
     unmapped: list[str]
@@ -2966,6 +2996,7 @@ class QualityReport:
     outliers: list[OutlierGroup] = field(default_factory=list)
     outlier_counts: tuple[int, int] = (0, 0)
     seconds_reinterpreted: list[tuple] = field(default_factory=list)
+    foreign: ForeignSlice | None = None
 
     @property
     def outlier_sets(self) -> int:
@@ -3036,9 +3067,62 @@ class QualityReport:
                 lines.append(f"    {exercise[:44]:<44} {sets:>5}   "
                              f"{first_day} … {last_day}")
 
+        if self.foreign:
+            f = self.foreign
+            lines.append("")
+            lines.append(
+                f"ЧУЖИЕ ТРЕНИРОВКИ («Диана»): {f.sets} подходов на {f.days} дней, "
+                f"исключены из витрин, данные сохранены (append-only)"
+            )
+            lines.append(
+                f"    всего в базе {f.total_sets}, витрины koilog считают "
+                f"{f.total_sets - f.sets}"
+            )
+            lines.append(
+                f"    пересечение с выбросами: {f.outlier_overlap} из "
+                f"{f.outlier_total}"
+            )
+            lines.append(f"    {f.first_day} … {f.last_day}")
+
         lines.append("")
         lines.append(f"всего замечаний: {self.problems}")
         return "\n".join(lines) + "\n"
+
+
+def foreign_summary(conn: sqlite3.Connection) -> ForeignSlice | None:
+    """Срез чужих тренировок (docs/dn-102-prereg.md, п.T6); ``None``, если их нет.
+
+    Строки с ``is_foreign = 1`` не удаляются: срез только пересказывает объём,
+    чтобы раздел качества показал, что бы вычлось из витрин.
+    """
+    row = conn.execute(
+        """
+        SELECT COUNT(*)                     AS sets,
+               COUNT(DISTINCT date)         AS days,
+               COALESCE(SUM(is_outlier), 0) AS outlier_overlap,
+               MIN(date)                    AS first_day,
+               MAX(date)                    AS last_day
+          FROM sets
+         WHERE is_foreign = 1
+        """
+    ).fetchone()
+    if not row["sets"]:
+        return None
+    total_sets = int(conn.execute("SELECT COUNT(*) FROM sets").fetchone()[0])
+    outlier_total = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM sets WHERE is_outlier = 1"
+        ).fetchone()[0]
+    )
+    return ForeignSlice(
+        sets=int(row["sets"]),
+        days=int(row["days"]),
+        total_sets=total_sets,
+        outlier_overlap=int(row["outlier_overlap"]),
+        outlier_total=outlier_total,
+        first_day=row["first_day"],
+        last_day=row["last_day"],
+    )
 
 
 def quality_report(conn: sqlite3.Connection) -> QualityReport:
@@ -3056,6 +3140,7 @@ def quality_report(conn: sqlite3.Connection) -> QualityReport:
         outliers=outlier_summary(conn),
         outlier_counts=outlier_totals(conn),
         seconds_reinterpreted=reinterpreted_as_seconds(conn),
+        foreign=foreign_summary(conn),
     )
 
 

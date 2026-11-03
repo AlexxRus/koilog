@@ -25,7 +25,8 @@ def _db() -> sqlite3.Connection:
             weight_mode TEXT,
             is_warmup   INTEGER NOT NULL DEFAULT 0,
             skipped     INTEGER NOT NULL DEFAULT 0,
-            is_outlier  INTEGER NOT NULL DEFAULT 0
+            is_outlier  INTEGER NOT NULL DEFAULT 0,
+            is_foreign  INTEGER NOT NULL DEFAULT 0
         );
         """
     )

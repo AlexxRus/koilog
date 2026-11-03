@@ -296,6 +296,15 @@ class ReportParserTests(unittest.TestCase):
         self.assertEqual(row.duration_min, 21.0)
         self.assertEqual(row.workout_name, "Диана / день 1")
 
+    def test_foreign_program_is_marked(self):
+        """docs/dn-102-prereg.md, п.T3: program='Диана' помечает is_foreign."""
+        diana = [r for r in self.rows if r.program == "Диана"]
+        raketa = [r for r in self.rows if r.program == "Raketa"]
+        self.assertTrue(diana)
+        self.assertTrue(raketa)
+        self.assertTrue(all(r.is_foreign == 1 for r in diana))
+        self.assertTrue(all(r.is_foreign == 0 for r in raketa))
+
     def test_set_index(self):
         bench = [r for r in self.rows if r.exercise == "Жим штанги лежа"]
         self.assertEqual([r.set_index for r in bench], [1, 2, 1])

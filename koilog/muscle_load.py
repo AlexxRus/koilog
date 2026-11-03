@@ -207,6 +207,7 @@ def _pool(
            AND is_warmup = 0
            AND skipped = 0
            AND is_outlier = 0
+           AND is_foreign = 0
          ORDER BY date, session_id
         """
     ).fetchall()

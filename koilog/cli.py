@@ -453,7 +453,7 @@ def _bodyweight_for_plan(conn, args: argparse.Namespace) -> float | None:
 
 
 def _latest_year(conn) -> int:
-    row = conn.execute("SELECT MAX(date) FROM sets").fetchone()
+    row = conn.execute("SELECT MAX(date) FROM sets WHERE is_foreign = 0").fetchone()
     return int(row[0][:4]) if row and row[0] else 0
 
 
@@ -753,6 +753,7 @@ def _stock_gaps(conn) -> list[tuple[str, list[float]]]:
          WHERE is_outlier = 0
            AND skipped = 0
            AND is_timed = 0
+           AND is_foreign = 0
            AND weight IS NOT NULL
            AND weight > 0
         """

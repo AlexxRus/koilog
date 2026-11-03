@@ -228,6 +228,7 @@ SELECT exercise,
   FROM sets
  WHERE skipped = 0
    AND is_outlier = 0
+   AND is_foreign = 0
    {warmup}
    {since}
  GROUP BY exercise
@@ -247,6 +248,7 @@ WITH days AS (
            MAX(rm) AS rm_day
       FROM sets
      WHERE rm IS NOT NULL
+       AND is_foreign = 0
      GROUP BY exercise, date, session_id
 ),
 shifted AS (
@@ -485,7 +487,7 @@ def window_sets(
     строки разминки в таблице нет ни в одном положении переключателя, и без
     отдельного счётчика «Учитывать разминку» было бы невидимым.
     """
-    where = "skipped = 0 AND is_outlier = 0"
+    where = "skipped = 0 AND is_outlier = 0 AND is_foreign = 0"
     params: tuple[str, ...] = ()
     if since:
         where += " AND date >= ?"
@@ -554,7 +556,7 @@ def recent_exercises(
         """
         SELECT exercise, COUNT(*) AS sets, MAX(date) AS last_day
           FROM sets
-         WHERE date IS NOT NULL AND date >= ?
+         WHERE date IS NOT NULL AND date >= ? AND is_foreign = 0
          GROUP BY exercise
          ORDER BY last_day DESC, sets DESC, exercise
         """,
@@ -976,6 +978,7 @@ WITH f AS (
        AND skipped = 0
        AND is_timed = 0
        AND is_outlier = 0
+       AND is_foreign = 0
        {since}
        {until}
 )
@@ -1395,6 +1398,7 @@ SELECT COUNT(DISTINCT session_id)          AS sessions,
    AND skipped = 0
    AND is_timed = 0
    AND is_outlier = 0
+   AND is_foreign = 0
 """
 
 
