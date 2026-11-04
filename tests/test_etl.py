@@ -247,10 +247,11 @@ class BodyweightTests(unittest.TestCase):
         self.assertEqual(r.weight, 100.0)
         self.assertEqual(r.added_weight, 0.0)
 
-    def test_vest_only_gets_bodyweight_added(self):
+    def test_vest_only_gets_effective_bodyweight_added(self):
+        """RM-98: E = 0.6 x тело + добавка (было 1.0 x тело, т.е. 90.0)."""
         r = etl.resolve_bodyweight("Отжимания", 20.0)
         self.assertEqual(r.mode, WeightMode.VEST_ONLY)
-        self.assertEqual(r.weight, 90.0)
+        self.assertEqual(r.weight, 62.0)
         self.assertEqual(r.added_weight, 20.0)
 
     def test_total_bodyweight_stays_and_yields_difference(self):
@@ -259,11 +260,12 @@ class BodyweightTests(unittest.TestCase):
         self.assertEqual(r.weight, 78.0)
         self.assertEqual(r.added_weight, 8.0)
 
-    def test_bodyweight_without_extra_has_no_rm(self):
+    def test_bodyweight_without_extra_gets_effective_bodyweight(self):
+        """RM-98: пустая добавка - это «своего груза нет», а не «вес неизвестен»."""
         r = etl.resolve_bodyweight("Отжимания", 0.0)
-        self.assertIsNone(r.weight)
-        self.assertIsNone(r.added_weight)
-        self.assertIsNone(one_rm(r.weight, 10))
+        self.assertEqual(r.weight, 42.0)
+        self.assertEqual(r.added_weight, 0.0)
+        self.assertIsNotNone(one_rm(r.weight, 10))
 
     def test_missing_weight(self):
         r = etl.resolve_bodyweight("Жим штанги лежа", None)

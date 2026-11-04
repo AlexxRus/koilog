@@ -104,12 +104,6 @@ __all__ = [
 WEIGHT_TAG_TOTAL = "тело+груз"
 WEIGHT_TAG_ADDED = "только груз"
 
-#: Упражнения, у которых суммарный вес тела ещё по интерим-модели (RM-98):
-#: подпись честно говорит, что 1RM здесь условный. Список - отображение, не
-#: правило расчёта; проверяется пином (docs/nu-138-prereg.md, п.5).
-INTERIM_BW_EXERCISES: frozenset[str] = frozenset({"Отжимания"})
-
-
 @dataclass(frozen=True, slots=True)
 class ExerciseStats:
     """Сводка по одному упражнению за всю историю.
@@ -1869,14 +1863,11 @@ def format_report(
     ]
     lines.append("-" * (width + 20 + 5 + 4 * 7 + 11 + 10 + 8))
     tagged = False
-    interim: list[str] = []
     for row in rows:
         name = row.exercise
         if row.weight_semantics is not None:
             name = f"{name} [{row.weight_semantics}]"
             tagged = True
-            if row.exercise in INTERIM_BW_EXERCISES:
-                interim.append(row.exercise)
         group = row.exercise_group
         if group_label is not None:
             group = group_label(row.exercise) or row.exercise_group
@@ -1910,11 +1901,6 @@ def format_report(
         )
         lines.append(
             "а не новая метрика - 1RM, КОИ и объём считаются как раньше."
-        )
-    for exercise in interim:
-        lines.append(
-            f"{exercise}: интерим до RM-98 - модель суммарного веса тела ещё не "
-            f"финальная, 1RM этого упражнения условный."
         )
     return "\n".join(lines) + "\n"
 

@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from datetime import date as date_cls
 from datetime import timedelta
 
-from .. import core, equipment
+from .. import core, equipment, taxonomy
 from . import illness as health_illness
 from .text import table
 
@@ -815,7 +815,16 @@ def return_plan(
     days_off = (date_cls.fromisoformat(today) - date_cls.fromisoformat(base_date)).days
     ramp = ramp_for(days_off)
 
-    weights = equipment.available_weights(exercise)
+    # Гард RM-98: рампа возврата - это рампа **внешнего** веса. Упражнение на
+    # своём теле (``vest_only``) или записанное суммарным весом
+    # (``total_bodyweight``) своей лестницы снаряда не имеет: у «Приседаний»
+    # после перехода на эффективную нагрузку появился бы 1RM, а вместе с ним
+    # и лестница штанги 20...160 кг - рампа «штанги» из приседа на своём теле.
+    # Возврат к таким упражнениям идёт по общей рамке, не по этой.
+    if taxonomy.weight_mode_of(exercise) is taxonomy.WeightMode.ABSOLUTE:
+        weights = equipment.available_weights(exercise)
+    else:
+        weights = ()
     warnings: list[str] = []
 
     if not weights or base_weight is None:

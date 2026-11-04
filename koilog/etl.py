@@ -73,8 +73,11 @@ __all__ = [
     "TimedDecision",
     "WeightDecision",
     "QualityReport",
+    "EFFECTIVE_BODYWEIGHT_SHARE",
+    "PUSHUPS_FAMILY",
     "bodyweight_for",
     "bodyweight_map",
+    "bodyweight_share",
     "connect",
     "create_schema",
     "detect_timed",
@@ -728,6 +731,41 @@ class WeightDecision:
     reason: str
 
 
+#: Эффективная доля собственного веса в нагрузке (RM-98).
+#:
+#: Версионная таблица v1 (``docs/rm-98-prereg.md`` §5): 0.6 - семейство
+#: отжиманий, 1.0 - все остальные упражнения. Число не «на глаз»: калибровка
+#: «отжимания vs жим» (только подходы не длиннее ``RM_MAX_REPS``, лучший подход
+#: года) даёт медиану отношения 0.96 при 0.6 (0.84 при 0.5 и 1.09 при 0.7).
+#: Пересматривается только через docs-поправку и повторный калибровочный
+#: прогон - тихая правка константы запрещена (``docs/rm-98-prereg.md`` §5).
+EFFECTIVE_BODYWEIGHT_SHARE = 0.6
+
+#: Семейство отжиманий: записана только добавка, а своё тело участвует в
+#: нагрузке не полностью. Снаружи семейства доля 1.0: для подтягиваний и
+#: приседа 0.6 дала бы 1RM ниже собственного веса (``docs/rm-98-prereg.md`` §2.7).
+PUSHUPS_FAMILY: frozenset[str] = frozenset({
+    "Отжимания",
+    "Отжимания от скамьи",
+    "Отжимания от пола",
+    "Отжимания трицепсами спиной к скамье",
+})
+
+
+def bodyweight_share(exercise: str | None) -> float:
+    """Доля собственного веса в эффективной нагрузке упражнения.
+
+    v1 (RM-98): :data:`EFFECTIVE_BODYWEIGHT_SHARE` для семейства отжиманий,
+    ``1.0`` для всех остальных. Сравнение идёт через ``taxonomy.normalize``,
+    поэтому ``ё``/``е`` и лишние пробелы имени на результат не влияют.
+    """
+    return (
+        EFFECTIVE_BODYWEIGHT_SHARE
+        if normalize(exercise) in PUSHUPS_FAMILY
+        else 1.0
+    )
+
+
 def resolve_bodyweight(
     exercise: str | None,
     weight: float | None,
@@ -751,38 +789,61 @@ def resolve_bodyweight(
     (``taxonomy.WEIGHT_MODE_OVERRIDE``), а режимы эти противоположны: у
     отжиманий записана только добавка, у подтягиваний - суммарный вес. Именно
     поэтому одного порога не хватает.
+
+    Для ``VEST_ONLY`` записанное значение - **добавка**, а суммарный вес
+    считается как **эффективная нагрузка** ``E = k x тело + добавка``
+    (RM-98, ``docs/rm-98-prereg.md``): ``k`` берётся из
+    :func:`bodyweight_share` (0.6 у семейства отжиманий, 1.0 у остальных).
+    Пустая добавка (``NULL``/``0``) даёт ``E = k x тело`` - тело нагружено и
+    без груза. ``TOTAL_BODYWEIGHT`` и ``ABSOLUTE`` не меняются.
     """
     mode = taxonomy.weight_mode_of(exercise)
-    if weight is None:
-        return WeightDecision(None, None, mode, "вес не указан")
 
     if mode is Mode.ABSOLUTE:
+        if weight is None:
+            return WeightDecision(None, None, mode, "вес не указан")
         return WeightDecision(weight, 0.0, mode, "вес как есть")
 
     if not taxonomy.counts_rm_of(exercise):
         # Для группы без 1RM вес не переписывается: прибавлять вес тела
         # значит выдумать суммарный вес, которого никто не записывал, а
         # потом ещё и снять с него метрики, которых для пресса и планки нет.
+        # Проверка стоит до арифметики тела: no-RM vest-строки (Скручивания,
+        # Планка, Подъём ног) остаются бит-в-бит, как их записали.
         return WeightDecision(
             weight, None, mode, "группа без 1RM, вес оставлен как записан"
         )
 
-    if weight == 0:
-        return WeightDecision(
-            None, None, mode, "своё тело без добавки - 1RM не считается"
-        )
-
     if mode is Mode.TOTAL_BODYWEIGHT:
+        if weight is None:
+            return WeightDecision(None, None, mode, "вес не указан")
+        if weight == 0:
+            return WeightDecision(
+                None, None, mode, "своё тело без добавки - 1RM не считается"
+            )
         return WeightDecision(
             weight, weight - body_weight, mode,
             f"записан суммарный вес, добавка = {weight:g} - {body_weight:g}",
         )
 
-    # VEST_ONLY: записана только добавка, своё тело прибавляем.
-    return WeightDecision(
-        weight + body_weight, weight, mode,
-        f"записан жилет {weight:g}, суммарно {weight + body_weight:g}",
-    )
+    # VEST_ONLY: записана только добавка, эффективная нагрузка =
+    # k x тело + добавка (RM-98, docs/rm-98-prereg.md). Пустая добавка
+    # (NULL/0) - это «своего груза нет», а не «вес неизвестен»: тело всё
+    # равно нагружено, поэтому E считается, и 1RM у строки появляется.
+    added = weight if weight else 0.0
+    share = bodyweight_share(exercise)
+    effective = share * body_weight + added
+    if added:
+        reason = (
+            f"записан жилет {added:g}, эффективная нагрузка "
+            f"{share:g} x {body_weight:g} + {added:g} = {effective:g}"
+        )
+    else:
+        reason = (
+            f"добавки нет, эффективная нагрузка "
+            f"{share:g} x {body_weight:g} = {effective:g}"
+        )
+    return WeightDecision(effective, added, mode, reason)
 
 
 # --------------------------------------------------------------------------
