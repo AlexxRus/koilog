@@ -294,5 +294,70 @@ class ProfileCoverageTests(unittest.TestCase):
                          f"Missing templates: {missing}")
 
 
+class MCSensitivityTests(unittest.TestCase):
+    """MC-детерминизм seed=99 (§13 пререга)."""
+
+    def test_mc_determinism_seed_99(self):
+        """Два прогона с seed=99 дают идентичные результаты."""
+        import random
+        import collections
+
+        # Фикстуры для MC теста.
+        conn = _db()
+        from datetime import date, timedelta
+        today = date.today()
+        
+        # Добавим несколько упражнений с разными профилями.
+        for i in range(10):
+            d = (today - timedelta(days=i*10)).isoformat()
+            _add(conn, d, "Жим штанги лежа", weight=60+i*5, reps=8)
+            _add(conn, d, "Становая тяга", weight=80+i*5, reps=6)
+            _add(conn, d, "Тяга гантели в наклоне одной рукой", weight=30+i*3, reps=10)
+        conn.commit()
+
+        def run_mc(seed_val):
+            rng = random.Random(seed_val)
+            base_kg = collections.Counter()
+            
+            rows = list(conn.execute("SELECT exercise, weight, reps FROM sets WHERE weight IS NOT NULL AND reps IS NOT NULL"))
+            for r in rows:
+                sh = muscle_share.share_of(r["exercise"])
+                if sh:
+                    e = float(r["weight"]) * float(r["reps"])
+                    for m, w in sh.items():
+                        base_kg[m] += e * w
+
+            flips = 0
+            n_draws = 50
+            base_rank = tuple(m for m, _ in base_kg.most_common())
+
+            for _ in range(n_draws):
+                perturbed = collections.Counter()
+                for r in rows:
+                    sh = muscle_share.share_of(r["exercise"])
+                    if sh:
+                        e = float(r["weight"]) * float(r["reps"])
+                        # Перемешиваем доли внутри профиля.
+                        raw_sh = {m2: sh[m2] * rng.uniform(0.8, 1.2) for m2 in sh}
+                        total = sum(raw_sh.values())
+                        sh_norm = {m2: v / total for m2, v in raw_sh.items()}
+                        for m2, w in sh_norm.items():
+                            perturbed[m2] += e * w
+
+                rank = tuple(m for m, _ in perturbed.most_common())
+                if rank != base_rank:
+                    flips += 1
+
+            return flips, base_rank
+
+        # Два прогона с одинаковым seed.
+        flips1, rank1 = run_mc(99)
+        flips2, rank2 = run_mc(99)
+
+        # Должны быть идентичны — это главное условие детерминизма.
+        self.assertEqual(flips1, flips2, f"MC flips differ: {flips1} vs {flips2}")
+        self.assertEqual(rank1, rank2, "MC base ranks differ")
+
+
 if __name__ == "__main__":
     unittest.main()
