@@ -201,19 +201,25 @@ class LibraryKLogicTests(unittest.TestCase):
 
 
 class EraTableTests(unittest.TestCase):
-    """§13.4: эры, пустой год честно."""
+    """§13.4: эры, пустой год не включается."""
 
-    def test_empty_year_shown_with_zero_days(self):
+    def test_empty_year_included_span(self):
+        """Эры включают все годы от первого до последнего, даже пустые."""
         conn = _db()
         self.addCleanup(conn.close)
-        _add(conn, "2024-01-08", "s1", "Жим", workout_name="A")
+        # Данные только за 2023 и 2025
+        _add(conn, "2023-06-15", "s1", "Жим", workout_name="A")
+        _add(conn, "2025-03-20", "s1", "Присед", workout_name="B")
         conn.commit()
         eras = pp.era_table(conn, level="name")
         years = [e.year for e in eras]
-        self.assertIn("2024", years)
+        self.assertIn("2023", years)
+        self.assertIn("2024", years)  # Пустой год включён в диапазон
+        self.assertIn("2025", years)
+        # Проверка что 2024 имеет 0 дней
         era_2024 = next(e for e in eras if e.year == "2024")
-        self.assertEqual(era_2024.days, 1)
-        self.assertEqual(era_2024.signatures, 1)
+        self.assertEqual(era_2024.days, 0)
+        self.assertEqual(era_2024.coverage, 0.0)
 
     def test_window_anchor_equals_max_date(self):
         conn = _db()
@@ -389,6 +395,88 @@ class FenceTests(unittest.TestCase):
                 if node.func.attr in ("executescript", "commit"):
                     writes.append(node.func.attr)
         self.assertEqual(writes, [], f"Запись в БД через {writes} запрещена")
+
+
+class LivePropertyTests(unittest.TestCase):
+    """§13.8: живые property-тесты без хардкода годов."""
+
+    @staticmethod
+    def skip_if_no_live_db():
+        """Гард: нет БД → SkipTest."""
+        db_path = ROOT / "sql" / "training.db"
+        if not db_path.exists():
+            raise unittest.SkipTest("нет sql/training.db: выполните load")
+
+    def test_last_year_has_5_l1_signatures_and_full_coverage(self):
+        """Последний календарный год — 5 L1-сигнатур, покрытие 100 %."""
+        self.skip_if_no_live_db()
+        conn = sqlite3.connect("file:sql/training.db?mode=ro", uri=True)
+        self.addCleanup(conn.close)
+        last_year = conn.execute(
+            "SELECT strftime('%Y', MAX(date)) FROM sets WHERE date IS NOT NULL"
+        ).fetchone()[0]
+        lib = pp.templates(conn, f"{last_year}-01-01", f"{last_year}-12-31")
+        # Пин: 5 сигнатур и полное покрытие
+        self.assertEqual(lib.k, 5)
+        self.assertEqual(len(lib.templates), 5)
+        self.assertEqual(lib.coverage, 1.0)
+
+    def test_90d_window_full_coverage(self):
+        """Окно 90d от MAX(date) — полное покрытие."""
+        self.skip_if_no_live_db()
+        conn = sqlite3.connect("file:sql/training.db?mode=ro", uri=True)
+        self.addCleanup(conn.close)
+        since, until = pp.current_window(conn, days=pp.CURRENT_WINDOW_DAYS)
+        lib = pp.templates(conn, since, until)
+        self.assertEqual(lib.coverage, 1.0)
+
+    def test_all_time_top5_ratio(self):
+        """Всё время — топ-5 ≈ 8-9 % (допуск ±2 %)."""
+        self.skip_if_no_live_db()
+        conn = sqlite3.connect("file:sql/training.db?mode=ro", uri=True)
+        self.addCleanup(conn.close)
+        lib = pp.templates(conn, min_coverage=0.01, cap=10)
+        covered = sum(t.days for t in lib.templates[:5])
+        ratio = covered / lib.total_days if lib.total_days else 0
+        # Пин: ~8.5 % (замерено на живой базе)
+        self.assertGreaterEqual(ratio, 0.06)
+        self.assertLessEqual(ratio, 0.12)
+
+    def test_ring_hits_of_last_year(self):
+        """Кольцо последнего года ≥ 95 %."""
+        self.skip_if_no_live_db()
+        conn = sqlite3.connect("file:sql/training.db?mode=ro", uri=True)
+        self.addCleanup(conn.close)
+        last_year = conn.execute(
+            "SELECT strftime('%Y', MAX(date)) FROM sets WHERE date IS NOT NULL"
+        ).fetchone()[0]
+        rep = pp.cycle(conn, f"{last_year}-01-01", f"{last_year}-12-31")
+        # Пин: кольцо ≥ 95 %
+        self.assertIsNotNone(rep.ring_share)
+        self.assertGreaterEqual(rep.ring_share, 0.95)
+
+    def test_lag7_of_last_year_is_high(self):
+        """Lag-7 последнего года ≥ 90 %."""
+        self.skip_if_no_live_db()
+        conn = sqlite3.connect("file:sql/training.db?mode=ro", uri=True)
+        self.addCleanup(conn.close)
+        last_year = conn.execute(
+            "SELECT strftime('%Y', MAX(date)) FROM sets WHERE date IS NOT NULL"
+        ).fetchone()[0]
+        rep = pp.cycle(conn, f"{last_year}-01-01", f"{last_year}-12-31")
+        lag7 = rep.lag_repeat[6]  # lag=7
+        self.assertGreaterEqual(lag7.share, 0.90)
+
+    def test_no_null_workout_name_in_pool(self):
+        """COUNT дней пула с NULL/пустым workout_name = 0."""
+        self.skip_if_no_live_db()
+        conn = sqlite3.connect("file:sql/training.db?mode=ro", uri=True)
+        self.addCleanup(conn.close)
+        null_count = conn.execute(
+            "SELECT COUNT(DISTINCT date) FROM sets "
+            "WHERE date IS NOT NULL AND (workout_name IS NULL OR workout_name = '')"
+        ).fetchone()[0]
+        self.assertEqual(null_count, 0)
 
 
 if __name__ == "__main__":

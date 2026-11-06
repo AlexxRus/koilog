@@ -164,7 +164,7 @@ def _read_days(
     if until is not None:
         sql += " AND date <= ?"
         params.append(until)
-    sql += " ORDER BY date, session_id, source_row, id"
+    sql += " ORDER BY date, id"
 
     days: dict[str, _Day] = {}
     for row in conn.execute(sql, params):
