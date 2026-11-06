@@ -201,7 +201,7 @@ class LibraryKLogicTests(unittest.TestCase):
 
 
 class EraTableTests(unittest.TestCase):
-    """§13.4: эры, пустой год не включается."""
+    """§13.4: эры — пустой год включается в диапазон и печатается честно нулями."""
 
     def test_empty_year_included_span(self):
         """Эры включают все годы от первого до последнего, даже пустые."""
@@ -431,16 +431,20 @@ class LivePropertyTests(unittest.TestCase):
         self.assertEqual(lib.coverage, 1.0)
 
     def test_all_time_top5_ratio(self):
-        """Всё время — топ-5 ≈ 8-9 % (допуск ±2 %)."""
+        """Всё время — топ-5 ≈ 35 % (§4: 492/1400 = 35,1%)."""
         self.skip_if_no_live_db()
         conn = sqlite3.connect("file:sql/training.db?mode=ro", uri=True)
         self.addCleanup(conn.close)
         lib = pp.templates(conn, min_coverage=0.01, cap=10)
-        covered = sum(t.days for t in lib.templates[:5])
+        # Честная топ-5 = templates[:5] + others[:N] если шаблонов < 5
+        top5 = list(lib.templates[:5])
+        if len(top5) < 5:
+            top5.extend(list(lib.others[:5 - len(top5)]))
+        covered = sum(t.days for t in top5[:5])
         ratio = covered / lib.total_days if lib.total_days else 0
-        # Пин: ~8.5 % (замерено на живой базе)
-        self.assertGreaterEqual(ratio, 0.06)
-        self.assertLessEqual(ratio, 0.12)
+        # Полоса 30–40 % по замеру §4 (492/1400 = 35,1%)
+        self.assertGreaterEqual(ratio, 0.30)
+        self.assertLessEqual(ratio, 0.40)
 
     def test_ring_hits_of_last_year(self):
         """Кольцо последнего года ≥ 95 %."""
