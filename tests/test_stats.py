@@ -322,10 +322,16 @@ class AvailableWeightsTests(unittest.TestCase):
 
     def test_vest_is_off_by_default_and_on_with_flag(self):
         self.assertEqual(stats.available_weights(self.conn, "Отжимания"), ())
-        with_vest = stats.available_weights(self.conn, "Отжимания", vest=True)
-        self.assertEqual(with_vest[0], 0.0)
-        self.assertEqual(with_vest[-1], 20.0)
-        self.assertEqual(len(with_vest), 11)
+        # Без body_weight для vest-only возвращается пусто (нет данных)
+        without_body = stats.available_weights(self.conn, "Отжимания", vest=True)
+        self.assertEqual(without_body, ())
+        # С body_weight строится E-ladder = k*body_weight + a
+        with_body = stats.available_weights(
+            self.conn, "Отжимания", vest=True, body_weight=70.0
+        )
+        self.assertEqual(with_body[0], 42.0)  # 0.6 * 70 + 0
+        self.assertEqual(with_body[-1], 62.0)  # 0.6 * 70 + 20
+        self.assertEqual(len(with_body), 11)
 
     def test_bodyweight_ladder_needs_body_weight(self):
         exercise = "Подтягивания на перекладине"

@@ -49,6 +49,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import equipment, taxonomy
+from .etl import bodyweight_share, PUSHUPS_FAMILY
 from .core import (
     KOI_ABOVE_WEEK,
     KOI_BANDS_WEEK,
@@ -1590,6 +1591,13 @@ def available_weights(
     ``hands = 1`` - делить вес не нужно, а вдвое уменьшенный поиск в лестнице
     на гантели просто ничего не находит.
 
+    Для vest_only-упражнений (отжимания и т.п.) после RM-98 записанный вес —
+    уже эффективная нагрузка **E = k·тело + добавка**, где k = 0.6 для
+    отжиманий (семейство PUSHUPS_FAMILY), k = 1.0 для остальных. Лестница
+    прогрессий строится как **k·body_weight + a** для каждого a из VEST_LADDER,
+    а не как сырой VEST_LADDER (0…20 кг). Без body_weight возвращается пустой
+    кортеж — честный ответ «нет данных».
+
     ``conn`` оставлен параметром и не используется: раньше список выводился
     запросом по таблице ``sets``, и его подпись нужна была вызывающим
     (``tests``). Убрать параметр - значит сломать вызовы ради единственного
@@ -1598,6 +1606,19 @@ def available_weights(
     Пустой кортеж - ответ «внешнего веса тут нет»: для планки, подъёма ног
     и кардио так и должно быть, и программа по ним не строится.
     """
+    # Vest-only упражнения (отжимания и т.п.) требуют E-ladder = k*body_weight + a
+    profile_id = equipment.EXERCISE_PROFILE.get(exercise or "")
+    if vest and profile_id == "vest":
+        if body_weight is None:
+            return ()  # Нет данных о весе тела - честный ответ «нельзя построить»
+        k = bodyweight_share(exercise)
+        out: list[float] = []
+        for a in equipment.VEST_LADDER:
+            e_weight = round(k * body_weight + a, 2)
+            if e_weight >= min_weight:
+                out.append(e_weight)
+        return tuple(out)
+
     return equipment.available_weights(
         exercise,
         min_weight=min_weight,
