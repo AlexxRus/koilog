@@ -72,6 +72,12 @@ MONOTONY_ALERT = health_load.MONOTONY_ALERT
 #: Сколько дней без тренировки считать «разрывом серии».
 GAP_DAYS = 14
 
+#: Причина состояния «нет данных»: так :func:`koilog.health.state.state_day`
+#: помечает пустую базу (ни часов, ни нагрузки). Рендер обязан её читать -
+#: иначе карточка обещает «можно по плану» там, где не посчитано ни одного
+#: канала (``docs/gp-139-prereg.md`` §5.3).
+_NO_DATA_REASON = "нет данных"
+
 #: Каналы часов: ``(позиция в выборке, ключ, подпись, знак «плохо»)``.
 #: Плюс - плохо, когда растёт (пульс, ЧДД, температура); минус - когда
 #: падает (ВСР, SpO2, сон).
@@ -218,6 +224,17 @@ def _recommend_from_state(state, score: dict | None = None) -> dict:
     ``rest`` - ``hold``; ``ramp`` - ``ramp``; ``normal`` - ``ok``.
     """
     from . import state as health_state
+
+    # Нет данных: «тренируйся по плану» здесь было бы выдумкой - каналов и
+    # нагрузки нет вовсе (``docs/gp-139-prereg.md`` §5.3). Причина приходит
+    # из :func:`koilog.health.state.state_day`, решение не переписывается.
+    if getattr(state, "reason", None) == _NO_DATA_REASON:
+        return {
+            "level": "nodata",
+            "title": "нет данных",
+            "text": "нет данных: каналы часов и нагрузка ещё не посчитаны "
+                    "(`apple-load`, `health-load`).",
+        }
 
     note = _score_note(score)
     if state.state == health_state.STATE_SICK:
@@ -639,6 +656,10 @@ def _gate_band(gate: dict) -> str:
 
 def _state_line(day: dict) -> str:
     """Строка состояния по спеке §5.3/§5.6 (метка рампы видна и на паузе)."""
+    if day.get("reason") == _NO_DATA_REASON:
+        # «Штатный план» на пустой базе - такая же выдумка, как и
+        # рекомендация «тренируйся по плану» (``docs/gp-139-prereg.md`` §5.3).
+        return _NO_DATA_REASON
     label = _STATE_TITLES.get(day.get("state"), day.get("state") or "?")
     if day.get("state") in ("ramp", "rest"):
         # Пауза видна в обоих состояниях: `rest` при незавершённой рампе -

@@ -858,8 +858,13 @@ class MainTests(CliFixture):
                         cli.main(["--db", str(Path(self._dir.name) / "нет.db"),
                                   *command])
 
-    def test_load_does_create_the_db(self):
-        """load - единственная команда, которой база нужна несуществующей."""
+    def test_load_refuses_before_creating_the_db(self):
+        """``load`` проверяет источники до ``etl.connect``.
+
+        Раньше файл базы создавался до чтения выгрузок (32 768 B мусора после
+        отказа). Решение Р4 (``docs/gp-139-prereg.md`` §5.2): отказ среды -
+        до записи, как у ``refresh``; сообщение про путь не меняется.
+        """
         target = Path(self._dir.name) / "создастся.db"
         err = io.StringIO()
         with redirect_stdout(io.StringIO()), redirect_stderr(err):
@@ -869,7 +874,8 @@ class MainTests(CliFixture):
         # не «сначала разберите выгрузки», а честная ошибка про путь
         self.assertEqual(code, 1)
         self.assertIn("нет1.csv", err.getvalue())
-        self.assertTrue(target.exists(), "база создаётся до чтения выгрузок")
+        self.assertFalse(target.exists(),
+                         "отказ среды - до создания файла базы")
 
     def test_bad_path_is_a_message_not_a_traceback(self):
         """Опечатка в пути - не повод показывать трассировку в три экрана."""

@@ -116,6 +116,26 @@ def _env_failure(exc: Exception) -> int:
     return 1
 
 
+def _source_empty(conn: sqlite3.Connection, *tables: str) -> bool:
+    """Источник пуст: таблицы нет **или** в ней ноль строк.
+
+    Предикат «пустой схемы» (``docs/gp-139-prereg.md`` §5.1): витрина,
+    которая без данных печатала бы «всё в порядке», обязана сначала
+    посмотреть на то, что читает. Отсутствующая таблица и пустая - для неё
+    одно и то же «считать нечего», а не «ничего плохого не нашлось».
+    """
+    for table in tables:
+        found = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        if found is None:
+            return True
+        if conn.execute(f'SELECT 1 FROM "{table}" LIMIT 1').fetchone() is None:
+            return True
+    return False
+
+
 def _csv_number(value: float | None, digits: int = 2) -> str:
     """Число для CSV: с округлением, ``None`` - пустой ячейкой.
 
@@ -217,6 +237,15 @@ def _drop_legacy(conn) -> str | None:
 def cmd_load(args: argparse.Namespace) -> int:
     if args.incremental:
         return _cmd_load_incremental(args)
+    # Отказ среды - до записи (``docs/gp-139-prereg.md`` §5.2, Р4):
+    # ``etl.connect`` создаёт файл базы, поэтому отсутствующий источник
+    # проверяется раньше, иначе после отказа на диске остаётся пустой файл.
+    # Сообщение - то же, что и у ``etl.load_all``: текст не дублируется.
+    try:
+        etl._require_file(args.journal, "журнала")
+        etl._require_file(args.report, "отчёт")
+    except FileNotFoundError as exc:
+        return _env_failure(exc)
     conn = etl.connect(args.db)
     try:
         dropped = _drop_legacy(conn)
@@ -623,6 +652,9 @@ def cmd_check(args: argparse.Namespace) -> int:
 def cmd_outliers(args: argparse.Namespace) -> int:
     conn = _open(args)
     try:
+        if _source_empty(conn, "sets"):
+            print("нет данных: sets пуст - сначала:  python -m koilog load")
+            return 1
         groups = etl.outlier_summary(conn)
         marked, total = etl.outlier_totals(conn)
         seconds = etl.reinterpreted_as_seconds(conn)
@@ -955,6 +987,9 @@ def cmd_return(args: argparse.Namespace) -> int:
     """Возврат к рабочим весам после болезни: кривая, рампа, гейт."""
     conn = _open(args)
     try:
+        if _source_empty(conn, "sets"):
+            print("нет данных: sets пуст - сначала:  python -m koilog load")
+            return 1
         exercise = args.exercise or health_retrain.default_exercise(conn)
         plan = health_retrain.return_plan(
             conn, exercise, steps=args.steps)
@@ -992,6 +1027,17 @@ def cmd_digest(args: argparse.Namespace) -> int:
     conn = _open(args)
     try:
         from .health import score as health_score
+        # Нет данных вовсе (ни журнала, ни часов): карточка «можно по плану»
+        # была бы выдумкой - отказ одной строкой (``docs/gp-139-prereg.md``
+        # §5.2, Р1/Р3). Если ``sets`` непуст, карточка остаётся: часов нет,
+        # но журнал уже разобран, и это рабочий сценарий.
+        health_empty = (_source_empty(conn, "aw_daily")
+                        and _source_empty(conn, "load_daily"))
+        if health_empty and _source_empty(conn, "sets"):
+            print("нет данных: ни журнала, ни часов - сначала:  "
+                  "python -m koilog load && python -m koilog apple-load && "
+                  "python -m koilog health-load")
+            return 1
         state = health_digest.day_state(
             conn, args.date, spec=health_score.spec_hash())
     finally:
