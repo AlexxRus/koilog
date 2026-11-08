@@ -42,6 +42,7 @@ __all__ = [
     "days_since_gap",
     "ewma",
     "format_summary",
+    "gap_load",
     "gap_runs",
     "health_days",
     "load_daily",
@@ -784,3 +785,139 @@ def series(
         params,
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+#: RN-104: «пропуск» = строго больше двух недель без тренировки (решение
+#: Р2-b=A, ``docs/rn-104-prereg.md`` §4), то есть >= 15 подряд идущих дней без
+#: нагрузки. Это **не** ``ACWR_GAP_DAYS = 14``: там «>= 14» - порог пересчёта
+#: ACWR, а здесь формулировка заказа «больше двух недель». Пограничный простой
+#: ровно 14 дней (2017-12-20…2018-01-02) пропуском не считается.
+PRELOAD_GAP_DAYS = 15
+
+#: Окна предпропускной нагрузки (Р3=A): свежая и накопленная - два числа, а не
+#: два порога. Окно полуоткрытое: ``(первый нулевой день - size, первый нулевой
+#: день]``, то есть дни **перед** простоем.
+PRELOAD_WINDOWS = (7, 14)
+
+#: Сколько **завершённых** пропусков нужно, чтобы перцентиль собственной
+#: истории был честным (Р4=C). Меньше - печатаются абсолютные числа без
+#: перцентиля (паттерн «честная пустая схема», GP-139).
+MIN_GAPS = 3
+
+
+def gap_load(
+    conn: sqlite3.Connection,
+    day: str | None = None,
+) -> dict:
+    """Нагрузка перед последним пропуском длиннее двух недель (RN-104).
+
+    Ряд - дневной тоннаж :func:`_session_rows` по **всей** истории, обрезанный
+    по ``day`` включительно: число из будущего на день не подставляется.
+    ``load_daily`` здесь не годится: у неё ``DEFAULT_WINDOW = "2024-01-16"``, и
+    на дефолтном окне пропусков 4 вместо 26 (тихая ложь, пререг §2.2).
+
+    «Пропуск» - прогон подряд идущих дней с нулевым учтённым тоннажом длиной
+    ``>= PRELOAD_GAP_DAYS`` (строго больше двух недель). Детектор - готовый
+    :func:`gap_runs` (та же семантика, что у ACWR), границы включительные.
+    День, где остались только разминка/гравитрон, читается как день без
+    нагрузки - так же, как его читает ACWR; в живой базе таких дней три, и
+    счёт пропусков они не меняют.
+
+    Состояния (Р5=A):
+
+    - ``status="completed"`` - последний **завершённый** пропуск с нагрузкой
+      за 7 и 14 дней перед ним (``gap``);
+    - ``status="ongoing"`` - простой ещё идёт; в ``gap`` он **не** попадает,
+      иначе накопленное выдавалось бы за завершённое;
+    - ``status="no_gaps"`` - пропусков больше двух недель не было.
+
+    Перцентиль (Р4=C) считается по скользящему 14-дневному тоннажу всех дней
+    ряда и печатается только при ``n_completed >= MIN_GAPS``: на тонкой
+    истории честнее показать число без перцентиля.
+
+    Ничего не пишет в базу - только читает ``sets``.
+    """
+    try:
+        rows = _session_rows(conn)
+    except sqlite3.OperationalError:      # нет таблицы ``sets`` (чистый клон)
+        return {"available": False, "status": "no_data", "date": day}
+    if not rows:
+        return {"available": False, "status": "no_data", "date": day}
+
+    dates = sorted(rows)
+    if day is None:
+        day = dates[-1]
+    try:
+        start_day = date_cls.fromisoformat(dates[0])
+        end_day = date_cls.fromisoformat(day)
+    except ValueError:
+        return {"available": False, "status": "no_data", "date": day}
+    if end_day < start_day:
+        return {"available": False, "status": "no_data", "date": day}
+
+    series_dates: list[str] = []
+    loads: list[float] = []
+    cursor = start_day
+    while cursor <= end_day:
+        key = cursor.isoformat()
+        row = rows.get(key)
+        loads.append(float((row or {}).get("tonnage") or 0.0))
+        series_dates.append(key)
+        cursor += timedelta(days=1)
+
+    runs = gap_runs(loads, PRELOAD_GAP_DAYS)
+    last_index = len(loads) - 1
+    completed = [(start, end) for start, end in runs if end < last_index]
+    ongoing = next(
+        ((start, end) for start, end in runs if end == last_index), None)
+
+    def _window(boundary: int, size: int) -> tuple[float, int]:
+        low = max(0, boundary - size)
+        chunk = loads[low:boundary]
+        return sum(chunk), sum(1 for value in chunk if value > 0)
+
+    def _collect(start: int, end: int) -> dict:
+        t7, d7 = _window(start, PRELOAD_WINDOWS[0])
+        t14, d14 = _window(start, PRELOAD_WINDOWS[1])
+        return {
+            "start": series_dates[start],
+            "end": series_dates[end],
+            "days": end - start + 1,
+            "t7": t7,
+            "t14": t14,
+            "d7": d7,
+            "d14": d14,
+        }
+
+    completed_gaps = [_collect(start, end) for start, end in completed]
+    ongoing_gap = _collect(*ongoing) if ongoing is not None else None
+
+    percentile = None
+    if len(completed_gaps) >= MIN_GAPS:
+        rolling = sorted(
+            sum(loads[max(0, index - 13):index + 1])
+            for index in range(len(loads))
+        )
+        target = completed_gaps[-1]["t14"]
+        below = sum(1 for value in rolling if value < target)
+        percentile = int(100.0 * below / len(rolling))
+
+    last_gap = None
+    if completed_gaps:
+        last_gap = dict(completed_gaps[-1])
+        last_gap["percentile"] = percentile
+
+    if ongoing_gap is not None:
+        status = "ongoing"
+    elif last_gap is not None:
+        status = "completed"
+    else:
+        status = "no_gaps"
+    return {
+        "available": True,
+        "date": day,
+        "status": status,
+        "n_completed": len(completed_gaps),
+        "gap": last_gap,
+        "ongoing": ongoing_gap,
+    }

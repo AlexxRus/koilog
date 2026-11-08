@@ -512,6 +512,7 @@ def day_state(conn: sqlite3.Connection, today: str | None = None,
         "today": resolved,
         "channels": channels_list,
         "load": load,
+        "gap_load": health_load.gap_load(conn, resolved),
         "gate": gate.to_dict(),
         "state": day.to_dict(),
         "score": score,
@@ -586,6 +587,10 @@ def format_digest(state: dict) -> str:
             f"{load['days_since_training'] if load['days_since_training'] is not None else '?'}"
         )
 
+    preload = state.get("gap_load") or {}
+    if preload.get("available"):
+        lines.append(_preload_gap_line(preload))
+
     gate = state.get("gate") or {}
     lines.append("")
     if gate.get("reasons") and not gate.get("ready"):
@@ -618,6 +623,35 @@ def format_digest(state: dict) -> str:
     lines.append(f"рекомендация: {rec['title']}")
     lines.append(f"  {rec['text']}")
     return "\n".join(lines)
+
+
+def _preload_gap_line(data: dict) -> str:
+    """Строка «нагрузка перед пропуском» (RN-104, ``docs/rn-104-prereg.md``).
+
+    Display-only (Р1=A): числа уже посчитаны :func:`koilog.health.load.gap_load`,
+    здесь только текст. Ярлыка «критическая» **нет** (Р4=C): замер показал, что
+    высокая нагрузка предшествовала лишь 7 из 27 пропусков, поэтому строка
+    сообщает факт, а не ставит диагноз. Перцентиль печатается только при
+    накопленной истории, иначе числа идут без него (``load.MIN_GAPS``).
+
+    Три честных состояния (Р5=A): завершённый пропуск, идущий простой (не
+    выдаётся за завершённый) и «пропусков не было» (не молчание).
+    """
+    status = data.get("status")
+    if status == "ongoing":
+        gap = data["ongoing"]
+        return (f"простой больше двух недель: идёт, {gap['days']} дн "
+                f"(с {gap['start']}) — не завершён")
+    if status == "completed":
+        gap = data["gap"]
+        text = (f"перед пропуском {gap['start']}…{gap['end']} "
+                f"({gap['days']} дн): объём 7 дн — {_num(gap['t7'], 0)} кг, "
+                f"14 дн — {_num(gap['t14'], 0)} кг; "
+                f"дней с нагрузкой {gap['d7']}/{gap['d14']}")
+        if gap.get("percentile") is not None:
+            text += f" ({gap['percentile']}-й перцентиль)"
+        return text
+    return "пропусков больше двух недель не было"
 
 
 _STATE_TITLES = {
