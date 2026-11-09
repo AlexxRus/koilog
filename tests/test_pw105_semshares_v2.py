@@ -278,6 +278,8 @@ class RollbackTests(unittest.TestCase):
         kg, koi, sets_cnt = muscle_share.totals_by_muscle(conn, version="v1")
 
         manual_kg = {}
+        manual_koi = {}
+        manual_koi_total = 0.0
         for row in conn.execute(
                 "SELECT exercise, weight, reps, koi FROM sets ORDER BY date"):
             profile = muscles.muscles_of(row["exercise"]).muscles
@@ -287,14 +289,23 @@ class RollbackTests(unittest.TestCase):
                 role = muscle_share._SHARES_V1[profile]
             shares = muscle_share._shares(profile, role)
             e = float(row["weight"]) * float(row["reps"])
+            k = float(row["koi"]) if row["koi"] is not None else 0.0
+            manual_koi_total += k
             for muscle, share in shares.items():
                 manual_kg[muscle] = manual_kg.get(muscle, 0.0) + e * share
+                manual_koi[muscle] = manual_koi.get(muscle, 0.0) + k * share
 
         for muscle, expected in manual_kg.items():
             self.assertAlmostEqual(kg[muscle], expected, places=10,
-                                   msg=f"v1 откат разошёлся: {muscle}")
+                                   msg=f"v1 откат разошёлся (кг): {muscle}")
+        # КОИ по каждой мышце — независимый ручной расчёт (не тождество):
+        # v1-доли возвращают ту же разбивку КОИ, а Σ = исходная сумма КОИ строк.
+        for muscle, expected in manual_koi.items():
+            self.assertAlmostEqual(koi[muscle], expected, places=10,
+                                   msg=f"v1 откат разошёлся (КОИ): {muscle}")
         self.assertAlmostEqual(sum(kg.values()), sum(manual_kg.values()), places=10)
-        self.assertAlmostEqual(sum(koi.values()), sum(koi.values()), places=10)
+        self.assertAlmostEqual(sum(koi.values()), manual_koi_total, places=10)
+        self.assertAlmostEqual(sum(koi.values()), sum(manual_koi.values()), places=10)
         self.assertGreater(sum(sets_cnt.values()), 0)
 
         # Сдвинутые профили действительно отличаются от v1 (иначе тест пуст).
