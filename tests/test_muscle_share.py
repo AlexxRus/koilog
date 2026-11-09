@@ -268,9 +268,10 @@ class ImportFenceTests(unittest.TestCase):
                          f"Import pulled decision modules: {proc.stderr}")
 
     def test_version_constants_present(self):
-        """VERSION и VERSION_DATE определены."""
-        self.assertEqual(muscle_share.VERSION, "v1")
-        self.assertEqual(muscle_share.VERSION_DATE, "2026-11-05")
+        """VERSION и VERSION_DATE определены (PW-105 §6 #8: канон — v2)."""
+        # Осознанное обновление пина PW-99: шаг 2 PW-105 переводит канон на v2.
+        self.assertEqual(muscle_share.VERSION, "v2")
+        self.assertEqual(muscle_share.VERSION_DATE, "2026-11-09")
 
 
 class ProfileCoverageTests(unittest.TestCase):
