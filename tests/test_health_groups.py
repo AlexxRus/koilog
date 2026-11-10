@@ -579,6 +579,27 @@ class OutlierFilterTests(unittest.TestCase):
         daily = groups._daily_by_group(conn)
         self.assertNotIn("2024-01-11", daily["Жим штанги лежа"])
 
+    def test_test_day_flows_into_series(self):
+        """Край §3 «Тестовый день», уточнение 2026-11-10: тестовый день входит в E-ряд как рабочий 
+        (маркер без фильтра, E2-b — окно дословно)."""
+        conn = _db()
+        self.addCleanup(conn.close)
+        _schema(conn)
+        # Создаём таблицу test_days и добавляем дату как тестовую
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS test_days (date TEXT PRIMARY KEY, note TEXT)"
+        )
+        conn.execute("INSERT INTO test_days (date) VALUES ('2024-01-10')")
+        # Добавляем железный подход на эту дату
+        _add(conn, "Становая тяга", "2024-01-10", 100.0, 5)
+        conn.commit()
+        # series должен содержать этот день с тоннажем 500.0 (100 * 5)
+        s = groups.series(conn, "СТАНОВАЯ ТЯГА", taxonomy.Mode.IRON, "2024-01-10")
+        # Проверяем что день присутствует в ряду
+        day_values = [(d.date, d.value) for d in s.days if d.date == "2024-01-10"]
+        self.assertEqual(len(day_values), 1)
+        self.assertEqual(day_values[0][1], 500.0)
+
 
 if __name__ == "__main__":
     unittest.main()
