@@ -386,7 +386,7 @@ class LivePoolParityTests(unittest.TestCase):
 
         if not rows:
             conn.close()
-            raise unittest.SkipTest(f"база пуста: в sets нет подходов")
+            raise unittest.SkipTest("база пуста: в sets нет подходов")
 
         # Проверить что есть хотя бы один подход в пуле 4.14.
         pool_count = conn.execute(

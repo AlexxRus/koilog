@@ -51,7 +51,6 @@ from __future__ import annotations
 import collections
 import sqlite3
 from datetime import date as date_cls, timedelta
-from typing import TYPE_CHECKING
 
 #: Версионная таблица v1 (дата фиксации 2026-11-05), PW-99.
 #: Профиль → роли (P=4, S=2, T=1). Нормализация к Σ=1 внутри ``_shares()``.
