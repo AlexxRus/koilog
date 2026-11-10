@@ -376,12 +376,12 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
     ради колонок жалко - вдруг лежат в долгой личной базе. ``ALTER TABLE``
     добавляет недостающее и не трогает остальное.
     """
-    for table, column, decl in _MIGRATION:
+    for tbl, column, decl in _MIGRATION:
         existing = {
-            row[1] for row in conn.execute(f"PRAGMA table_info({table})")
+            row[1] for row in conn.execute(f"PRAGMA table_info({tbl})")
         }
-        if _has_table(conn, table) and column not in existing:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        if _has_table(conn, tbl) and column not in existing:
+            conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {column} {decl}")
 
 
 def build_features(
@@ -722,7 +722,6 @@ def onset_cv(
         # в плотном кластере окно обрезано, и такая реконструкция врала
         onset_date = starts.get(episode)
         if onset_date is None and test_pos:
-            tail = test_pos[-1] + 1
             onset_date = data.dates[onset_position] if (
                 (onset_position := test_pos[-1] + 1) < len(data.dates)) else None
         onset_position = date_index.get(onset_date) if onset_date else None
@@ -1636,7 +1635,6 @@ def matched_auc(
     data = _dataset(conn, features)
     at_risk = data.at_risk
     dates = data.dates
-    y = data.y_onset
     starts = {e.id: e.start for e in health_illness.episodes(conn)
               if e.level != "gap_only"}
     position_of = {day: i for i, day in enumerate(dates)}
@@ -1866,7 +1864,7 @@ def dumps(data: dict) -> str:
 def format_lag(rows: list[dict], feature: str) -> str:
     """Таблица лаг-анализа: на сколько SD признак отклонён за ``lag`` дней."""
     body = table(
-        (f"лаг, дн", f"{feature}, эффект (SD)", "n"),
+        ("лаг, дн", f"{feature}, эффект (SD)", "n"),
         [(row["lag"], "—" if row["effect"] is None else f"{row['effect']:+.2f}",
           row["n"]) for row in rows],
     )

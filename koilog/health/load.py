@@ -31,8 +31,6 @@ import statistics
 from datetime import date as date_cls
 from datetime import timedelta
 
-from .. import etl
-
 __all__ = [
     "DEFAULT_WINDOW",
     "LoadDay",

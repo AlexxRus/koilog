@@ -49,7 +49,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import equipment, taxonomy
-from .etl import bodyweight_share, PUSHUPS_FAMILY
+from .etl import bodyweight_share
 from .core import (
     KOI_ABOVE_WEEK,
     KOI_BANDS_WEEK,

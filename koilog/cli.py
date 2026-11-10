@@ -34,7 +34,7 @@ import os
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 from . import equipment, etl, muscle_load, rules, stats
 from .core import BODY_WEIGHT

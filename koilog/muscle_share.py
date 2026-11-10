@@ -53,9 +53,6 @@ import sqlite3
 from datetime import date as date_cls, timedelta
 from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from . import muscles
-
 #: Версионная таблица v1 (дата фиксации 2026-11-05), PW-99.
 #: Профиль → роли (P=4, S=2, T=1). Нормализация к Σ=1 внутри ``_shares()``.
 #: **Не меняется:** откат v2→v1 должен давать числа PW-99 бит-в-бит.

@@ -426,7 +426,6 @@ def balance(
     (нулевой знаменатель, мало истории). Округление — до 0.1 (кратность).
     """
     row_n = series(conn, numerator, mode, date)
-    row_d = series(conn, denominator, mode, date)
     date = date or (row_n.days[-1].date if row_n.days else None)
     if date is None:
         return None

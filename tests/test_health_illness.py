@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import unittest
 
 from koilog.health import illness
@@ -277,8 +278,7 @@ class TailDriftGuardTests(unittest.TestCase):
 class BuildTailTests(unittest.TestCase):
     """Интеграция 4.1: ``illness.build`` реально продлевает end и пишет хвост."""
 
-    def _db(self) -> "sqlite3.Connection":
-        import sqlite3
+    def _db(self) -> sqlite3.Connection:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
         conn.executescript(
@@ -302,7 +302,6 @@ class BuildTailTests(unittest.TestCase):
     def test_build_extends_end_and_marks_tail_days(self):
         from datetime import date as date_cls
         from datetime import timedelta
-        import sqlite3  # noqa: F401
 
         conn = self._db()
         # фон 60 дней «нейтральных» ночей, затем эпизод и держащий хвост

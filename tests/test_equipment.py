@@ -11,7 +11,6 @@ from __future__ import annotations
 import unittest
 
 from koilog import equipment
-from koilog.taxonomy import EXERCISE_GROUP
 
 
 class DumbbellTests(unittest.TestCase):

@@ -35,7 +35,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date as date_cls
 from datetime import timedelta
 

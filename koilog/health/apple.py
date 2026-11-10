@@ -854,9 +854,9 @@ def write_apple(conn: sqlite3.Connection, data: AppleData) -> None:
     прогонов. ``sets`` не затрагивается.
     """
     conn.executescript(_SCHEMA)
-    for table in ("aw_daily", "aw_sleep", "aw_workouts", "aw_bodytemp",
-                  "aw_hr", "aw_ecg", "aw_meta"):
-        conn.execute(f"DELETE FROM {table}")
+    for tbl in ("aw_daily", "aw_sleep", "aw_workouts", "aw_bodytemp",
+                "aw_hr", "aw_ecg", "aw_meta"):
+        conn.execute(f"DELETE FROM {tbl}")
 
     placeholders = ", ".join("?" * len(DAILY_COLUMNS))
     conn.executemany(

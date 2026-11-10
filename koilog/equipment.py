@@ -66,7 +66,6 @@ __all__ = [
     "PROFILES",
     "Profile",
     "STACK_454",
-    "VEST",
     "VEST_LADDER",
     "available_weights",
     "hands_of",

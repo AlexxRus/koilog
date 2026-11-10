@@ -15,7 +15,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
-from koilog import cli, etl, stats
+from koilog import cli, etl
 from koilog.core import one_rm
 
 
@@ -696,7 +696,7 @@ class IllnessCommandTests(unittest.TestCase):
     def setUp(self):
         from datetime import date as date_cls, timedelta
 
-        from koilog.health import apple, illness
+        from koilog.health import apple
 
         self._dir = tempfile.TemporaryDirectory()
         self.db = Path(self._dir.name) / "h.db"

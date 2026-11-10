@@ -3,12 +3,11 @@
 
 from __future__ import annotations
 
-import collections
 import sqlite3
 import unittest
 from pathlib import Path
 
-from koilog import muscles, muscle_share, taxonomy
+from koilog import muscle_share, taxonomy
 
 ROOT = Path(__file__).resolve().parent
 
@@ -503,7 +502,7 @@ class LivePoolParityTests(unittest.TestCase):
         self.assertEqual(
             len(missing_from_pool), 0,
             f"Профили PROFILES не в пуле и не в исключениях: {missing_from_pool}. "
-            f"Добавьте их в expected_exclusions или верните данные."
+            "Добавьте их в expected_exclusions или верните данные."
         )
 
 

@@ -9,7 +9,6 @@ from koilog.core import (
     KOI_ABOVE,
     KOI_BANDS,
     RM_MAX_REPS,
-    WAVE_MAX_REPS,
     WAVE_MIN_REPS,
     SetSpec,
     find_optimal_reps,
