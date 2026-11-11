@@ -33,17 +33,21 @@ MS-199 описывает **альтернативный источник дол
 
 **Артефакты v1 (не меняются):**
 - `koilog/muscles.py` (принят 4.10): 17 меток, `_COMPOSITION = 131` упражнений, `muscles_of(name)` без тихих дефолтов;
-- `koilog/muscle_share.py`: `_SHARES_V1` = 32 шаблона, fallback строка `(4,2,2,1)` для тяговых групп, инвариант Σ=1 по 17 меткам, envelope ±20% / seed=99 / n=2000;
+- `koilog/muscle_share.py`: `_SHARES_V1` = 28 базовых шаблонов + 2 override-строки в `_GROUP_OVERRIDES` (вертикальная/горизонтальная тяга), fallback строка `(4,2,2,1)` — 0 имён напрямую применяется, инвариант Σ=1 по 17 меткам, envelope ±20% / seed=99 / n=2000;
 - pin-функция `format_shares` = строка 637, sha256 `d6c62f84cef7a53c4c2eef54d4bcea3c033af77421397edfad8a4ba32cc0e04b`;
 - E-агрегация `koilog/health/groups.py`: КОИ-фильтры, ROLLING_WINDOW=7, BASELINE_LAGS=(7,14,21), test_test_day_flows_into_series.
 
-**Замеры покрытия v1:**
+**Замеры покрытия v1 (замер 2026-11-11):**
 | что | число |
 |---|---|
 | профилей в `_COMPOSITION` | 131 упражнение |
-| шаблонов в `_SHARES_V1` | 32 |
-| fallback `(4,2,2,1)` покрывает | TBD (замер по `muscles_of`) |
-| витрин, потребляющих muscle_share | `koilog.ipynb` яч.17 (totals_by_muscle) |
+| базовых шаблонов в `_SHARES_V1` | 28 |
+| override-строк в `_GROUP_OVERRIDES` | 2 (вертикальная/горизонтальная тяга) |
+| fallback `(4,2,2,1)` покрывает | 0 имён напрямую |
+| явный шаблон (без fallback/override) | 110 упражнений |
+| override-группа | 14 упражнений |
+| вне пула (`None`, без профиля) | 7 («Бег», «Беговая дорожка», «Гребля в тренажере», «Тренажер для гребли», «Разминка», «Планка», «Планка на руках») |
+| витрин, потребляющих muscle_share | `koilog.ipynb` яч.18 (totals_by_muscle) |
 | где уже взвешено КОИ | display-only, кросс-режимно (W2) |
 
 **Фенсы v1:** import guard 4.14 (groups.py, state.py, retrain.py, ml.py, score.py не импортируют muscle_share); D11-b (нагрузка в решениях = 0); Σ=1 инвариант; тоннаж порежимно (W2).
@@ -91,7 +95,7 @@ MS-199 описывает **альтернативный источник дол
 
 1. **Import fence:** `state.py`, `retrain.py`, `ml.build_features`, `ml.build_labels`, `score.py`, `digest.recommend` **не импортируют** muscle_share (проверка AST как в test_health_groups.py:483).
 2. **D11-b/A:** доля не участвует в решениях; E-строка (groups_state) остаётся display-only.
-3. **Σ=1 инвариант:** каждая строка таблицы суммируется в 1.0 точно (пересчётfallback при добавлении шаблонов).
+3. **Σ=1 инвариант:** каждая строка таблицы суммируется в 1.0 точно (пересчёт fallback при добавлении шаблонов).
 4. **Тоннаж порежимно:** no cross-mode aggregation (W2); kg по режимам, KOI кросс-режимно.
 5. **Append-only prereg:** после утверждения prereg заморожен; правки — только датированными дополнениями.
 6. **Версионирование:** VERSION / VERSION_DATE в коде при публикации v2; откат v1 бит-в-бит сохраняется.
@@ -100,7 +104,7 @@ MS-199 описывает **альтернативный источник дол
 
 ## §6 Тесты-минимум (при реализации)
 
-1. **Инвариант Σ=1:** residual == 0 per set (как v1, 1397 дней).
+1. **Инвариант Σ=1:** residual == 0 per set (как v1, `days_with_E` = 1397; `muscle_share.py:536`).
 2. **Import fence:** decision modules не импортируют muscle_share (AST assert).
 3. **Coverage:** missing templates = 0 (все 32 шаблона покрыты).
 4. **Monte Carlo:** seed=99, n=2000, flips reported (±20% envelope).
